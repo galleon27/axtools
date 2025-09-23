@@ -1,0 +1,706 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<shelfDocument>
+  <!-- This file contains definitions of shelves, toolbars, and tools.
+ It should not be hand-edited when it is being used by the application.
+ Note, that two definitions of the same element are not allowed in
+ a single file. -->
+
+  <tool name="octane rop" label="Octane Create ROP" icon="D:/Dropbox/!hdas/custom_hda_icon.png">
+    <script scriptType="python"><![CDATA[import hou
+
+#create ropnet
+ropnet = hou.node('/obj').createNode('ropnet')
+
+#create shopnet // create render target
+shop = ropnet.createNode('shopnet')
+renderT = shop.createNode('octane_rendertarget_dl')
+#print renderT.relativePathTo(ropnet)
+
+#create Octane ROP
+octaneRop = ropnet.createNode('Octane_ROP')
+octaneRop.parm('HO_renderTarget').set(renderT.path())
+ropnet.layoutChildren()]]></script>
+  </tool>
+
+  <tool name="Bake Textures" label="Create ROP for Bake" icon="D:/Dropbox/!hdas/bake.png">
+    <helpText><![CDATA[Select Node with Hierarchy]]></helpText>
+    <script scriptType="python"><![CDATA[import hou
+
+#selected nodes
+selected = hou.selectedNodes()
+#children = selected.children()
+
+#create RT
+temp = ()
+root = hou.node('/obj')
+shopnetNode = root.glob('shopnet*')
+
+
+if ( temp == shopnetNode):
+    shop = root.createNode('shopnet')
+    rt = shop.createNode('octane_rendertarget_dl')
+    rt.parm('parmKernel').set(1)
+    rt.parm('parmCamera').set(2)
+    rt.parm('maxsamples').set(150)
+    rt.parm('denoiser').set(1)
+
+
+for i in selected:
+
+    children = i.children()
+    #create list based on type
+    a = [c for c in children if c.type().name() == 'geo']
+    
+    #check for ropnet
+    ropnetNode = i.glob("ropnet*")
+    temp = ()
+    
+    hou.setPwd(i)
+    
+    #create hierarchy
+    if (ropnetNode == temp):
+        rop = hou.pwd().createNode('ropnet')
+        
+        i.layoutChildren()
+        
+        for b in a:
+            name = b.name()
+            r = rop.createNode('Octane_ROP')
+            r.setName(name)
+            r.parm('HO_objects_candidate').set(name)
+            r.parm('HO_renderTarget').set(rt.path())
+            rop.layoutChildren()]]></script>
+  </tool>
+
+  <tool name="create rop for bake" label="Create ROP for bake" icon="bake.png">
+    <script scriptType="python"><![CDATA[import hou
+
+#selected nodes
+selected = hou.selectedNodes()
+#children = selected.children()
+
+rt = hou.node(hou.parm('/obj/ropnet1/Octane_ROP1/HO_renderTarget').eval())
+
+for nodes in selected:
+    children = nodes.children()
+    rootName = nodes.name()
+    list = [c for c in children if c.type().name() == 'geo']
+    temp = ()
+    ropnetNode = nodes.glob("ropnet*")
+    shopnetNode = nodes.glob("matnet*")
+    
+    hou.setPwd(nodes)
+    
+    if (ropnetNode == temp):
+        rop = hou.pwd().createNode('ropnet')
+        shop = hou.pwd().createNode('matnet')
+        nodes.layoutChildren()
+        
+        for i in list:
+            name = i.name()
+            index = list.index(i) + 1
+            i.parm('octane_objprop_baking').set(index)
+            print(index)
+            #create ropnet
+            r = rop.createNode('Octane_ROP')
+            r.setName(name)        
+            rop.layoutChildren()
+            
+            #create shopnet
+            s = rt.copyTo(shop)
+            #s = shop.createNode('octane_rendertarget_dl')
+            s.setName(name)
+            s.parm('parmCamera').set(2)
+            s.parm('padding').set(1)
+            s.parm('bakingGroupId').set(index)
+            s.parm('uvSet2').set(2)
+            shop.layoutChildren()
+            #set rop parm
+            r.parm('HO_renderTarget').set(s.path())
+            #r.parm('HO_objects_candidate').set(rootName + "/" + name + " light*")
+            r.parm('HO_renderToMPlay').set(0)
+            r.parm('HO_img_enable').set(1)
+            #r.parm('HO_matOverride_enable').set(1) #material override
+            #r.parm('HO_matOverride_shop').set("/obj/matnet1/white") #material override
+            r.parm('HO_img_fileName').set("$RENDER/" + nodes.name()[:-4] + "/$OS.png")
+            r.parm('HO_img_fileFormat').set(0)
+            
+print("Succesfully created ROPs for bake")]]></script>
+  </tool>
+
+  <tool name="Delete Materials" label="Delate Materials" icon="D:/Dropbox/!hdas/wrong.png">
+    <script scriptType="python"><![CDATA[import hou
+
+#selected nodes
+selected = hou.selectedNodes()
+#children = selected.children()
+
+for nodes in selected:
+    children = nodes.children()
+    rootName = nodes.name()
+    list = [c for c in children if c.type().name() == 'geo']
+    temp = ()
+    ropnetNode = nodes.glob("ropnet*")
+    shopnetNode = nodes.glob("shopnet*")
+    
+    hou.setPwd(nodes)
+    
+    for i in list:
+        name = i.name()
+        c = i.children()
+        for lastNode in c:
+            print lastNode.outputs()
+        attDel = i.createNode('attribute_delete')
+        attDel.parm('primdel').set("shop_materialpath")
+        attDel.moveToGoodPosition()
+        attDel.setInput(0, lastNode, 0)
+        attDel.setDisplayFlag(True)
+        attDel.setRenderFlag(True)
+]]></script>
+  </tool>
+
+  <tool name="Delete Materials0" label="Delate Materials" icon="wrong.png">
+    <script scriptType="python"><![CDATA[import hou
+
+#selected nodes
+selected = hou.selectedNodes()
+#children = selected.children()
+listB = []
+for nodes in selected:
+    children = nodes.children()
+    rootName = nodes.name()
+    list = [c for c in children if c.type().name() == 'geo']
+    temp = ()
+    
+    hou.setPwd(nodes)
+    
+    for i in list:
+        name = i.name()
+        c = i.children()
+
+        for n in c:
+            a = n.outputs()
+            if (a == ()):
+                lastNode = n
+                print(lastNode)
+                attDel = i.createNode('attribdelete', 'del_mat')
+                attDel.parm('primdel').set("shop_materialpath")
+                attDel.moveToGoodPosition()
+                attDel.setFirstInput(lastNode, 0)
+                attDel.setDisplayFlag(True)
+                attDel.setRenderFlag(True)
+]]></script>
+  </tool>
+
+  <tool name="UV/NO UV" label="UV / NO UV" icon="PLASMA_App">
+    <script scriptType="python"><![CDATA[import hou
+
+#selected nodes
+selected = hou.selectedNodes()
+#children = selected.children()
+
+for nodes in selected:
+    children = nodes.children()
+    rootName = nodes.name()
+    list = [c for c in children if c.type().name() == 'geo']
+    temp = ()
+    ropnetNode = nodes.glob("ropnet*")
+    shopnetNode = nodes.glob("shopnet*")
+    
+    hou.setPwd(nodes)
+    
+    for i in list:
+        name = i.name()
+        switch = i.glob("switch*")[0]
+        s = switch.parm('input').eval()
+        if (s == 0):
+            switch.parm('input').set(1)
+            temp = "no uv"
+        if (s == 1):
+            switch.parm('input').set(0)
+            temp = "uv"
+print(temp)]]></script>
+  </tool>
+
+  <tool name="Delete UVs" label="Delete UVs" icon="PLASMA_App">
+    <script scriptType="python"><![CDATA[import hou
+
+#selected nodes
+selected = hou.selectedNodes()
+#children = selected.children()
+
+for nodes in selected:
+    children = nodes.children()
+    rootName = nodes.name()
+    list = [c for c in children if c.type().name() == 'geo']
+    temp = ()
+    ropnetNode = nodes.glob("ropnet*")
+    shopnetNode = nodes.glob("shopnet*")
+    
+    hou.setPwd(nodes)
+    
+    for i in list:
+        name = i.name()
+        c = i.children()
+        for n in c:
+            a = n.outputs()
+            
+            if (a == ()):
+                lastNode = n
+        switch = i.createNode('switch')
+        switch.setInput(0, lastNode, 0)
+        switch.moveToGoodPosition()
+        
+        attDel = i.createNode('attribdelete')
+        attDel.parm('vtxdel').set("uv*")
+        attDel.moveToGoodPosition()
+        attDel.setInput(0, lastNode, 0)
+        
+        switch.setInput(1, attDel, 0)
+        switch.setDisplayFlag(True)
+        switch.setRenderFlag(True)
+print("Succesfully created nodes")]]></script>
+  </tool>
+
+  <tool name="Unlock File" label="Unlock File Node" icon="unlock.png">
+    <script scriptType="python"><![CDATA[import hou
+
+#selected nodes
+selected = hou.selectedNodes()
+#children = selected.children()
+
+for nodes in selected:
+    children = nodes.children()
+    
+    for file in children:
+        children = file.children()
+        list = [c for c in children if c.type().name() == 'file']
+        
+        for i in list:
+            i.setHardLocked(0)
+        ]]></script>
+  </tool>
+
+  <tool name="create octane rop" label="Create Octane ROP" icon="custom_hda_icon.png">
+    <script scriptType="python"><![CDATA[import hou
+
+root = hou.node('/obj/')
+ropnet = root.createNode('ropnet')
+matnet = root.createNode('matnet')
+matnet.moveToGoodPosition()
+rt = ropnet.createNode('matnet')
+rt.setName('octane_rt')
+root.createNode('cam')
+
+shop = rt.createNode('octane_mat_renderTarget')
+rop = ropnet.createNode('Octane_ROP').parm('HO_renderTarget').set(shop.path())
+mat = matnet.createNode('octane_vopnet')
+
+
+ropnet.layoutChildren()]]></script>
+  </tool>
+
+  <tool name="Create Instance" label="Create instance" icon="custom_hda_icon.png">
+    <script scriptType="python"><![CDATA[import hou
+
+#selected nodes
+selected = hou.selectedNodes()
+#children = selected.children()
+
+for nodes in selected:
+    children = nodes.children()
+    rootName = nodes.name()
+    #print rootName
+    list = [c for c in children if c.type().name() == 'geo']
+    instance = hou.node('/obj').createNode('subnet')
+    instance.setName(rootName + "_Instance")
+    for i in list:
+        c = hou.node(instance.path()).createNode('instance')
+        c.setName(i.name())
+        c.parm('instancepath').set(i.path())
+        c.moveToGoodPosition()]]></script>
+  </tool>
+
+  <tool name="Create Octane Arnold Material" label="Create Octane Arnold Material" icon="custom_hda_icon">
+    <script scriptType="python"><![CDATA[import hou
+import os
+
+directory = hou.ui.selectFile(file_type=hou.fileType.Directory)
+root = hou.node('/obj')
+matnet = hou.node('/obj/octane_matnet')
+filename = []
+imageset = []
+
+if matnet == None:
+    temp = root.createNode('matnet', 'octane_matnet')
+
+a = root.glob('*matnet')[0]
+
+
+if directory != "":
+    
+    #get image list
+    imagesetdir = os.listdir(directory)
+    #replace space in image name with underscore
+    for i in imagesetdir:
+        i = i.replace(" ", "_")
+        imageset.append(i)
+        
+    #get image list
+    imageset = os.listdir(directory)
+    #get image name
+    for imagefile in imageset:
+        if "Preview" not in imagefile:
+            if imagefile.lower().endswith(('.png', '.jpg', '.tga', '.exr')):
+                #create filename list
+                name = imagefile.split('_')[:len(imagefile.split('_'))-1]
+                name = "_".join(name).replace(" ", "_")
+                filename.append(name)
+                #remove duplicates from list
+                filename = list(dict.fromkeys(filename))
+    
+        
+    for name in filename:
+        #create material
+        material = a.createNode('octane_vopnet', name)
+        material.moveToGoodPosition()
+        materialnode = material.createNode('NT_MAT_UNIVERSAL')
+        output = material.path() + "/octane_material1"
+        o = hou.node(output)
+        o.setNamedInput('material', materialnode, 'NT_MAT_UNIVERSAL')
+
+    #build shader
+        for imagefile in imageset:
+            if imagefile.lower().endswith(('.png', '.jpg', '.tga', '.exr')):
+                #print(imagefile)
+                if name + '_BaseColor.' in imagefile:
+                    baseColor = material.createNode('NT_TEX_IMAGE')
+                    baseColor.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    materialnode.setNamedInput('albedo', baseColor, 'NT_TEX_IMAGE')
+    
+                if name + '_Emissive.' in imagefile:
+                    emissive = material.createNode('NT_TEX_IMAGE')
+                    emissive.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    texEmission = material.createNode('NT_EMIS_TEXTURE')
+                    texEmission.setNamedInput('efficiency_or_texture', emissive, 'NT_TEX_IMAGE')
+                    materialnode.setNamedInput('emission', texEmission, 'NT_EMIS_TEXTURE')
+                
+                
+                if name + '_Metalness.' in imagefile:
+                    metalness = material.createNode('NT_TEX_FLOATIMAGE')
+                    metalness.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    metalness.parm('gamma').set(1)
+                    metalness.parm('colorSpace').set("NAMED_COLOR_SPACE_OTHER")
+                    materialnode.setNamedInput('metallic', metalness, 'NT_TEX_FLOATIMAGE')
+                    
+                    
+                if name + '_Normal.' in imagefile:
+                    normal = material.createNode('NT_TEX_IMAGE')
+                    normal.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    normal.parm('gamma').set(1)
+                    normal.parm('colorSpace').set("NAMED_COLOR_SPACE_OTHER")
+                    materialnode.setNamedInput('normal', normal, 'NT_TEX_IMAGE')
+                    
+                if name + '_Roughness.' in imagefile:
+                    roughness = material.createNode('NT_TEX_FLOATIMAGE')
+                    roughness.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    roughness.parm('gamma').set(1)
+                    roughness.parm('colorSpace').set("NAMED_COLOR_SPACE_OTHER")
+                    materialnode.setNamedInput('roughness', roughness, 'NT_TEX_FLOATIMAGE')
+                    
+]]></script>
+  </tool>
+
+  <tool name="Arnold UDIM" label="Create UDIM Arnold Material" icon="ROP_Octane_ROP.svg">
+    <script scriptType="python"><![CDATA[import hou
+import os
+
+directory = hou.ui.selectFile(file_type=hou.fileType.Directory)
+root = hou.node('/obj')
+matnet = hou.node('/obj/octane_matnet')
+filename = []
+imageset = []
+temp = []
+udim = "1001."
+udimstr = ".<udim>."
+
+
+if matnet == None:
+    temp = root.createNode('matnet', 'octane_matnet')
+
+a = root.glob('*matnet')[0]
+
+if directory != "":
+
+    #get image list
+    imagesetdir = os.listdir(directory)
+    #replace space in image name with underscore
+    for i in imagesetdir:
+        i = i.replace(" ", "_")
+        imageset.append(i)
+
+    #get image name
+    for imagefile in imageset:
+        if imagefile.lower().endswith(('.png', '.jpg', '.tga', '.exr')):
+            #create filename list
+            name = imagefile.split('_')[:len(imagefile.split('_'))-1]
+            #udim = imagefile.split('_')[len(imagefile.split('_'))-1:]
+            name = "_".join(name).replace(" ", "_")
+            filename.append(name)
+            #remove duplicates from list
+            filename = list(dict.fromkeys(filename))
+
+
+            
+        
+    for name in filename:
+        #create material
+        material = a.createNode('octane_vopnet', name)
+        materialnode = material.createNode('NT_MAT_UNIVERSAL')
+        output = material.path() + "/octane_material1"
+        o = hou.node(output)
+        o.setNamedInput('material', materialnode, 'NT_MAT_UNIVERSAL')
+
+
+    #build shader
+        for imagefile in imageset:
+            if imagefile.lower().endswith(('.png', '.jpg', '.tga', '.exr')):
+                if name + '_BaseColor.' + udim in imagefile:
+                    #replace udim number with udim string
+                    imagefile = imagefile.split('.')
+                    imagefile[1] = udimstr
+                    imagefile = ''.join(imagefile)
+                    
+                    baseColor = material.createNode('NT_TEX_IMAGE_TILES')
+                    baseColor.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    materialnode.setNamedInput('albedo', baseColor, 'NT_TEX_IMAGE_TILES')
+    
+                if name + '_Emissive.' + udim in imagefile:
+                    imagefile = imagefile.split('.')
+                    imagefile[1] = udimstr
+                    imagefile = ''.join(imagefile)
+
+                    emissive = material.createNode('NT_TEX_IMAGE_TILES')
+                    emissive.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    texEmission = material.createNode('NT_EMIS_TEXTURE')
+                    texEmission.setNamedInput('efficiency_or_texture', emissive, 'NT_TEX_IMAGE_TILES')
+                    materialnode.setNamedInput('emission', texEmission, 'NT_EMIS_TEXTURE')                
+                
+                if name + '_Metalness.' + udim in imagefile:
+                    imagefile = imagefile.split('.')
+                    imagefile[1] = udimstr
+                    imagefile = ''.join(imagefile)
+
+                    metalness = material.createNode('NT_TEX_IMAGE_TILES')
+                    metalness.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    metalness.parm('gamma').set(1)
+                    materialnode.setNamedInput('metallic', metalness, 'NT_TEX_IMAGE_TILES')              
+                    
+                if name + '_Normal.' + udim in imagefile:
+                    imagefile = imagefile.split('.')
+                    imagefile[1] = udimstr
+                    imagefile = ''.join(imagefile)
+
+                    normal = material.createNode('NT_TEX_IMAGE_TILES')
+                    normal.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    normal.parm('gamma').set(1)
+                    materialnode.setNamedInput('normal', normal, 'NT_TEX_IMAGE_TILES')
+                    
+                if name + '_Roughness.' + udim in imagefile:
+                    imagefile = imagefile.split('.')
+                    imagefile[1] = udimstr
+                    imagefile = ''.join(imagefile)
+
+                    roughness = material.createNode('NT_TEX_IMAGE_TILES')
+                    roughness.parm('A_FILENAME').set(os.path.join(directory, imagefile))
+                    roughness.parm('gamma').set(1)
+                    materialnode.setNamedInput('roughness', roughness, 'NT_TEX_IMAGE_TILES')
+
+]]></script>
+  </tool>
+
+  <tool name="Create RS Arnold Material" label="Create RS Arnold Material" icon="rs_material-01.svg">
+    <script scriptType="python"><![CDATA[import hou
+import os
+
+directory = hou.ui.selectFile(file_type=hou.fileType.Directory)
+root = hou.node('/obj')
+matnet = hou.node('/obj/rs_matnet')
+filename = []
+imageset = []
+
+if matnet == None:
+    temp = root.createNode('matnet', 'rs_matnet')
+
+a = root.glob('rs_matnet')[0]
+
+
+if directory != "":
+    
+    #get image list
+    imagesetdir = os.listdir(directory)
+    #replace space in image name with underscore
+    for i in imagesetdir:
+        i = i.replace(" ", "_")
+        imageset.append(i)
+        
+    #get image list
+    imageset = os.listdir(directory)
+    #get image name
+    for imagefile in imageset:
+        if imagefile.lower().endswith(('.png', '.jpg', '.tga', '.exr')):
+            #create filename list
+            name = imagefile.split('_')[:len(imagefile.split('_'))-1]
+            name = "_".join(name).replace(" ", "_")
+            filename.append(name)
+            #remove duplicates from list
+            filename = list(dict.fromkeys(filename))
+        
+        
+    for name in filename:
+        #create material
+        material = a.createNode('redshift_vopnet', name)
+        material.moveToGoodPosition()
+        materialnode = material.glob('*Material1')[0]
+        materialnode.parm('refl_fresnel_mode').set('2')
+
+    #build shader
+        for imagefile in imageset:
+            if imagefile.lower().endswith(('.png', '.jpg', '.tga', '.exr')):
+                #print(imagefile)
+                if name + '_BaseColor.' in imagefile:
+                    baseColor = material.createNode('redshift::TextureSampler')
+                    baseColor.parm('tex0').set(os.path.join(directory, imagefile))
+                    materialnode.setNamedInput('diffuse_color', baseColor, 'outColor')
+    
+                if name + '_Emissive.' in imagefile:
+                    emissive = material.createNode('redshift::TextureSampler')
+                    emissive.parm('tex0').set(os.path.join(directory, imagefile))
+                    materialnode.setNamedInput('emission_color', emissive, 'outColor')
+                    materialnode.parm('emission_weight').set(1)
+                
+                
+                if name + '_Metalness.' in imagefile:
+                    metalness = material.createNode('redshift::TextureSampler')
+                    metalness.parm('tex0').set(os.path.join(directory, imagefile))
+                    metalness.parm('tex0_colorSpace').set('scene-linear Rec.709-sRGB')
+                    materialnode.setNamedInput('refl_metalness', metalness, 'outColor')
+                    
+                    
+                if name + '_Normal.' in imagefile:
+                    normal = material.createNode('redshift::TextureSampler')
+                    bump = material.createNode('BumpMap')
+                    bump.parm('inputType').set('1')
+                    normal.parm('tex0').set(os.path.join(directory, imagefile))
+                    normal.parm('tex0_colorSpace').set('scene-linear Rec.709-sRGB')
+                    bump.setNamedInput('input', normal, 'outColor')
+                    materialnode.setNamedInput('bump_input', bump, 'out')
+                    
+                if name + '_Roughness.' in imagefile:
+                    roughness = material.createNode('redshift::TextureSampler')
+                    roughness.parm('tex0').set(os.path.join(directory, imagefile))
+                    roughness.parm('tex0_colorSpace').set('scene-linear Rec.709-sRGB')
+                    materialnode.setNamedInput('refl_roughness', roughness, 'outColor')
+                    
+]]></script>
+  </tool>
+
+  <tool name="createNull" label="Create Null" icon="custom_hda_icon.png">
+    <script scriptType="python"><![CDATA[import hou
+sel = hou.selectedNodes()
+pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+cursor_position = pane.cursorPosition()
+
+for i in sel:
+    node = i.createOutputNode("OUT")
+    node.setName("OUT", unique_name=True)
+    node.setPosition(cursor_position)
+
+]]></script>
+  </tool>
+
+  <tool name="Split SOP by shop_materialpath" label="Material SOP Split" icon="PLASMA_App">
+    <script scriptType="python"><![CDATA[import hou
+temp = '@shop_materialpath=='
+child = hou.selectedNodes()
+
+for select in child:
+    children = select.children()
+    list = [c for c in children if c.type().name() != 'matnet']
+    #print(list)
+    for c in children:
+        a = c.outputs()
+          #get last node in network
+        
+        
+        if(a==()):
+            lastNode = c
+            l = lastNode.outputNames()
+            if (l != ()):
+                geo = lastNode.geometry()
+                #get material list
+                matname = geo.findPrimAttrib("shop_materialpath").strings()
+                print(matname)
+                #create blast node for each material
+                for i in matname:
+                    blast = select.createNode('blast')
+                    blast.setFirstInput(c, 0)
+                    blast.moveToGoodPosition()
+                    blast.parm('group').set(temp+i)
+                    blast.parm('negate').set(1)]]></script>
+  </tool>
+
+  <tool name="Merge selected nodes to network" label="Merge To Network" icon="arrows.svg">
+    <script scriptType="python"><![CDATA[import hou
+
+selected = hou.selectedNodes()
+dir = hou.node('/obj').createNode('geo')
+
+for node in selected:
+    file = dir.createNode('object_merge')
+    #file.setName(node[:3])
+    file.parm('objpath1').set(node.path())
+    file.parm('xformtype').set(1)]]></script>
+  </tool>
+
+  <tool name="Hierarchy for Octane" label="Hierarchy for Octane" icon="PLASMA_App">
+    <script scriptType="python"><![CDATA[import hou
+
+root = hou.node('/obj')
+node = hou.node('/obj/file1/')
+selected = hou.selectedNodes()
+
+
+#geo = node.geometry()
+for n in selected:
+    b = hou.node(n.path())
+    node = n.children()
+    for i in node:
+        name = i.name()
+        c = i.children()
+        outputNum = i.outputs()
+        if (outputNum == ()):
+            geo = i.geometry()
+            list = geo.findPrimAttrib('shop_materialpath').strings()
+            
+            a = b.createNode('null')
+            a.setName("Octane_RENDER")
+            a.moveToGoodPosition()
+            a.setInput(0, i, 0)
+
+            for prim in list:
+                b = root.createNode('geo')
+                b.moveToGoodPosition()
+                b.setName(prim)
+                objMerge = b.createNode('object_merge')
+                objMerge.parm('objpath1').set(n.path())
+                objMerge.parm('xformtype').set(1)
+                part = b.createNode('blast')
+                part.setInput(0, objMerge, 0)
+                part.setDisplayFlag(True)
+                part.setRenderFlag(True)
+                part.parm('group').set("@shop_materialpath==" + prim)
+                part.parm('negate').set(1)
+                part.moveToGoodPosition()]]></script>
+  </tool>
+</shelfDocument>

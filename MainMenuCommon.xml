@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mainMenu>
+  <menuBar>
+    <subMenu id="h.axtools">
+      <label>AX Tools</label>
+      <insertAfter>help_menu</insertAfter>
+      
+      <scriptItem id="h.swatchlib">
+        <label>Swatches Library</label>
+        <scriptCode><![CDATA[
+import hou
+x = hou.ui.curDesktop().createFloatingPaneTab(hou.paneTabType.PythonPanel, (200,200), (1200,800), "swatches")
+if x:
+    x.floatingPanel().setName("swatches")
+        ]]></scriptCode>
+      </scriptItem>
+    </subMenu>
+  </menuBar>
+</mainMenu>

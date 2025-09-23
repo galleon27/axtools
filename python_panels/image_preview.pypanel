@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <!-- This file contains definitions of Python interfaces and the
+ interfaces menu.  It should not be hand-edited when it is being
+ used by the application.  Note, that two definitions of the
+ same interface or of the interfaces menu are not allowed
+ in a single file. -->
+  <interface name="Image Preview" label="Image Preview" icon="MISC_python" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA[from PySide2 import QtWidgets, QtGui, QtCore
+import hou
+import os
+import random
+from PIL import Image, ImageDraw, ImageQt
+
+class ImagePreviewWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+            super(ImagePreviewWidget, self).__init__(parent)
+    
+            self.setMinimumSize(400, 400)
+            self.label = QtWidgets.QLabel()
+            self.label.setAlignment(QtCore.Qt.AlignCenter)
+    
+            layout = QtWidgets.QVBoxLayout()
+            layout.addWidget(self.label)
+            self.setLayout(layout)
+    
+            # Track last seen values
+            self._last_node = None
+            self._last_key = None
+            
+            self.update_preview()
+            hou.ui.addEventLoopCallback(self.check_for_updates)
+        
+    def check_for_updates(self):
+            """Poll the current selection and update the preview if needed."""
+            nodes = hou.selectedNodes()
+            if not nodes:
+                return
+    
+            node = nodes[0]
+            if not node:
+                return
+    
+            key = (
+                node.path(),
+                node.parm("image_path").eval(),
+                node.parm("samples").eval(),
+                node.parm("seed").eval()
+            )
+    
+            if self._last_key != key:
+                self._last_key = key
+                self._last_node = node
+                self.update_preview()
+                
+    def update_preview(self):
+        node = hou.selectedNodes()[0] if hou.selectedNodes() else None
+        if not node:
+            self.label.setText("Select an HDA node to preview.")
+            return
+
+        image_path = os.path.expandvars(node.parm("image_path").eval())
+        seed = int(node.parm("seed").eval())
+        samples = int(node.parm("samples").eval())
+
+        if not os.path.exists(image_path):
+            self.label.setText(f"Image not found:\n{image_path}")
+            return
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as e:
+            self.label.setText(f"Failed to load image:\n{str(e)}")
+            return
+
+        width, height = image.size
+        random.seed(seed)
+        draw = ImageDraw.Draw(image)
+
+        for _ in range(samples):
+            x = random.randint(0, width - 1)
+            y = random.randint(0, height - 1)
+            color = image.getpixel((x, y))
+            r1 = 6
+            r2 = 3
+            draw.ellipse([x - r1, y - r1, x + r1, y + r1], outline=(255, 255, 255), width=2)
+            draw.ellipse([x - r2, y - r2, x + r2, y + r2], fill=color)
+
+        qim = ImageQt.ImageQt(image)
+        pixmap = QtGui.QPixmap.fromImage(qim)
+        self.label.setPixmap(pixmap.scaled(600, 600, QtCore.Qt.KeepAspectRatio))
+        
+    def closeEvent(self, event):
+        hou.ui.removeEventLoopCallback(self.check_for_updates)
+        event.accept()
+
+
+def createInterface():
+    return ImagePreviewWidget()
+]]></script>
+    <includeInToolbarMenu menu_position="416" create_separator="false"/>
+    <help><![CDATA[]]></help>
+  </interface>
+</pythonPanelDocument>

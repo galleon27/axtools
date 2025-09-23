@@ -1,0 +1,8 @@
+{
+    "env": [
+        {
+            "ALEX": "D:/Dropbox/!hdas/otls/ALEX"
+        }
+    ],
+    "path": "$ALEX" 
+}

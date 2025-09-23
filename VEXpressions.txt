@@ -1,0 +1,9 @@
+attribwrangle/snippet
+    [AX] Time-offset Alembic Instance
+
+    float time = ch("time");
+    setprimintrinsic(0,"abcframe",@primnum,fit01(rand(@primnum), 0, time), "add");
+
+channelwrangle/snipper
+    [AX] Offset Animation
+    V = chinput(0, C, I + C*ch('offset'));

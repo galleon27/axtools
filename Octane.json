@@ -1,0 +1,16 @@
+{
+    "enable" : true,
+    "env": 
+    [
+    	{
+    		"HOUDINI_PATH" :
+    		{
+                "value": "C:/Users/ALEX/Documents/houdiniOctane",
+        	},
+            "PATH" :
+            {
+                "value": "C:/Users/ALEX/Documents/houdiniOctane/bin",
+            }            
+    	}
+    ]
+}
