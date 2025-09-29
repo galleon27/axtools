@@ -24,6 +24,8 @@
     <memberTool name="Gradient from Image"/>
     <memberTool name="Swatches"/>
     <memberTool name="Export Rops"/>
+    <memberTool name="Copernicus Heightmap Layers Export"/>
+    <memberTool name="Relink Files"/>
   </toolshelf>
 
   <tool name="GSG Octane Material" label="GSG Octane Material" icon="custom_hda_icon">
@@ -1228,8 +1230,212 @@ for file in list:
         #print file]]></script>
   </tool>
 
-  <tool name="Export Rops" label="Export Rops" icon="PLASMA_App">
+  <tool name="Export Rops" label="Export Rops" icon="export_rops">
     <script scriptType="python"><![CDATA[import shelf_export_rops # your saved module filename without .py
 shelf_export_rops.show_ui()]]></script>
+  </tool>
+
+  <tool name="Copernicus Heightmap Layers Export" label="Copernicus Heightmap Layers Export" icon="export_rops">
+    <script scriptType="python"><![CDATA[import hou
+
+# Get the currently selected node.
+try:
+    selected_node = hou.selectedNodes()[0]
+except IndexError:
+    hou.ui.displayMessage("Please select a node first.", title="No Node Selected")
+    raise SystemExit
+
+# Get the parent network of the selected node.
+parent = selected_node.parent()
+
+# Get the position of the selected node to place the new nodes relative to it.
+pos = selected_node.position()
+
+# Get all the output labels from the selected node.
+output_labels = selected_node.outputLabels()
+
+# Exit if the selected node has no outputs.
+if not output_labels:
+    hou.ui.displayMessage("The selected node has no outputs.", title="No Outputs Found")
+    raise SystemExit
+
+# A list to hold the newly created NULL nodes and their corresponding labels.
+processed_nodes = []
+
+# --- Create a NULL for each output ---
+for i, label in enumerate(output_labels):
+    # Create the NULL node.
+    null_node = parent.createNode("null", f"OUT_{label}")
+
+    # Connect the selected node's output to the new NULL's input.
+    null_node.setInput(0, selected_node, i)
+
+    # Calculate and set the position for the NULL node.
+    null_pos = hou.Vector2(pos.x() + 3, pos.y() - i * 1.5)
+    null_node.setPosition(null_pos)
+
+    # Set 'outputname1' parameter if it exists.
+    # Note: A standard NULL COP does not have this parameter.
+    # This will only work on nodes that have this specific parameter.
+    output_name_parm = null_node.parm("outputname1").set(label)
+
+    # Add the new NULL and its label to our list for the next step.
+    processed_nodes.append((null_node, label))
+
+
+# --- Create a ROP for each new NULL ---
+for null_node, label in processed_nodes:
+    # Get the position of the current NULL node.
+    null_pos = null_node.position()
+
+    # Create a 'comp' (Composite Output) node.
+    # We'll name it based on the label.
+    rop_name = f"ROP_{label}"
+    rop_node = parent.createNode("rop_image", rop_name)
+
+    # Connect the NULL node's output to the new ROP node's input.
+    rop_node.setInput(0, null_node, 0)
+
+    # Position the ROP node to the right of the NULL node.
+    rop_pos = hou.Vector2(null_pos.x() + 3, null_pos.y())
+    rop_node.setPosition(rop_pos)
+
+    # Set the AOV Image Plane parameter on the rop_node to the label.
+    rop_node.parm("aov1").set(label)
+
+]]></script>
+  </tool>
+
+  <tool name="Relink Files" label="Relink Files" icon="PLASMA_App">
+    <script scriptType="python"><![CDATA[import hou
+
+# --- Version-Agnostic PySide Import ---
+# For compatibility with Houdini 20+ (PySide6) and older versions (PySide2).
+try:
+    from PySide6 import QtWidgets, QtCore
+except ImportError:
+    from PySide2 import QtWidgets, QtCore
+
+# --- Global variable to hold a single instance of our dialog ---
+# This prevents opening multiple copies of the tool window.
+path_replacer_dialog_instance = None
+
+
+# --- Node/Parameter Mapping ---
+NODE_PARAM_MAP = {
+    'mtlximage': 'file',
+    'redshift::TextureSampler': 'tex0',
+    'file': 'file',
+    'octane::NT_TEX_IMAGE': 'A_FILENAME',
+    'octane::NT_TEX_FLOATIMAGE': 'A_FILENAME',
+    'octane::NT_TEX_ALPHA': 'A_FILENAME'
+}
+
+
+class PathReplacerDialog(QtWidgets.QDialog):
+    """A non-modal dialog window for path replacement."""
+    def __init__(self, parent=hou.ui.mainQtWindow()):
+        super(PathReplacerDialog, self).__init__(parent)
+
+        self.setWindowTitle("File Path Replacer")
+        self.setMinimumWidth(450)
+        
+        # This attribute makes the window appear on top, but it's not strictly modal.
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+
+        # --- UI Setup ---
+        self.main_layout = QtWidgets.QVBoxLayout(self)
+        
+        # Add a label to guide the user
+        info_label = QtWidgets.QLabel("Select a parent node, then enter paths and click Replace.")
+        info_label.setStyleSheet("font-style: italic; color: #888;")
+
+        form_layout = QtWidgets.QFormLayout()
+        self.original_path_input = QtWidgets.QLineEdit()
+        self.new_path_input = QtWidgets.QLineEdit()
+        form_layout.addRow("Original Path:", self.original_path_input)
+        form_layout.addRow("New Path:", self.new_path_input)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        self.replace_button = QtWidgets.QPushButton("Replace")
+        self.close_button = QtWidgets.QPushButton("Close")
+        button_layout.addStretch() 
+        button_layout.addWidget(self.replace_button)
+        button_layout.addWidget(self.close_button)
+
+        self.main_layout.addWidget(info_label)
+        self.main_layout.addLayout(form_layout)
+        self.main_layout.addLayout(button_layout)
+
+        # --- Connections ---
+        self.replace_button.clicked.connect(self.run_replacement_logic)
+        self.close_button.clicked.connect(self.close) # The built-in close slot
+
+    def run_replacement_logic(self):
+        """This function is now triggered by the 'Replace' button."""
+        start_node = None
+        selected_nodes = hou.selectedNodes()
+        if not selected_nodes:
+            hou.ui.displayMessage("Please select a parent node in the network first.", title="Error")
+            return
+        
+        start_node = selected_nodes[0]
+        
+        original_path = self.original_path_input.text()
+        new_path = self.new_path_input.text()
+
+        if not original_path:
+            hou.ui.displayMessage("The 'Original Path' field cannot be empty.", title="Error")
+            return
+
+        updated_nodes_count = 0
+        with hou.undos.group("Replace File Paths"):
+            for node in start_node.allSubChildren():
+                node_type_name = node.type().name()
+                
+                if node_type_name in NODE_PARAM_MAP:
+                    param_name = NODE_PARAM_MAP[node_type_name]
+                    file_parm = node.parm(param_name)
+                    
+                    if file_parm:
+                        current_raw_path = file_parm.unexpandedString()
+                        if original_path in current_raw_path:
+                            new_raw_path = current_raw_path.replace(original_path, new_path)
+                            file_parm.set(new_raw_path)
+                            updated_nodes_count += 1
+        
+        hou.ui.displayMessage(
+            f"Updated {updated_nodes_count} file path(s) within '{start_node.name()}'.",
+            title="Process Complete"
+        )
+        
+    def closeEvent(self, event):
+        """
+        This is a special Qt function that runs when the window is closed.
+        We use it to clean up our global instance variable.
+        """
+        global path_replacer_dialog_instance
+        path_replacer_dialog_instance = None
+        super(PathReplacerDialog, self).closeEvent(event)
+
+
+def show_tool():
+    """
+    This is the main function called by the shelf button.
+    It manages the creation and display of the dialog instance.
+    """
+    global path_replacer_dialog_instance
+    
+    # If an instance of the window already exists, just bring it to the front.
+    if path_replacer_dialog_instance:
+        path_replacer_dialog_instance.raise_()
+        path_replacer_dialog_instance.activateWindow()
+    # Otherwise, create a new one.
+    else:
+        path_replacer_dialog_instance = PathReplacerDialog()
+        path_replacer_dialog_instance.show()
+
+# --- Entry point for the shelf tool ---
+show_tool()]]></script>
   </tool>
 </shelfDocument>
