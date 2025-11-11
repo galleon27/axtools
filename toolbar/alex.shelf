@@ -607,16 +607,38 @@ if directory != "":
 
   <tool name="createNull" label="Create Null" icon="custom_hda_icon.png">
     <script scriptType="python"><![CDATA[import hou
-sel = hou.selectedNodes()
-pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
-cursor_position = pane.cursorPosition()
 
-for i in sel:
-    node = i.createOutputNode("OUT")
-    node.setName("OUT", unique_name=True)
-    node.setPosition(cursor_position)
+def create_output_node():
+    """
+    Creates a custom 'OUT' HDA if the context supports it,
+    otherwise defaults to creating a 'null' node.
+    """
+    sel = hou.selectedNodes()
+    if not sel:
+        return
 
-]]></script>
+    pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+    if not pane:
+        return
+
+    cursor_position = pane.cursorPosition()
+    parent_node = pane.pwd()
+    node_type_category = parent_node.childTypeCategory()
+
+    # Determine which node type to create based on the current context.
+    if "OUT" in node_type_category.nodeTypes():
+        node_to_create = "OUT"
+    else:
+        node_to_create = "null"
+
+    # Create the determined node type for each selected node.
+    for i in sel:
+        node = i.createOutputNode(node_to_create)
+        node.setName("OUT", unique_name=True)
+        node.setPosition(cursor_position)
+
+# Execute the function to run the script.
+create_output_node()]]></script>
   </tool>
 
   <tool name="Split SOP by shop_materialpath" label="Material SOP Split" icon="PLASMA_App">
