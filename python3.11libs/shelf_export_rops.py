@@ -1,11 +1,11 @@
 import hou
-from PySide2 import QtWidgets, QtCore, QtGui
+from PySide6 import QtWidgets, QtCore, QtGui
 
 # --- Define the list of all ROP types we want to search for ---
 ROP_TYPES_TO_FIND = ['rop_fbx', 'rop_geometry', 'rop_alembic']
 
 
-# --- Core Logic Functions ---
+# --- Core Logic Functions (Unchanged) ---
 
 def find_rop_nodes_in_selection(rop_type_names):
     """
@@ -86,14 +86,15 @@ def execute_rops(rop_nodes):
     print("\nExecution complete.")
 
 
-# --- PySide2 GUI Class ---
+# --- PySide6 GUI Class ---
 
 class RopExporterUI(QtWidgets.QWidget):
     
     ui_instance = None
 
     def __init__(self, parent=None):
-        super(RopExporterUI, self).__init__(parent=hou.qt.mainWindow(), f=QtCore.Qt.Window)
+        # PySide6: Explicitly set the window flag type
+        super().__init__(parent=hou.qt.mainWindow(), f=QtCore.Qt.WindowType.Window)
         
         # --- Window Properties ---
         self.setWindowTitle("ROP Exporter")
@@ -106,15 +107,22 @@ class RopExporterUI(QtWidgets.QWidget):
 
         self.rop_tree_view = QtWidgets.QTreeView()
         self.rop_tree_view.setModel(self.rop_model)
-        self.rop_tree_view.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        # PySide6: SelectionMode Enum
+        self.rop_tree_view.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         
-        # --- IMPROVEMENT: Changed edit trigger for better responsiveness ---
-        self.rop_tree_view.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.EditKeyPressed)
+        # PySide6: EditTrigger Enum
+        self.rop_tree_view.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked | 
+            QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         
-        self.rop_tree_view.setSortingEnabled(False) # Disable sorting to maintain groups
-        self.rop_tree_view.header().setSectionResizeMode(0, QtWidgets.QHeaderView.Interactive)
-        self.rop_tree_view.header().setSectionResizeMode(1, QtWidgets.QHeaderView.Interactive)
-        self.rop_tree_view.header().setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        self.rop_tree_view.setSortingEnabled(False) 
+        
+        # PySide6: ResizeMode Enum
+        self.rop_tree_view.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        self.rop_tree_view.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        self.rop_tree_view.header().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        
         self.rop_tree_view.header().resizeSection(0, 150)
         self.rop_tree_view.header().resizeSection(1, 150)
         
@@ -151,7 +159,10 @@ class RopExporterUI(QtWidgets.QWidget):
         Searches selection first, then falls back to all of /obj.
         """
         # Temporarily disconnect the signal to prevent it firing during population
-        self.rop_model.itemChanged.disconnect(self.on_item_changed)
+        try:
+            self.rop_model.itemChanged.disconnect(self.on_item_changed)
+        except RuntimeError:
+            pass # Signal wasn't connected
         
         self.rop_model.clear()
         self.rop_model.setHorizontalHeaderLabels(["ROP Name", "Node", "Output Path"])
@@ -191,9 +202,9 @@ class RopExporterUI(QtWidgets.QWidget):
                     output_path = rop_node.parm('sopoutput').eval() if rop_node.parm('sopoutput') else ""
                     rop_output_item = QtGui.QStandardItem(output_path)
                     
-                    # Store the hou.Node object on the items that need it
-                    rop_name_item.setData(rop_node, QtCore.Qt.UserRole)
-                    rop_output_item.setData(rop_node, QtCore.Qt.UserRole) # Added for direct access
+                    # Store the hou.Node object. PySide6 prefers ItemDataRole enum for clarity.
+                    rop_name_item.setData(rop_node, QtCore.Qt.ItemDataRole.UserRole)
+                    rop_output_item.setData(rop_node, QtCore.Qt.ItemDataRole.UserRole)
                     
                     parent_item.appendRow([rop_name_item, node_path_item, rop_output_item])
                 
@@ -215,7 +226,8 @@ class RopExporterUI(QtWidgets.QWidget):
             return
 
         new_path = item.text()
-        rop_node = item.data(QtCore.Qt.UserRole) # Directly get the node from the item
+        # PySide6: Retrieve data using ItemDataRole enum
+        rop_node = item.data(QtCore.Qt.ItemDataRole.UserRole)
         
         if isinstance(rop_node, hou.Node) and rop_node.parm('sopoutput'):
             try:
@@ -249,7 +261,8 @@ class RopExporterUI(QtWidgets.QWidget):
             if index.parent().isValid():
                 item = self.rop_model.itemFromIndex(index)
                 if item:
-                    node = item.data(QtCore.Qt.UserRole)
+                    # PySide6: Retrieve data using ItemDataRole enum
+                    node = item.data(QtCore.Qt.ItemDataRole.UserRole)
                     if isinstance(node, hou.Node):
                         nodes_to_export.append(node)
         
@@ -267,7 +280,6 @@ def show_ui():
     """
     Creates and shows the UI. Ensures that only one instance of the UI exists.
     """
-    # This simple singleton pattern is good for Houdini tools
     if RopExporterUI.ui_instance:
         try:
             RopExporterUI.ui_instance.close()

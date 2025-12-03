@@ -3,8 +3,12 @@ import os
 import random
 from PIL import Image, ImageQt, ImageDraw
 import colorsys
-from PySide2 import QtWidgets, QtGui, QtCore
- 
+from PySide6 import QtWidgets, QtGui, QtCore
+
+# -----------------------------------------------------------------------------
+# CORE LOGIC (No UI)
+# -----------------------------------------------------------------------------
+
 def sample_image_colors_to_ramp(
     hda_node,
     image_parm="image_path",
@@ -13,7 +17,7 @@ def sample_image_colors_to_ramp(
     seed_parm="seed",
     filter_parm="filter_mode"
 ):
-    # Load parameters
+    # (Same code as before for the ramp generation logic...)
     image_path = os.path.expandvars(hda_node.parm(image_parm).eval())
     num_samples = max(1, int(hda_node.parm(samples_parm).eval()))
     seed = int(hda_node.parm(seed_parm).eval())
@@ -32,7 +36,6 @@ def sample_image_colors_to_ramp(
     width, height = image.size
     random.seed(seed)
 
-    # Sample a subset of pixels (fast)
     candidate_count = 10000
     sampled_pixels = [
         image.getpixel((random.randint(0, width - 1), random.randint(0, height - 1)))
@@ -44,16 +47,11 @@ def sample_image_colors_to_ramp(
 
     def passes_filter(rgb):
         h, s, v = rgb_to_hsv(rgb)
-        if filter_mode == "bright":
-            return v > 0.7
-        elif filter_mode == "dark":
-            return v < 0.3
-        elif filter_mode == "muted":
-            return s < 0.3
-        elif filter_mode == "deep":
-            return s > 0.6 and v < 0.5
-        else:
-            return True
+        if filter_mode == "bright": return v > 0.7
+        elif filter_mode == "dark": return v < 0.3
+        elif filter_mode == "muted": return s < 0.3
+        elif filter_mode == "deep": return s > 0.6 and v < 0.5
+        else: return True
 
     filtered = [rgb for rgb in sampled_pixels if passes_filter(rgb)]
 
@@ -61,27 +59,28 @@ def sample_image_colors_to_ramp(
         hou.ui.displayMessage(f"No pixels matched filter '{filter_mode}'.")
         return
 
-    # Final color pick
     final_colors = random.sample(filtered, min(num_samples, len(filtered)))
     final_colors = [[c / 255.0 for c in color] for color in final_colors]
     final_colors.sort(key=lambda rgb: sum(rgb))
 
-    # Build ramp
     positions = [float(i) / (len(final_colors) - 1) if len(final_colors) > 1 else 0.5 for i in range(len(final_colors))]
     bases = [hou.rampBasis.Linear] * len(final_colors)
     ramp = hou.Ramp(bases, positions, final_colors)
 
-    # Apply ramp
-    ramp_parm = hda_node.parm(ramp_parm)
-    if ramp_parm:
-        ramp_parm.set(ramp)
+    ramp_parm_node = hda_node.parm(ramp_parm)
+    if ramp_parm_node:
+        ramp_parm_node.set(ramp)
 
-preview_window_instance = None  # Place this at the top of your PythonModule file
+
+# -----------------------------------------------------------------------------
+# UI LOGIC (Preview Window)
+# -----------------------------------------------------------------------------
+
+preview_window_instance = None
 
 def show_image_preview_with_markers(hda_node):
     global preview_window_instance
 
-    # If already open, just bring it to front or refresh
     if preview_window_instance is not None and preview_window_instance.isVisible():
         preview_window_instance.raise_()
         preview_window_instance.activateWindow()
@@ -90,40 +89,71 @@ def show_image_preview_with_markers(hda_node):
     class ImagePreview(QtWidgets.QDialog):
         def __init__(self, hda_node):
             super().__init__()
-            self.setWindowTitle("Image Preview with Color Markers")
-            self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-            self.setMinimumSize(400, 400)
+            self.setWindowTitle("Image Preview")
+            self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowType.WindowStaysOnTopHint)
+            self.resize(500, 500) # Default starting size
+            
             self.hda_node = hda_node
 
-            self.label = QtWidgets.QLabel()
-            self.label.setAlignment(QtCore.Qt.AlignCenter)
+            # Data containers
+            self.cached_image_path = None
+            self.original_image = None # PIL Image
+            self.sampled_data = []     # List of (x, y, rgb_tuple)
 
+            # UI Setup
             layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0) # Edge to edge image
+            
+            self.label = QtWidgets.QLabel()
+            self.label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            
+            # CRITICAL: This allows the label to shrink. Otherwise, the label will 
+            # lock the window size to the image size and prevent shrinking.
+            self.label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+            
             layout.addWidget(self.label)
 
-            # Store last parameter values to detect changes
+            # State tracking
             self.last_params = {
-                "image_path": None,
-                "seed": None,
-                "samples": None,
-                "filter_mode": None,
+                "image_path": None, "seed": None, "samples": None, "filter_mode": None,
             }
 
             self.update_timer = QtCore.QTimer(self)
-            self.update_timer.timeout.connect(self.check_for_updates)
-            self.update_timer.start(300)  # check every 300ms
+            self.update_timer.timeout.connect(self.check_node_params)
+            self.update_timer.start(300)
 
             self.destroyed.connect(self.cleanup)
 
-            # Initial update
-            self.update_preview()
+            # Initial load
+            self.check_node_params()
 
         def cleanup(self):
             global preview_window_instance
             preview_window_instance = None
 
-        def check_for_updates(self):
+        # ---------------------------------------------------------------------
+        # Event Overrides
+        # ---------------------------------------------------------------------
+        
+        def resizeEvent(self, event):
+            """
+            Triggered automatically by Qt when the user resizes the window.
+            We just re-draw the current data to fit the new size.
+            """
+            self.draw_preview()
+            super().resizeEvent(event)
+
+        # ---------------------------------------------------------------------
+        # Logic
+        # ---------------------------------------------------------------------
+
+        def check_node_params(self):
+            """
+            Checks Houdini node parameters to see if we need to reload the image/data.
+            """
             try:
+                # Use raw string for path to avoid evaluation issues if not needed, 
+                # but eval() is usually safer for env vars.
                 image_path = os.path.expandvars(self.hda_node.parm("image_path").eval())
                 seed = int(self.hda_node.parm("seed").eval())
                 samples = int(self.hda_node.parm("samples").eval())
@@ -142,124 +172,162 @@ def show_image_preview_with_markers(hda_node):
 
             if changed:
                 self.last_params.update({
-                    "image_path": image_path,
-                    "seed": seed,
-                    "samples": samples,
-                    "filter_mode": filter_mode,
+                    "image_path": image_path, "seed": seed, 
+                    "samples": samples, "filter_mode": filter_mode,
                 })
-                self.update_preview()
+                # Reload data and redraw
+                self.process_image_data()
+                self.draw_preview()
 
-        def update_preview(self):
-            image_path = self.last_params["image_path"]
+        def process_image_data(self):
+            """
+            Heavy lifting: Loads image from disk and calculates sample points.
+            Only runs when parameters change, NOT when resizing window.
+            """
+            path = self.last_params["image_path"]
             seed = self.last_params["seed"]
             samples = self.last_params["samples"]
             filter_mode = self.last_params["filter_mode"]
 
-            if not image_path or not os.path.exists(image_path):
+            if not path or not os.path.exists(path):
+                self.original_image = None
+                self.sampled_data = []
                 return
 
             try:
-                original_image = Image.open(image_path).convert("RGB")
+                # Store the original PIL image
+                self.original_image = Image.open(path).convert("RGB")
             except Exception:
+                self.original_image = None
                 return
 
-            width, height = original_image.size
+            width, height = self.original_image.size
             random.seed(seed)
 
-            # Sample pixels
+            # 1. Filter candidates
             candidate_count = 10000
-            sampled_pixels = [
-                original_image.getpixel((random.randint(0, width - 1), random.randint(0, height - 1)))
-                for _ in range(candidate_count)
-            ]
+            candidates = []
+            for _ in range(candidate_count):
+                cx, cy = random.randint(0, width - 1), random.randint(0, height - 1)
+                candidates.append((cx, cy, self.original_image.getpixel((cx, cy))))
 
             def rgb_to_hsv(rgb):
                 return colorsys.rgb_to_hsv(*(c / 255.0 for c in rgb))
 
             def passes_filter(rgb):
                 h, s, v = rgb_to_hsv(rgb)
-                if filter_mode == "bright":
-                    return v > 0.7
-                elif filter_mode == "dark":
-                    return v < 0.3
-                elif filter_mode == "muted":
-                    return s < 0.3
-                elif filter_mode == "deep":
-                    return s > 0.6 and v < 0.5
+                if filter_mode == "bright": return v > 0.7
+                elif filter_mode == "dark": return v < 0.3
+                elif filter_mode == "muted": return s < 0.3
+                elif filter_mode == "deep": return s > 0.6 and v < 0.5
                 return True
 
-            filtered = [rgb for rgb in sampled_pixels if passes_filter(rgb)]
-            if not filtered:
+            filtered_candidates = [item for item in candidates if passes_filter(item[2])]
+
+            # 2. Pick Final Sample Points
+            # We store the coordinate (x,y) and color so we can draw it later
+            # regardless of image scale.
+            self.sampled_data = []
+            if filtered_candidates:
+                # We need random positions from the filtered set, but we want 
+                # new random positions for the visualization to match the ramp logic
+                # Ideally, we should visualize exactly what the ramp sees.
+                # For visualization purposes, let's just pick 'samples' amount of random spots
+                # that pass the filter to show where colors COULD come from.
+                
+                # To be accurate to the ramp logic:
+                # The ramp logic grabs pixel values. To visualize *location*, 
+                # we just grab random valid coordinates.
+                for _ in range(samples):
+                     # Randomly pick a valid pixel location from the filtered list
+                     # (In a real scenario, you might want spatial distribution, 
+                     # but here we pick from the pool of valid colors)
+                     import random as rnd
+                     chosen = rnd.choice(filtered_candidates)
+                     self.sampled_data.append(chosen)
+
+        def draw_preview(self):
+            """
+            Rendering: Scales current image to window size and paints markers.
+            Runs on every Resize event.
+            """
+            if not self.original_image:
+                self.label.setText("No Image Loaded")
                 return
 
-            sampled_positions = []
-            for _ in range(samples):
-                x = random.randint(0, width - 1)
-                y = random.randint(0, height - 1)
-                color = original_image.getpixel((x, y))
-                sampled_positions.append((x, y, color))
+            # 1. Get current available size from the label/window
+            # We use the label size, which adjusts with the window
+            target_w = self.label.width()
+            target_h = self.label.height()
 
-            # Convert image for display
-            qim = ImageQt.ImageQt(original_image)
+            if target_w <= 0 or target_h <= 0:
+                return
+
+            # 2. Convert PIL to QPixmap
+            qim = ImageQt.ImageQt(self.original_image)
             pixmap = QtGui.QPixmap.fromImage(qim)
 
-            # Scale the image to fit the label
+            # 3. Scale Pixmap keeping Aspect Ratio
+            # This does the math to fit the image inside the window
             scaled_pixmap = pixmap.scaled(
-                self.label.width(),
-                self.label.height(),
-                QtCore.Qt.KeepAspectRatio,
-                QtCore.Qt.SmoothTransformation
+                target_w, target_h,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation
             )
 
-            # Compute scale factor and offset
-            scaled_width = scaled_pixmap.width()
-            scaled_height = scaled_pixmap.height()
-            x_scale = scaled_width / width
-            y_scale = scaled_height / height
-            scale = min(x_scale, y_scale)
+            # 4. Calculate coordinate translation
+            # We need to know where (0,0) of the image ended up relative to the label center
+            orig_w, orig_h = self.original_image.size
+            final_w = scaled_pixmap.width()
+            final_h = scaled_pixmap.height()
 
-            x_offset = (self.label.width() - scaled_width) // 2
-            y_offset = (self.label.height() - scaled_height) // 2
+            scale_factor = final_w / orig_w # Uniform scale because of KeepAspectRatio
 
-            # Convert to QImage for painting
-            image_with_overlay = scaled_pixmap.toImage()
+            # 5. Prepare to Draw Markers
+            # We draw onto the Scaled Pixmap so the markers are crisp 
+            # (or we could draw on an overlay widget, but painting on the image is easier here)
+            image_for_painting = scaled_pixmap.toImage()
             painter = QtGui.QPainter()
-            painter.begin(image_with_overlay)
-            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.begin(image_for_painting)
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
 
-            outer_radius = 6  # Absolute size
+            outer_radius = 6
             inner_radius = 4
 
-            for x, y, rgb in sampled_positions:
-                sx = int(x * scale)
-                sy = int(y * scale)
+            # 6. Draw Dots
+            for x_orig, y_orig, rgb in self.sampled_data:
+                # Project original coordinates to scaled coordinates
+                sx = int(x_orig * scale_factor)
+                sy = int(y_orig * scale_factor)
+
                 color = QtGui.QColor(*rgb)
 
-                # Outer white ring
+                # White Outline
                 pen = QtGui.QPen(QtGui.QColor(255, 255, 255))
                 pen.setWidth(2)
                 painter.setPen(pen)
-                painter.setBrush(QtCore.Qt.NoBrush)
-                painter.drawEllipse(sx - outer_radius, sy - outer_radius, outer_radius * 2, outer_radius * 2)
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(
+                    QtCore.QPoint(sx, sy), 
+                    outer_radius, outer_radius
+                )
 
-                # Inner fill
-                painter.setPen(QtCore.Qt.NoPen)
+                # Color Fill
+                painter.setPen(QtCore.Qt.PenStyle.NoPen)
                 painter.setBrush(color)
-                painter.drawEllipse(sx - inner_radius, sy - inner_radius, inner_radius * 2, inner_radius * 2)
+                painter.drawEllipse(
+                    QtCore.QPoint(sx, sy), 
+                    inner_radius, inner_radius
+                )
 
             painter.end()
 
-            final_pixmap = QtGui.QPixmap.fromImage(image_with_overlay)
-            self.label.setPixmap(final_pixmap)
+            # 7. Update Label
+            self.label.setPixmap(QtGui.QPixmap.fromImage(image_for_painting))
 
 
-
-    # Create and show the window
     preview_window_instance = ImagePreview(hda_node)
     preview_window_instance.show()
-
-
-
 
 def ui():
     node = hou.pwd()
