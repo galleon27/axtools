@@ -6,7 +6,7 @@
  same interface or of the interfaces menu are not allowed
  in a single file. -->
   <interface name="swatches" label="Swatches" icon="MISC_python" showNetworkNavigationBar="false" help_url="">
-    <script><![CDATA[from PySide2 import QtWidgets, QtCore
+    <script><![CDATA[from PySide6 import QtWidgets, QtCore
 import swatches_panel # your saved module filename without .py
 
 def onCreateInterface():
