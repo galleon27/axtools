@@ -1134,31 +1134,39 @@ show_tool()]]></script>
   </tool>
 
   <tool name="Loop Sequence" label="Loop Sequence" icon="custom_hda_icon">
+    <helpText><![CDATA[Loops a loaded sequence.]]></helpText>
     <script scriptType="python"><![CDATA[import hou
 import glob
 import re
+import os
 
 nodes = hou.selectedNodes()
 
 for node in nodes:
     parm = node.parm("file") or node.parm("filename") or node.parm("map")
-    
+
     if parm:
         raw_path = parm.unexpandedString()
         match = re.search(r'\$F(\d+)', raw_path)
-        
+
         if match:
             f_token = match.group(0)
-            padding = match.group(1)
+            padding_str = match.group(1)
+            padding_val = int(padding_str)
             
             glob_path = raw_path.replace(f_token, "*")
             expanded_path = hou.expandString(glob_path)
-            file_count = len(glob.glob(expanded_path))
+            files = glob.glob(expanded_path)
+            file_count = len(files)
             
-            if file_count == 0:
-                file_count = 300
-                
-            expr = "`padzero({}, ($F - 1) % {} + 1)`".format(padding, file_count)
+            zero_filename = raw_path.replace(f_token, "0".zfill(padding_val))
+            expanded_zero = hou.expandString(zero_filename)
+            
+            if os.path.exists(expanded_zero):
+                expr = "`padzero({}, ($F - 1) % {})`".format(padding_str, file_count)
+            else:
+                expr = "`padzero({}, ($F - 1) % {} + 1)`".format(padding_str, file_count)
+            
             parm.set(raw_path.replace(f_token, expr))]]></script>
   </tool>
 </shelfDocument>
