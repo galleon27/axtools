@@ -79,7 +79,6 @@ class SwatchLabel(QtWidgets.QLabel):
 
         self._drag_active = True
         self._has_moved = False
-        # PySide6: use position().toPoint() instead of pos()
         self._start_pos = event.position().toPoint()
         self._button = event.button()
 
@@ -154,7 +153,8 @@ class SwatchLabel(QtWidgets.QLabel):
                 elif context_type in self.REDSHIFT_CONTEXTS:
                     created_nodes = self._create_redshift_nodes(context, swatch_to_create, pos)
                 elif context.childTypeCategory().name() == 'Object':
-                    created_nodes = self._create_object_nodes(context, swatch_to_create)
+                    # Double click in Object context: create single geo with color
+                    created_nodes = self._create_object_nodes(context, swatch_to_create, pos)
                 else:
                     hou.ui.displayMessage(f"Unsupported network context for swatch creation: {context_type}")
 
@@ -177,8 +177,7 @@ class SwatchLabel(QtWidgets.QLabel):
         swatch_action = menu.addAction("Create Swatches in Geo")
         swatch_action.triggered.connect(self.create_swatches_in_geo)
         
-        # PySide6: globalPos is deprecated, use globalPosition().toPoint(), exec_ is now exec
-        menu.exec(event.globalPosition().toPoint())
+        menu.exec(event.globalPos())
 
     @staticmethod
     def sort_colors_by_hue(swatches):
@@ -193,7 +192,6 @@ class SwatchLabel(QtWidgets.QLabel):
         return sorted(swatches, key=lambda s: rgb_to_hsv(s.rgb))
 
     def mouseMoveEvent(self, event):
-        # PySide6: pos() deprecated, use position().toPoint()
         current_pos = event.position().toPoint()
         if self._drag_active and (current_pos - self._start_pos).manhattanLength() > 5:
             self._has_moved = True
@@ -209,8 +207,6 @@ class SwatchLabel(QtWidgets.QLabel):
 
         swatches_to_create = []
         if self._button == Qt.MouseButton.MiddleButton:
-            # If the middle-dragged swatch is part of a selection, use the selection.
-            # Otherwise, just use the single swatch under the cursor.
             if self in SwatchLabel.selected_labels:
                 swatches_to_create = list(SwatchLabel.selected_labels)
             else:
@@ -234,7 +230,8 @@ class SwatchLabel(QtWidgets.QLabel):
             elif context_type in self.REDSHIFT_CONTEXTS:
                 created_nodes = self._handle_material_creation(context, swatches_to_create, pos, self._create_redshift_nodes, self._create_redshift_gradient)
             elif context.childTypeCategory().name() == 'Object':
-                created_nodes = self._create_object_nodes(context, swatches_to_create)
+                # Re-use _handle_sop_creation for Object context as the logic (Ask Nodes vs Gradient) is identical
+                created_nodes = self._handle_sop_creation(context, swatches_to_create, pos, self._create_object_nodes, self._create_object_gradient)
             else:
                 hou.ui.displayMessage(f"Unsupported network context for drag & drop: {context_type}")
 
@@ -260,18 +257,7 @@ class SwatchLabel(QtWidgets.QLabel):
             return node_creation_func(context, selected, pos)
 
     def _handle_material_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
-        if len(selected) > 1:
-            choice = hou.ui.displayMessage("Create individual nodes or a gradient?", buttons=["Nodes", "Gradient", "Cancel"], default_choice=0, close_choice=2)
-            if choice == 0:
-                return node_creation_func(context, selected, pos)
-            elif choice == 1:
-                sort_choice = hou.ui.displayMessage("Sort swatches by hue?", buttons=["Yes", "No", "Cancel"], default_choice=0, close_choice=2)
-                if sort_choice == 2: return []
-                swatches_to_use = self.sort_colors_by_hue(selected) if sort_choice == 0 else selected
-                return gradient_creation_func(context, swatches_to_use, pos)
-            else: return []
-        else:
-            return node_creation_func(context, selected, pos)
+        return self._handle_sop_creation(context, selected, pos, node_creation_func, gradient_creation_func)
 
     def _create_nodes(self, context, selected, pos, node_type, parm_names):
         created = []
@@ -311,11 +297,18 @@ class SwatchLabel(QtWidgets.QLabel):
     def _create_redshift_nodes(self, context, selected, pos):
         return self._create_nodes(context, selected, pos, "redshift::RSColorConstant", ("colorr", "colorg", "colorb"))
 
-    def _create_object_nodes(self, context, selected):
+    def _create_object_nodes(self, context, selected, pos=None):
         created = []
-        for swatch in selected:
+        spacing = hou.Vector2(3.0, 0.0) # Horizontal spacing for object nodes
+        start_pos = pos if pos else hou.Vector2(0, 0)
+        
+        for i, swatch in enumerate(selected):
             geo = context.createNode("geo", sanitize_name(swatch.name))
-            geo.moveToGoodPosition()
+            if pos:
+                geo.setPosition(start_pos + spacing * i)
+            else:
+                geo.moveToGoodPosition()
+                
             if file_node := geo.node("file1"): file_node.destroy()
             color = geo.createNode("color", sanitize_name(swatch.name))
             color.parmTuple("color").set(swatch.rgb)
@@ -323,6 +316,20 @@ class SwatchLabel(QtWidgets.QLabel):
             geo.layoutChildren()
             created.append(geo)
         return created
+
+    def _create_object_gradient(self, context, selected, pos):
+        # Create container
+        geo = context.createNode("geo", "swatch_gradient")
+        if pos: geo.setPosition(pos)
+        else: geo.moveToGoodPosition()
+        
+        if file_node := geo.node("file1"): file_node.destroy()
+        
+        # Create gradient inside using SOP logic
+        self._create_sop_gradient(geo, selected, hou.Vector2(0, 0))
+        
+        geo.layoutChildren()
+        return [geo]
 
     def _create_gradient(self, context, selected, pos, node_type, parm_name):
         node = context.createNode(node_type)
@@ -363,19 +370,29 @@ class SwatchLabel(QtWidgets.QLabel):
         if not pane: return
 
         context = pane.pwd()
-        if context.childTypeCategory().name() != 'Sop':
-            hou.ui.displayMessage("Can only create a gradient in a SOP context.")
-            return
+        
+        # Allow gradients in Object context via context menu as well
+        if context.childTypeCategory().name() == 'Sop':
+            try:
+                pos = pane.cursorPosition()
+                nodes = self._create_sop_gradient(context, selected, pos)
+                if nodes:
+                    nodes[0].setSelected(True, clear_all_selected=True)
+                    pane.setCurrentNode(nodes[0])
+            except Exception as e:
+                hou.ui.displayMessage(f"Error creating gradient: {e}")
+        elif context.childTypeCategory().name() == 'Object':
+            try:
+                pos = pane.cursorPosition()
+                nodes = self._create_object_gradient(context, selected, pos)
+                if nodes:
+                    nodes[0].setSelected(True, clear_all_selected=True)
+                    pane.setCurrentNode(nodes[0])
+            except Exception as e:
+                hou.ui.displayMessage(f"Error creating gradient: {e}")
+        else:
+            hou.ui.displayMessage("Can only create a gradient in a SOP or Object context.")
 
-        try:
-            pos = pane.cursorPosition()
-            nodes = self._create_sop_gradient(context, selected, pos)
-            if nodes:
-                nodes[0].setSelected(True, clear_all_selected=True)
-                pane.setCurrentNode(nodes[0])
-        except Exception as e:
-            hou.ui.displayMessage(f"Error creating gradient: {e}")
-            
     def create_swatches_in_geo(self):
         selected = list(SwatchLabel.selected_labels or {self})
         if not selected: return
