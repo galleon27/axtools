@@ -8,9 +8,9 @@ from PySide6 import QtWidgets, QtCore, QtGui
 # CONFIGURATION
 # ==============================================================================
 NODE_MAPPING = {
-    'file': 'file',                  # File SOP
+    'file': ['file', 'filename'],    # SOPs use 'file', Copernicus uses 'filename'
     'alembic': 'fileName',           # Alembic SOP
-    'filecache': 'file',             # File Cache (Read mode) - Skipped via logic, but mapping kept for safety
+    'filecache': 'file',             # File Cache (Read mode) - Skipped via logic
     'mtlximage': 'file',             # MaterialX Image
     'mtlxunknown': 'file',           # MaterialX Unknown
     'texture::2.0': 'map',           # Principled Shader texture
@@ -21,12 +21,11 @@ NODE_MAPPING = {
     'bonemaptarget': 'file',         # KineFX Bone Map
     
     # Octane Support
-    'NT_TEX_IMAGE': 'A_FILENAME',    
     'octane::NT_TEX_IMAGE': 'A_FILENAME', 
 }
 
 # ==============================================================================
-# CUSTOM DELEGATE (Highlighting Only)
+# CUSTOM DELEGATE (Highlighting + Anti-Ghosting)
 # ==============================================================================
 class AssetDelegate(QtWidgets.QStyledItemDelegate):
     def __init__(self, parent=None):
@@ -38,39 +37,50 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
 
     def paint(self, painter, option, index):
         self.initStyleOption(option, index)
-        option.text = "" # Prevent default drawing
         
+        # 1. Clear text from option so standard drawControl doesn't draw it (we do it manually)
+        option.text = "" 
+        
+        # 2. Setup Painter to prevent ghosting during resize
+        painter.save()
+        painter.setClipRect(option.rect) # <--- Critical for preventing resize ghosting
+        
+        # 3. Draw standard control (Backgrounds, Alternating Colors, Selection)
         style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
         style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, option, painter, option.widget)
 
+        # 4. Get Data
         text = index.data(QtCore.Qt.DisplayRole)
-        if not text: return
+        if text:
+            fg_brush = index.data(QtCore.Qt.ForegroundRole)
+            if option.state & QtWidgets.QStyle.State_Selected:
+                text_color = "#ffffff"
+            else:
+                text_color = fg_brush.color().name() if fg_brush else "#dadada"
 
-        fg_brush = index.data(QtCore.Qt.ForegroundRole)
-        if option.state & QtWidgets.QStyle.State_Selected:
-            text_color = "#ffffff"
-        else:
-            text_color = fg_brush.color().name() if fg_brush else "#dadada"
+            # 5. HTML Construction
+            html_text = text
+            if self.regex_pattern:
+                try:
+                    def hl(match):
+                        return f"<span style='background-color: #d4aa00; color: #000000; font-weight:bold;'>{match.group(0)}</span>"
+                    highlighted = re.sub(self.regex_pattern, hl, text, flags=re.IGNORECASE)
+                    html_text = f"<div style='color: {text_color}; white-space: pre;'>{highlighted}</div>"
+                except:
+                    html_text = f"<div style='color: {text_color}; white-space: pre;'>{text}</div>"
+            else:
+                 html_text = f"<div style='color: {text_color}; white-space: pre;'>{text}</div>"
 
-        html_text = text
-        if self.regex_pattern:
-            try:
-                def hl(match):
-                    return f"<span style='background-color: #d4aa00; color: #000000; font-weight:bold;'>{match.group(0)}</span>"
-                highlighted = re.sub(self.regex_pattern, hl, text, flags=re.IGNORECASE)
-                html_text = f"<div style='color: {text_color}; white-space: pre;'>{highlighted}</div>"
-            except:
-                html_text = f"<div style='color: {text_color}; white-space: pre;'>{text}</div>"
-        else:
-             html_text = f"<div style='color: {text_color}; white-space: pre;'>{text}</div>"
+            # 6. Draw HTML Text
+            text_rect = option.rect.adjusted(5, 0, -5, 0)
+            doc = QtGui.QTextDocument()
+            doc.setDefaultStyleSheet("div { font-family: Source Sans Pro, Segoe UI, sans-serif; font-size: 13px; }")
+            doc.setHtml(html_text)
+            
+            # Vertical Center
+            painter.translate(text_rect.left(), text_rect.top() + (text_rect.height() - doc.size().height()) / 2)
+            doc.drawContents(painter)
 
-        painter.save()
-        text_rect = option.rect.adjusted(5, 0, -5, 0)
-        doc = QtGui.QTextDocument()
-        doc.setDefaultStyleSheet("div { font-family: Source Sans Pro, Segoe UI, sans-serif; font-size: 13px; }")
-        doc.setHtml(html_text)
-        painter.translate(text_rect.left(), text_rect.top() + (text_rect.height() - doc.size().height()) / 2)
-        doc.drawContents(painter)
         painter.restore()
 
 # ==============================================================================
@@ -101,10 +111,10 @@ class AssetManagerPanel(QtWidgets.QWidget):
         # Status Filter
         self.cmb_status_filter = QtWidgets.QComboBox()
         self.cmb_status_filter.addItems(["All Statuses", "MISSING", "OK", "VAR"])
+        self.cmb_status_filter.setToolTip("Filter by status.\nNote: 'MISSING' includes 'VAR' (variables).")
         self.cmb_status_filter.currentIndexChanged.connect(self.on_top_filter_changed)
         self.cmb_status_filter.setFixedWidth(100)
         
-        # Text Filter
         self.le_filter = QtWidgets.QLineEdit()
         self.le_filter.setPlaceholderText("Filter name/path... (Use * for wildcards)")
         self.le_filter.textChanged.connect(self.on_top_filter_changed)
@@ -137,6 +147,7 @@ class AssetManagerPanel(QtWidgets.QWidget):
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
         
+        # GHOSTING FIX: Ensure alternating colors are on
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
@@ -216,10 +227,14 @@ class AssetManagerPanel(QtWidgets.QWidget):
         
         item_path = QtWidgets.QTableWidgetItem(raw_val)
         item_path.setForeground(QtGui.QBrush(text_color))
+        # TOOLTIP added here
+        item_path.setToolTip(raw_val)
         self.table.setItem(row, 3, item_path)
         
         item_full = QtWidgets.QTableWidgetItem(node.path())
         item_full.setForeground(QtGui.QBrush(text_color))
+        # TOOLTIP added here
+        item_full.setToolTip(node.path())
         self.table.setItem(row, 4, item_full)
 
     def make_paths_relative(self):
@@ -270,38 +285,28 @@ class AssetManagerPanel(QtWidgets.QWidget):
         for node in all_nodes:
             type_name = node.type().name()
             
-            # --- FILTER: Exclude File Caches completely ---
-            # if type_name == 'filecache':
-            #     continue
+            if type_name == 'filecache':
+                continue
 
             if type_name in NODE_MAPPING:
-                param_name = NODE_MAPPING[type_name]
-                parm = node.parm(param_name)
+                param_candidates = NODE_MAPPING[type_name]
+                if not isinstance(param_candidates, list):
+                    param_candidates = [param_candidates]
+                
+                parm = None
+                for p_name in param_candidates:
+                    p = node.parm(p_name)
+                    if p:
+                        parm = p
+                        break
+                
                 if parm:
                     raw_val = parm.rawValue()
-                    
-                    # --- FILTER: Exclude Empty ---
-                    if not raw_val or raw_val.strip() == "":
-                        continue
-                    
-                    # --- FILTER: Exclude Expression Backticks ---
-                    if "`" in raw_val:
-                        continue
-                        
-                    # --- FILTER: Exclude Channel References (Linked Params) ---
-                    # Checks for ch("..") or chs("..")
-                    if "ch(" in raw_val or "chs(" in raw_val:
-                        continue
-                        
-                    # --- FILTER: Exclude Attributes ---
-                    # Checks for @ notation
-                    if "@" in raw_val:
-                        continue
-                    
-                    # --- FILTER: Exclude Relative/Op Paths ---
-                    # Checks for paths starting with . (./ or ../) or op:
-                    if raw_val.startswith(".") or raw_val.startswith("op:"):
-                        continue
+                    if not raw_val or raw_val.strip() == "": continue
+                    if "`" in raw_val: continue
+                    if "ch(" in raw_val or "chs(" in raw_val: continue
+                    if "@" in raw_val: continue
+                    if raw_val.startswith(".") or raw_val.startswith("op:"): continue
 
                     self.cached_nodes.append((node, parm))
                     self.table.insertRow(row)
@@ -314,7 +319,6 @@ class AssetManagerPanel(QtWidgets.QWidget):
         pattern = self.le_filter.text()
         status_filter = self.cmb_status_filter.currentText()
         
-        # 1. Update Delegate for highlighting
         regex = ""
         if pattern:
             if not any(c in pattern for c in ['*', '?']):
@@ -324,7 +328,6 @@ class AssetManagerPanel(QtWidgets.QWidget):
         self.delegate.set_regex(regex)
         self.table.viewport().update()
         
-        # 2. Filter Rows
         pattern_lower = pattern.lower()
         if pattern_lower and not any(c in pattern_lower for c in ['*', '?']):
             pattern_lower = f"*{pattern_lower}*"
@@ -336,12 +339,19 @@ class AssetManagerPanel(QtWidgets.QWidget):
             path_text = path_item.text().lower()
             status_text = status_item.text()
             
+            # 1. Text Match
             text_match = True
             if pattern_lower:
                 text_match = fnmatch.fnmatch(path_text, pattern_lower)
             
+            # 2. Status Match (Logic Changed)
             status_match = True
-            if status_filter != "All Statuses":
+            if status_filter == "MISSING":
+                # MISSING filter includes both MISSING and VAR
+                if status_text not in ["MISSING", "VAR"]:
+                    status_match = False
+            elif status_filter != "All Statuses":
+                # Strict match for OK, VAR, etc.
                 if status_text != status_filter:
                     status_match = False
             
