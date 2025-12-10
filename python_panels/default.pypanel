@@ -21,7 +21,7 @@
     <interfaceItem name="HydraSceneBrowser"/>
     <separatorItem/>
     <interfaceItem name="MatLib"/>
-    <interfaceItem name="motionclipmixer"/>
+    <separatorItem/>
     <interfaceItem name="rig_tree"/>
     <interfaceItem name="sesi_bookmarks_editor"/>
     <interfaceItem name="sesi_character_picker"/>
@@ -31,10 +31,10 @@
     <interfaceItem name="sesi_light_linker"/>
     <interfaceItem name="sesi_light_mixer"/>
     <separatorItem/>
-    <interfaceItem name="RedshiftRenderViewPane"/>
+    <separatorItem/>
     <separatorItem/>
     <interfaceItem name="OctaneQt5IPRPane"/>
-    <interfaceItem name="RedshiftRenderInfoPane"/>
+    <separatorItem/>
     <interfaceItem name="log_viewer"/>
     <interfaceItem name="sidefx::node_info"/>
     <interfaceItem name="apexanimationlayersmanager"/>
@@ -42,6 +42,7 @@
     <interfaceItem name="layout_asset_gallery"/>
     <interfaceItem name="Image Preview"/>
     <interfaceItem name="swatches"/>
+    <interfaceItem name="Asset Manager"/>
     <separatorItem/>
   </interfacesMenu>
 </pythonPanelDocument>

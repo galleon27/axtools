@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <!-- This file contains definitions of Python interfaces and the
+ interfaces menu.  It should not be hand-edited when it is being
+ used by the application.  Note, that two definitions of the
+ same interface or of the interfaces menu are not allowed
+ in a single file. -->
+  <interface name="asset_manager" label="Asset Manager" icon="custom_hda_icon" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA[from PySide6 import QtWidgets, QtCore
+import asset_manager # your saved module filename without .py
+
+def onCreateInterface():
+    # Return an instance of your SwatchViewer widget
+    return asset_manager.AssetManagerPanel()]]></script>
+    <includeInToolbarMenu menu_position="418" create_separator="false"/>
+    <help><![CDATA[]]></help>
+  </interface>
+</pythonPanelDocument>
