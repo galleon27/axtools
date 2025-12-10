@@ -1169,4 +1169,33 @@ for node in nodes:
             
             parm.set(raw_path.replace(f_token, expr))]]></script>
   </tool>
+
+  <tool name="Merge selected nodes to network" label="Merge To Network" icon="arrows.svg">
+    <script scriptType="python"><![CDATA[import hou
+
+selected = hou.selectedNodes()
+
+if selected:
+    choice = hou.ui.displayMessage("Where to create nodes?", buttons=("Current Context", "/obj", "Cancel"), close_choice=2)
+
+    if choice != 2:
+        target_node = None
+        
+        if choice == 0:
+            pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+            cwd = pane.pwd()
+            if cwd.childTypeCategory() == hou.sopNodeTypeCategory():
+                target_node = cwd
+            else:
+                target_node = cwd.createNode('geo')
+        elif choice == 1:
+            target_node = hou.node('/obj').createNode('geo')
+
+        if target_node:
+            for node in selected:
+                om = target_node.createNode('object_merge')
+                om.parm('objpath1').set(node.path())
+                om.parm('xformtype').set(1)
+                om.moveToGoodPosition()]]></script>
+  </tool>
 </shelfDocument>
