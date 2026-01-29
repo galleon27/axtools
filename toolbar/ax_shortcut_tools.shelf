@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<shelfDocument>
+  <!-- This file contains definitions of shelves, toolbars, and tools.
+ It should not be hand-edited when it is being used by the application.
+ Note, that two definitions of the same element are not allowed in
+ a single file. -->
+
+  <toolshelf name="AX Shortcut Tools" label="AX Shortcut Tools">
+    <memberTool name="Reveal in Explorer"/>
+  </toolshelf>
+
+  <tool name="Reveal in Explorer" label="Reveal in Explorer" icon="custom_hda_icon">
+    <script scriptType="python"><![CDATA[import hou
+import os
+
+def open_directory_from_node():
+    # 1. Get the currently selected nodes
+    selected_nodes = hou.selectedNodes()
+    
+    if not selected_nodes:
+        hou.ui.setStatusMessage("No node selected.", severity=hou.severityType.Warning)
+        return
+
+    # We only care about the first selected node
+    node = selected_nodes[0]
+    
+    # 2. Define a list of common parameter names used for files
+    # Add more here if you have specific custom HDA parameters
+    target_parms = ['file', 'filename', 'map', 'tex', 'picture', 'sopoutput', 'vm_picture', 'copoutput']
+    
+    file_path = None
+    
+    # 3. Iterate through possible parameter names to find a match
+    for parm_name in target_parms:
+        parm = node.parm(parm_name)
+        if parm:
+            # Evaluate the parameter to resolve $HIP, $JOB, etc.
+            raw_path = parm.eval()
+            
+            # Make sure the string isn't empty
+            if raw_path and raw_path != "":
+                file_path = raw_path
+                break
+    
+    # 4. Open the directory
+    if file_path:
+        # Create an absolute path (handles relative paths if necessary)
+        # Note: hou.ui.showInFileBrowser usually handles this, but abspath is safer
+        abs_path = os.path.abspath(file_path)
+        
+        try:
+            # This is the native Houdini function. 
+            # It opens Explorer/Finder and highlights the specific file.
+            hou.ui.showInFileBrowser(abs_path)
+            hou.ui.setStatusMessage(f"Opened path for {node.name()}", severity=hou.severityType.Message)
+        except hou.Error as e:
+            hou.ui.displayMessage(f"Error opening file browser: {e}")
+    else:
+        hou.ui.displayMessage(f"Could not find a valid file path on node '{node.name()}'.")
+
+# Run the function
+open_directory_from_node()]]></script>
+  </tool>
+</shelfDocument>

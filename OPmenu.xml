@@ -1,0 +1,30 @@
+<menuDocument>
+    <!-- Root menu -->
+    <menu>
+        
+        <!-- The AX Submenu -->
+        <subMenu id="ax_toolset_menu">
+            <label>AX</label>
+            
+            <!-- Items go DIRECTLY here, no extra <menu> tag needed -->
+            <scriptItem id="ax.open_explorer">
+                <label>Open File Location</label>
+                <context>
+                    <expression>kwargs["node"] is not None</expression>
+                </context>
+                <scriptCode><![CDATA[
+import importlib
+import ax_utils 
+
+# Reload allows you to edit ax_utils.py without restarting Houdini
+importlib.reload(ax_utils)
+
+# Call the function
+ax_utils.open_node_path(kwargs['node'])
+                ]]></scriptCode>
+            </scriptItem>
+            
+        </subMenu>
+
+    </menu>
+</menuDocument>
