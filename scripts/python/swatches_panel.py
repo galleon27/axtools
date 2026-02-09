@@ -3,7 +3,7 @@ import struct
 import hou
 import json
 import re
-from PySide6 import QtWidgets, QtCore, QtGui
+from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
 
 def cmyk_to_rgb(c, m, y, k):
@@ -52,6 +52,7 @@ class SwatchLabel(QtWidgets.QLabel):
     KARMA_CONTEXTS = ('materialbuilder', 'materiallibrary', 'karmamaterialbuilder', 'subnet')
     OCTANE_CONTEXTS = ('octane_vopnet', 'octane_solaris_material_builder')
     REDSHIFT_CONTEXTS = ('redshift_vopnet', 'rs_usd_material_builder')
+    MATNET_CONTEXTS = ('matnet',)
 
     def __init__(self, name, rgb, viewer, parent=None):
         super().__init__(parent)
@@ -62,7 +63,7 @@ class SwatchLabel(QtWidgets.QLabel):
         r, g, b = [int(c * 255) for c in rgb]
         self.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid black;")
         self.setToolTip(f"{self.name}\nRGB: {self.rgb}")
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setCursor(QtCore.Qt.OpenHandCursor)
         self._drag_active = False
         self._has_moved = False
         self._selected = False
@@ -73,29 +74,29 @@ class SwatchLabel(QtWidgets.QLabel):
         r, g, b = [int(c * 255) for c in self.rgb]
         self.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: {border};")
 
+    # --- THIS METHOD CONTAINS THE NEW SELECTION LOGIC ---
     def mousePressEvent(self, event):
-        if event.button() not in [Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton]:
+        if event.button() not in [QtCore.Qt.LeftButton, QtCore.Qt.MiddleButton]:
             return
 
         self._drag_active = True
         self._has_moved = False
-        self._start_pos = event.position().toPoint()
+        self._start_pos = event.pos()
         self._button = event.button()
 
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == QtCore.Qt.LeftButton:
             modifiers = QtWidgets.QApplication.keyboardModifiers()
             
-            if modifiers == (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier):
+            if modifiers == (QtCore.Qt.ShiftModifier | QtCore.Qt.ControlModifier):
                 if SwatchLabel.last_clicked and SwatchLabel.last_clicked in self.viewer.swatch_widgets:
                     start_index = self.viewer.swatch_widgets.index(SwatchLabel.last_clicked)
                     end_index = self.viewer.swatch_widgets.index(self)
                     start, end = min(start_index, end_index), max(start_index, end_index)
                     for i in range(start, end + 1):
-                        widget = self.viewer.swatch_widgets[i]
-                        widget.set_selected(True)
-                        SwatchLabel.selected_labels.add(widget)
+                        self.viewer.swatch_widgets[i].set_selected(True)
+                        SwatchLabel.selected_labels.add(self.viewer.swatch_widgets[i])
 
-            elif modifiers == Qt.KeyboardModifier.ShiftModifier:
+            elif modifiers == QtCore.Qt.ShiftModifier:
                 if SwatchLabel.last_clicked and SwatchLabel.last_clicked in self.viewer.swatch_widgets:
                     for label in list(SwatchLabel.selected_labels):
                         label.set_selected(False)
@@ -105,13 +106,12 @@ class SwatchLabel(QtWidgets.QLabel):
                     end_index = self.viewer.swatch_widgets.index(self)
                     start, end = min(start_index, end_index), max(start_index, end_index)
                     for i in range(start, end + 1):
-                        widget = self.viewer.swatch_widgets[i]
-                        widget.set_selected(True)
-                        SwatchLabel.selected_labels.add(widget)
+                        self.viewer.swatch_widgets[i].set_selected(True)
+                        SwatchLabel.selected_labels.add(self.viewer.swatch_widgets[i])
                 else:
                     self.set_selected(True); SwatchLabel.selected_labels.add(self); SwatchLabel.last_clicked = self
             
-            elif modifiers == Qt.KeyboardModifier.ControlModifier:
+            elif modifiers == QtCore.Qt.ControlModifier:
                 self.set_selected(not self._selected)
                 if self._selected:
                     SwatchLabel.selected_labels.add(self)
@@ -119,18 +119,21 @@ class SwatchLabel(QtWidgets.QLabel):
                 else:
                     SwatchLabel.selected_labels.discard(self)
             
-            else:
-                is_only_selected = self._selected and len(SwatchLabel.selected_labels) == 1
-                if is_only_selected:
-                    self.set_selected(False); SwatchLabel.selected_labels.clear(); SwatchLabel.last_clicked = None
-                else:
+            else: # No modifiers (standard left-click)
+                # If clicking on an unselected item, clear the old selection.
+                if not self._selected:
                     for label in list(SwatchLabel.selected_labels):
                         label.set_selected(False)
                     SwatchLabel.selected_labels.clear()
-                    self.set_selected(True); SwatchLabel.selected_labels.add(self); SwatchLabel.last_clicked = self
+                    self.set_selected(True)
+                    SwatchLabel.selected_labels.add(self)
+                # If clicking an already selected item, we do nothing on press.
+                # This allows a drag to begin on the whole selection. The logic
+                # in mouseReleaseEvent will handle what happens if it was a simple click.
+                SwatchLabel.last_clicked = self
 
     def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == QtCore.Qt.LeftButton:
             pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
             if not pane:
                 hou.ui.displayMessage("No active Network Editor found.")
@@ -152,9 +155,10 @@ class SwatchLabel(QtWidgets.QLabel):
                     created_nodes = self._create_octane_nodes(context, swatch_to_create, pos)
                 elif context_type in self.REDSHIFT_CONTEXTS:
                     created_nodes = self._create_redshift_nodes(context, swatch_to_create, pos)
+                elif context_type in self.MATNET_CONTEXTS:
+                    created_nodes = self._create_matnet_nodes(context, swatch_to_create, pos)
                 elif context.childTypeCategory().name() == 'Object':
-                    # Double click in Object context: create single geo with color
-                    created_nodes = self._create_object_nodes(context, swatch_to_create, pos)
+                    created_nodes = self._create_object_nodes(context, swatch_to_create)
                 else:
                     hou.ui.displayMessage(f"Unsupported network context for swatch creation: {context_type}")
 
@@ -192,26 +196,39 @@ class SwatchLabel(QtWidgets.QLabel):
         return sorted(swatches, key=lambda s: rgb_to_hsv(s.rgb))
 
     def mouseMoveEvent(self, event):
-        current_pos = event.position().toPoint()
-        if self._drag_active and (current_pos - self._start_pos).manhattanLength() > 5:
+        if self._drag_active and (event.pos() - self._start_pos).manhattanLength() > 5:
             self._has_moved = True
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
 
     def mouseReleaseEvent(self, event):
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
-        if not self._drag_active or not self._has_moved: return
-        self._drag_active = False
+        self.setCursor(QtCore.Qt.OpenHandCursor)
+        
+        # This block handles simple clicks (not drags)
+        if not self._has_moved:
+            self._drag_active = False
+            # If this was a simple click on an already-selected item in a multi-selection
+            if self._button == QtCore.Qt.LeftButton and self._selected and len(SwatchLabel.selected_labels) > 1:
+                modifiers = QtWidgets.QApplication.keyboardModifiers()
+                if modifiers not in [QtCore.Qt.ShiftModifier, QtCore.Qt.ControlModifier, (QtCore.Qt.ShiftModifier | QtCore.Qt.ControlModifier)]:
+                    for label in list(SwatchLabel.selected_labels):
+                        label.set_selected(False)
+                    SwatchLabel.selected_labels.clear()
+                    self.set_selected(True)
+                    SwatchLabel.selected_labels.add(self)
+            return
 
+        # This block handles drag-and-drop
+        self._drag_active = False
         pane = hou.ui.paneTabUnderCursor()
         if not isinstance(pane, hou.NetworkEditor): return
 
         swatches_to_create = []
-        if self._button == Qt.MouseButton.MiddleButton:
+        if self._button == QtCore.Qt.MiddleButton:
             if self in SwatchLabel.selected_labels:
                 swatches_to_create = list(SwatchLabel.selected_labels)
             else:
                 swatches_to_create = [self]
-        else: # Left-drag always uses the current selection
+        else:
             swatches_to_create = list(SwatchLabel.selected_labels or {self})
 
         if not swatches_to_create: return
@@ -229,9 +246,10 @@ class SwatchLabel(QtWidgets.QLabel):
                 created_nodes = self._handle_material_creation(context, swatches_to_create, pos, self._create_octane_nodes, self._create_octane_gradient)
             elif context_type in self.REDSHIFT_CONTEXTS:
                 created_nodes = self._handle_material_creation(context, swatches_to_create, pos, self._create_redshift_nodes, self._create_redshift_gradient)
+            elif context_type in self.MATNET_CONTEXTS:
+                created_nodes = self._handle_matnet_creation(context, swatches_to_create, pos, self._create_matnet_nodes, self._create_matnet_gradient)
             elif context.childTypeCategory().name() == 'Object':
-                # Re-use _handle_sop_creation for Object context as the logic (Ask Nodes vs Gradient) is identical
-                created_nodes = self._handle_sop_creation(context, swatches_to_create, pos, self._create_object_nodes, self._create_object_gradient)
+                created_nodes = self._create_object_nodes(context, swatches_to_create)
             else:
                 hou.ui.displayMessage(f"Unsupported network context for drag & drop: {context_type}")
 
@@ -245,8 +263,7 @@ class SwatchLabel(QtWidgets.QLabel):
     def _handle_sop_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
         if len(selected) > 1:
             choice = hou.ui.displayMessage("Create individual nodes or a gradient?", buttons=["Nodes", "Gradient", "Cancel"], default_choice=0, close_choice=2)
-            if choice == 0:
-                return node_creation_func(context, selected, pos)
+            if choice == 0: return node_creation_func(context, selected, pos)
             elif choice == 1:
                 sort_choice = hou.ui.displayMessage("Sort swatches by hue?", buttons=["Yes", "No", "Cancel"], default_choice=0, close_choice=2)
                 if sort_choice == 2: return []
@@ -257,6 +274,9 @@ class SwatchLabel(QtWidgets.QLabel):
             return node_creation_func(context, selected, pos)
 
     def _handle_material_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
+        return self._handle_sop_creation(context, selected, pos, node_creation_func, gradient_creation_func)
+
+    def _handle_matnet_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
         return self._handle_sop_creation(context, selected, pos, node_creation_func, gradient_creation_func)
 
     def _create_nodes(self, context, selected, pos, node_type, parm_names):
@@ -296,19 +316,27 @@ class SwatchLabel(QtWidgets.QLabel):
 
     def _create_redshift_nodes(self, context, selected, pos):
         return self._create_nodes(context, selected, pos, "redshift::RSColorConstant", ("colorr", "colorg", "colorb"))
-
-    def _create_object_nodes(self, context, selected, pos=None):
+    
+    # --- THIS METHOD CONTAINS YOUR NEW CODE ---
+    def _create_matnet_nodes(self, context, selected, pos):
         created = []
-        spacing = hou.Vector2(3.0, 0.0) # Horizontal spacing for object nodes
-        start_pos = pos if pos else hou.Vector2(0, 0)
-        
+        spacing = hou.Vector2(1.5, -1.5)
         for i, swatch in enumerate(selected):
+            node = context.createNode("constant")
+            node.setName(sanitize_name(swatch.name), unique_name=True)
+            node.parm("consttype").set("color") # "color" is the correct string value
+            node.parm("colordefr").set(swatch.rgb[0])
+            node.parm("colordefg").set(swatch.rgb[1])
+            node.parm("colordefb").set(swatch.rgb[2])
+            node.setPosition(pos + spacing * i)
+            created.append(node)
+        return created
+
+    def _create_object_nodes(self, context, selected):
+        created = []
+        for swatch in selected:
             geo = context.createNode("geo", sanitize_name(swatch.name))
-            if pos:
-                geo.setPosition(start_pos + spacing * i)
-            else:
-                geo.moveToGoodPosition()
-                
+            geo.moveToGoodPosition()
             if file_node := geo.node("file1"): file_node.destroy()
             color = geo.createNode("color", sanitize_name(swatch.name))
             color.parmTuple("color").set(swatch.rgb)
@@ -316,20 +344,6 @@ class SwatchLabel(QtWidgets.QLabel):
             geo.layoutChildren()
             created.append(geo)
         return created
-
-    def _create_object_gradient(self, context, selected, pos):
-        # Create container
-        geo = context.createNode("geo", "swatch_gradient")
-        if pos: geo.setPosition(pos)
-        else: geo.moveToGoodPosition()
-        
-        if file_node := geo.node("file1"): file_node.destroy()
-        
-        # Create gradient inside using SOP logic
-        self._create_sop_gradient(geo, selected, hou.Vector2(0, 0))
-        
-        geo.layoutChildren()
-        return [geo]
 
     def _create_gradient(self, context, selected, pos, node_type, parm_name):
         node = context.createNode(node_type)
@@ -356,6 +370,10 @@ class SwatchLabel(QtWidgets.QLabel):
 
     def _create_redshift_gradient(self, context, selected, pos):
         return self._create_gradient(context, selected, pos, "redshift::RSRamp", "ramp")
+    
+    # --- THIS METHOD CONTAINS YOUR NEW CODE ---
+    def _create_matnet_gradient(self, context, selected, pos):
+        return self._create_gradient(context, selected, pos, "rampparm", "rampcolordefault")
 
     def create_gradient_from_swatches(self):
         selected = list(SwatchLabel.selected_labels or {self})
@@ -370,29 +388,19 @@ class SwatchLabel(QtWidgets.QLabel):
         if not pane: return
 
         context = pane.pwd()
-        
-        # Allow gradients in Object context via context menu as well
-        if context.childTypeCategory().name() == 'Sop':
-            try:
-                pos = pane.cursorPosition()
-                nodes = self._create_sop_gradient(context, selected, pos)
-                if nodes:
-                    nodes[0].setSelected(True, clear_all_selected=True)
-                    pane.setCurrentNode(nodes[0])
-            except Exception as e:
-                hou.ui.displayMessage(f"Error creating gradient: {e}")
-        elif context.childTypeCategory().name() == 'Object':
-            try:
-                pos = pane.cursorPosition()
-                nodes = self._create_object_gradient(context, selected, pos)
-                if nodes:
-                    nodes[0].setSelected(True, clear_all_selected=True)
-                    pane.setCurrentNode(nodes[0])
-            except Exception as e:
-                hou.ui.displayMessage(f"Error creating gradient: {e}")
-        else:
-            hou.ui.displayMessage("Can only create a gradient in a SOP or Object context.")
+        if context.childTypeCategory().name() != 'Sop':
+            hou.ui.displayMessage("Can only create a gradient in a SOP context.")
+            return
 
+        try:
+            pos = pane.cursorPosition()
+            nodes = self._create_sop_gradient(context, selected, pos)
+            if nodes:
+                nodes[0].setSelected(True, clear_all_selected=True)
+                pane.setCurrentNode(nodes[0])
+        except Exception as e:
+            hou.ui.displayMessage(f"Error creating gradient: {e}")
+            
     def create_swatches_in_geo(self):
         selected = list(SwatchLabel.selected_labels or {self})
         if not selected: return
@@ -578,7 +586,7 @@ class SwatchViewer(QtWidgets.QWidget):
             self.swatch_widgets.append(swatch)
 
             name_label = QtWidgets.QLabel(name)
-            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             name_label.setToolTip(name)
             name_label.setFixedWidth(100)
             name_label.setStyleSheet("text-overflow: ellipsis; white-space: nowrap; overflow: hidden;")
@@ -587,8 +595,8 @@ class SwatchViewer(QtWidgets.QWidget):
             vbox = QtWidgets.QVBoxLayout(wrapper)
             vbox.setContentsMargins(0, 0, 0, 0)
             vbox.setSpacing(4)
-            vbox.addWidget(swatch, alignment=Qt.AlignmentFlag.AlignCenter)
-            vbox.addWidget(name_label, alignment=Qt.AlignmentFlag.AlignCenter)
+            vbox.addWidget(swatch, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+            vbox.addWidget(name_label, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
             self.grid.addWidget(wrapper, row, col)
         
         self.grid.setRowStretch(self.grid.rowCount(), 1)
