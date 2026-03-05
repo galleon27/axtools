@@ -930,72 +930,78 @@ shelf_export_rops.show_ui()]]></script>
   <tool name="Copernicus Heightmap Layers Export" label="Copernicus Heightmap Layers Export" icon="export_rops">
     <script scriptType="python"><![CDATA[import hou
 
-# Get the currently selected node.
+# Check selection
 try:
     selected_node = hou.selectedNodes()[0]
 except IndexError:
     hou.ui.displayMessage("Please select a node first.", title="No Node Selected")
     raise SystemExit
 
-# Get the parent network of the selected node.
 parent = selected_node.parent()
-
-# Get the position of the selected node to place the new nodes relative to it.
 pos = selected_node.position()
-
-# Get all the output labels from the selected node.
 output_labels = selected_node.outputLabels()
 
-# Exit if the selected node has no outputs.
+# Check for outputs
 if not output_labels:
     hou.ui.displayMessage("The selected node has no outputs.", title="No Outputs Found")
     raise SystemExit
 
-# A list to hold the newly created NULL nodes and their corresponding labels.
+# -------------------------------------------------------------------
+# NEW CODE: Input Dialog
+# -------------------------------------------------------------------
+# This opens a small window asking for text.
+# It returns a tuple: (button_index, text_entered)
+button_idx, prefix_text = hou.ui.readInput(
+    "Enter the prefix for the Null nodes:", 
+    buttons=("OK", "Cancel"), 
+    title="Set Prefix",
+    initial_contents="OUT" # Default text
+)
+
+# If the user clicks "Cancel" (index 1) or closes the window, stop the script.
+if button_idx != 0:
+    raise SystemExit
+# -------------------------------------------------------------------
+
 processed_nodes = []
 
-# --- Create a NULL for each output ---
 for i, label in enumerate(output_labels):
-    # Create the NULL node.
-    null_node = parent.createNode("null", f"OUT_{label}")
+    
+    # Use the input text here combined with the label
+    # This creates "YourPrefix_LabelName"
+    node_name = f"{prefix_text}_{label}"
+    
+    null_node = parent.createNode("null", node_name)
 
-    # Connect the selected node's output to the new NULL's input.
     null_node.setInput(0, selected_node, i)
 
-    # Calculate and set the position for the NULL node.
     null_pos = hou.Vector2(pos.x() + 3, pos.y() - i * 1.5)
     null_node.setPosition(null_pos)
 
-    # Set 'outputname1' parameter if it exists.
-    # Note: A standard NULL COP does not have this parameter.
-    # This will only work on nodes that have this specific parameter.
-    output_name_parm = null_node.parm("outputname1").set(label)
+    # Added a safety check in case the parameter doesn't exist on a standard Null
+    if null_node.parm("outputname1"):
+        null_node.parm("outputname1").set(label)
 
-    # Add the new NULL and its label to our list for the next step.
     processed_nodes.append((null_node, label))
 
 
-# --- Create a ROP for each new NULL ---
 for null_node, label in processed_nodes:
-    # Get the position of the current NULL node.
+
     null_pos = null_node.position()
 
-    # Create a 'comp' (Composite Output) node.
-    # We'll name it based on the label.
     rop_name = f"ROP_{label}"
+    
+    # Check if 'rop_image' is a valid node type in your context before creating
+    # (Assuming it is valid based on your previous code)
     rop_node = parent.createNode("rop_image", rop_name)
 
-    # Connect the NULL node's output to the new ROP node's input.
     rop_node.setInput(0, null_node, 0)
 
-    # Position the ROP node to the right of the NULL node.
     rop_pos = hou.Vector2(null_pos.x() + 3, null_pos.y())
     rop_node.setPosition(rop_pos)
 
-    # Set the AOV Image Plane parameter on the rop_node to the label.
-    rop_node.parm("aov1").set(label)
-
-]]></script>
+    if rop_node.parm("aov1"):
+        rop_node.parm("aov1").set(label)]]></script>
   </tool>
 
   <tool name="Relink Files" label="Relink Files" icon="PLASMA_App">
