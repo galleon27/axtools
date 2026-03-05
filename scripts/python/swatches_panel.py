@@ -322,12 +322,11 @@ class SwatchLabel(QtWidgets.QLabel):
         created = []
         spacing = hou.Vector2(1.5, -1.5)
         for i, swatch in enumerate(selected):
-            node = context.createNode("constant")
+            node = context.createNode("principledshader::2.0")
             node.setName(sanitize_name(swatch.name), unique_name=True)
-            node.parm("consttype").set("color") # "color" is the correct string value
-            node.parm("colordefr").set(swatch.rgb[0])
-            node.parm("colordefg").set(swatch.rgb[1])
-            node.parm("colordefb").set(swatch.rgb[2])
+            node.parm("basecolorr").set(swatch.rgb[0])
+            node.parm("basecolorg").set(swatch.rgb[1])
+            node.parm("basecolorb").set(swatch.rgb[2])
             node.setPosition(pos + spacing * i)
             created.append(node)
         return created
