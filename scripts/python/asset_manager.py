@@ -37,7 +37,7 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
         self.initStyleOption(option, index)
         option.text = "" 
         painter.save()
-        painter.setClipRect(option.rect)
+        painter.setClipRect(option.rect) 
         
         style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
         style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, option, painter, option.widget)
@@ -98,11 +98,12 @@ class AssetManagerPanel(QtWidgets.QWidget):
         
         self.cmb_status_filter = QtWidgets.QComboBox()
         self.cmb_status_filter.addItems(["All Statuses", "MISSING", "OK", "VAR"])
+        self.cmb_status_filter.setToolTip("Filter by status.\nNote: 'MISSING' includes 'VAR'.")
         self.cmb_status_filter.currentIndexChanged.connect(self.on_top_filter_changed)
         self.cmb_status_filter.setFixedWidth(100)
         
         self.le_filter = QtWidgets.QLineEdit()
-        self.le_filter.setPlaceholderText("Filter... (Use * for wildcards)")
+        self.le_filter.setPlaceholderText("Filter name/path... (Use * for wildcards)")
         self.le_filter.textChanged.connect(self.on_top_filter_changed)
         
         self.btn_localize = QtWidgets.QPushButton("Make Relative")
@@ -171,15 +172,56 @@ class AssetManagerPanel(QtWidgets.QWidget):
         
         layout.addWidget(fr_group)
         
-        self.cached_nodes = [] 
+        self.cached_nodes =[] 
         self.refresh_assets()
+        
+        # --- SYNCHRONIZE WITH HOUDINI SELECTION ---
+        self._last_selection = ()
+        self.selection_timer = QtCore.QTimer(self)
+        self.selection_timer.timeout.connect(self.sync_selection_from_houdini)
+        self.selection_timer.start(250) # Polling 4 times a second
+
+    # ==========================================================================
+    # LOGIC: SELECTION SYNC
+    # ==========================================================================
+    def sync_selection_from_houdini(self):
+        """ Monitors Houdini's network pane and highlights the matching rows here. """
+        if not self.isVisible(): 
+            return
+            
+        try:
+            curr_sel = tuple(hou.selectedNodes())
+        except:
+            return
+            
+        if curr_sel == self._last_selection:
+            return
+            
+        self._last_selection = curr_sel
+        sel_set = set(curr_sel)
+        
+        self.table.blockSignals(True)
+        self.table.clearSelection()
+        
+        for i, (node, parm) in enumerate(self.cached_nodes):
+            try:
+                # If node is currently selected in Houdini and the row is not hidden
+                if node in sel_set and not self.table.isRowHidden(i):
+                    for col in range(self.table.columnCount()):
+                        item = self.table.item(i, col)
+                        if item:
+                            item.setSelected(True)
+            except hou.ObjectWasDeleted:
+                pass
+                
+        self.table.blockSignals(False)
 
     # ==========================================================================
     # LOGIC: CORE
     # ==========================================================================
     def check_file_status(self, raw_path, expanded_path):
         if not raw_path or raw_path.strip() == "": return "EMPTY", QtGui.QColor(100, 100, 100)
-        seq_tokens = ["$F", "<UDIM>", "<uvtile>", "%(UDIM)", "%04d", "$T", "`"]
+        seq_tokens =["$F", "<UDIM>", "<uvtile>", "%(UDIM)", "%04d", "$T", "`"]
         if any(token in raw_path for token in seq_tokens): return "VAR", QtGui.QColor(255, 170, 0)
         if os.path.exists(expanded_path): return "OK", QtGui.QColor(100, 200, 100)
         return "MISSING", QtGui.QColor(255, 60, 60)
@@ -229,37 +271,24 @@ class AssetManagerPanel(QtWidgets.QWidget):
         self.table.blockSignals(False)
 
     # ==========================================================================
-    # LOGIC: ROBUST REGEX GENERATION
+    # LOGIC: SLASH-AGNOSTIC REGEX
     # ==========================================================================
     def get_smart_regex(self, find_pat, repl_pat=""):
         if not find_pat: return ""
         
-        # 1. Smart Strip (Start/End wildcards)
         if find_pat.startswith('*') and repl_pat.startswith('*'):
             find_pat = find_pat[1:]
         if find_pat.endswith('*') and repl_pat.endswith('*'):
             find_pat = find_pat[:-1]
 
-        # 2. Tokenize Wildcards to protect them from escaping
-        # We use a unique string token
         find_pat = find_pat.replace('*', '___STAR___')
         find_pat = find_pat.replace('?', '___QUES___')
         
-        # 3. Normalize Slashes for splitting
-        # Convert all backslashes to forward slashes for splitting purposes
         normalized_pat = find_pat.replace('\\', '/')
-        
-        # 4. Split by slash
         parts = normalized_pat.split('/')
+        escaped_parts =[re.escape(p) for p in parts]
         
-        # 5. Escape each part individualy
-        escaped_parts = [re.escape(p) for p in parts]
-        
-        # 6. Re-join with a regex class that matches BOTH slash types
-        # r'[\\/]' matches either \ or /
         regex_str = r'[\\/]'.join(escaped_parts)
-        
-        # 7. Restore Wildcards (Convert tokens to Regex wildcards)
         regex_str = regex_str.replace('___STAR___', '.*')
         regex_str = regex_str.replace('___QUES___', '.')
         
@@ -271,7 +300,7 @@ class AssetManagerPanel(QtWidgets.QWidget):
     def refresh_assets(self):
         self.table.blockSignals(True)
         self.table.setRowCount(0)
-        self.cached_nodes = []
+        self.cached_nodes =[]
         all_nodes = hou.node("/").allSubChildren()
         row = 0
         for node in all_nodes:
@@ -280,7 +309,7 @@ class AssetManagerPanel(QtWidgets.QWidget):
 
             if type_name in NODE_MAPPING:
                 param_candidates = NODE_MAPPING[type_name]
-                if not isinstance(param_candidates, list): param_candidates = [param_candidates]
+                if not isinstance(param_candidates, list): param_candidates =[param_candidates]
                 parm = None
                 for p_name in param_candidates:
                     if node.parm(p_name): parm = node.parm(p_name); break
@@ -313,7 +342,6 @@ class AssetManagerPanel(QtWidgets.QWidget):
             
             text_match = True
             if regex:
-                # Use search, not match, to find substrings anywhere
                 text_match = re.search(regex, path_text, re.IGNORECASE) is not None
             
             status_match = True
@@ -352,8 +380,6 @@ class AssetManagerPanel(QtWidgets.QWidget):
                 node, parm = self.cached_nodes[i]
                 current_raw = parm.rawValue()
                 try:
-                    # Using lambda ensures replacement string is literal 
-                    # (avoids 'bad escape' error if path has backslashes)
                     new_raw = re.sub(regex_str, lambda m: final_repl, current_raw, flags=re.IGNORECASE)
                     if new_raw != current_raw:
                         parm.set(new_raw)
@@ -430,12 +456,19 @@ class AssetManagerPanel(QtWidgets.QWidget):
     def select_in_network(self):
         rows = self.get_selected_indices()
         if not rows: return
+        
+        # Block our own timer to prevent recursive selection interference
+        self._last_selection = None 
+        
         for n in hou.selectedNodes(): n.setSelected(False)
         first = None
         for idx in rows:
             node, _ = self.cached_nodes[idx]
-            node.setSelected(True)
-            if not first: first = node
+            try:
+                node.setSelected(True)
+                if not first: first = node
+            except hou.ObjectWasDeleted:
+                pass
         if first:
             p = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
             if p: p.cd(first.parent().path()); p.homeToSelection()
