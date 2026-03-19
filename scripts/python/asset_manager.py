@@ -760,6 +760,44 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self.filter_combo.currentIndexChanged.connect(self._apply_filter)
         h_lay.addWidget(self.filter_combo)
 
+        h_lay.addSpacing(8)
+
+        self.type_filter_btn = QtWidgets.QPushButton("Type: All")
+        self.type_filter_btn.setToolTip("Filter by node type")
+        self.type_filter_btn.setFixedWidth(130)
+        self.type_filter_btn.clicked.connect(self._show_type_filter_popup)
+        h_lay.addWidget(self.type_filter_btn)
+
+        # Popup panel (hidden until button clicked)
+        self._type_popup = QtWidgets.QFrame(self, QtCore.Qt.WindowType.Popup)
+        self._type_popup.setStyleSheet(f"""
+            QFrame {{ background:{PANEL_BG}; border:1px solid {BORDER}; }}
+            QListWidget {{ background:{PANEL_MID}; border:none; }}
+            QListWidget::item {{ padding:3px 8px; }}
+            QListWidget::item:selected {{ background:{SEL_BG}; color:#fff; }}
+        """)
+        popup_lay = QtWidgets.QVBoxLayout(self._type_popup)
+        popup_lay.setContentsMargins(4, 4, 4, 4)
+        popup_lay.setSpacing(4)
+
+        popup_top = QtWidgets.QHBoxLayout()
+        btn_all  = QtWidgets.QPushButton("All")
+        btn_none = QtWidgets.QPushButton("None")
+        btn_all.setFixedHeight(20)
+        btn_none.setFixedHeight(20)
+        btn_all.clicked.connect(self._type_filter_select_all)
+        btn_none.clicked.connect(self._type_filter_select_none)
+        popup_top.addWidget(btn_all)
+        popup_top.addWidget(btn_none)
+        popup_lay.addLayout(popup_top)
+
+        self._type_list = QtWidgets.QListWidget()
+        self._type_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self._type_list.setFixedWidth(220)
+        self._type_list.itemChanged.connect(self._on_type_filter_changed)
+        popup_lay.addWidget(self._type_list)
+        self._type_popup.hide()
+
         h_lay.addStretch()
 
         btn_refresh = QtWidgets.QPushButton("⟳  Refresh")
@@ -896,6 +934,7 @@ class AssetManagerWindow(QtWidgets.QWidget):
             self._last_hou_selection = {n.path() for n in hou.selectedNodes()}
         except Exception:
             self._last_hou_selection = set()
+        self._rebuild_type_list()
         self._apply_filter()
         total = len(self._entries)
         missing = sum(1 for e in self._entries if not e["exists"])
@@ -936,11 +975,23 @@ class AssetManagerWindow(QtWidgets.QWidget):
         text = self.search_box.text().lower()
         mode = self.filter_combo.currentIndex()   # 0=all, 1=missing, 2=found
 
+        # Collect checked types
+        checked_types = set()
+        for i in range(self._type_list.count()):
+            item = self._type_list.item(i)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                checked_types.add(item.text())
+        all_types = {self._type_list.item(i).text() for i in range(self._type_list.count())}
+        # Only skip filtering if ALL types are checked (or list is empty = not yet built)
+        type_filter_active = bool(all_types) and checked_types != all_types
+
         self._filtered = []
         for e in self._entries:
             if mode == 1 and e["exists"]:
                 continue
             if mode == 2 and not e["exists"]:
+                continue
+            if type_filter_active and e["node"].type().name() not in checked_types:
                 continue
             if text:
                 blob = " ".join([
@@ -954,6 +1005,128 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self._populate_table()
 
     def _populate_table(self):
+        v_scroll = self.table.verticalScrollBar().value()
+        self.table.setRowCount(0)
+        for row_idx, e in enumerate(self._filtered):
+            self.table.insertRow(row_idx)
+
+            # status dot
+            dot = QtWidgets.QTableWidgetItem(
+                "●" if e["exists"] else "●"
+            )
+            dot.setForeground(QtGui.QColor(OK_GREEN if e["exists"] else MISS_RED))
+            dot.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            dot.setToolTip("File found" if e["exists"] else "File NOT found")
+            self.table.setItem(row_idx, COL_STATUS, dot)
+
+            # node path
+            node_item = QtWidgets.QTableWidgetItem(e["node"].path())
+            node_item.setForeground(QtGui.QColor(ACCENT))
+            node_item.setToolTip("Double-click to select node in Houdini")
+            self.table.setItem(row_idx, COL_NODE, node_item)
+
+            # type
+            self.table.setItem(row_idx, COL_TYPE,
+                               QtWidgets.QTableWidgetItem(e["node"].type().name()))
+
+            # parm name
+            parm_item = QtWidgets.QTableWidgetItem(e["parm_name"])
+            parm_item.setForeground(QtGui.QColor(TEXT_DIM))
+            self.table.setItem(row_idx, COL_PARM, parm_item)
+
+            # path — raw ($VAR/...) or expanded (absolute) depending on toggle
+            path_display = e["expanded"] if self._show_absolute else e["raw"]
+            path_item = QtWidgets.QTableWidgetItem(path_display)
+            path_item.setData(QtCore.Qt.ItemDataRole.UserRole, e["exists"])
+            path_item.setToolTip(e["raw"] if self._show_absolute else e["expanded"])
+            self.table.setItem(row_idx, COL_PATH, path_item)
+
+            # action buttons widget
+            btn_widget = QtWidgets.QWidget()
+            btn_layout = QtWidgets.QHBoxLayout(btn_widget)
+            btn_layout.setContentsMargins(4, 2, 4, 2)
+            btn_layout.setSpacing(4)
+
+            btn_browse = QtWidgets.QPushButton("Browse")
+            btn_browse.setFixedHeight(22)
+            btn_browse.setToolTip("Pick a new file for this parameter")
+            btn_browse.clicked.connect(functools.partial(self._browse_single, row_idx))
+            btn_layout.addWidget(btn_browse)
+
+            btn_reveal = QtWidgets.QPushButton("📂")
+            btn_reveal.setFixedWidth(28)
+            btn_reveal.setFixedHeight(22)
+            btn_reveal.setToolTip("Open folder in file explorer")
+            btn_reveal.clicked.connect(functools.partial(self._reveal_in_explorer, row_idx))
+            btn_layout.addWidget(btn_reveal)
+
+            self.table.setCellWidget(row_idx, COL_ACTIONS, btn_widget)
+            self.table.setRowHeight(row_idx, 30)
+
+        self.table.verticalScrollBar().setValue(v_scroll)
+
+    def _rebuild_type_list(self):
+        """Rebuild the type filter list from current entries, preserving checked state."""
+        previously_checked = set()
+        for i in range(self._type_list.count()):
+            item = self._type_list.item(i)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                previously_checked.add(item.text())
+
+        all_types = sorted({e["node"].type().name() for e in self._entries})
+
+        self._type_list.blockSignals(True)
+        self._type_list.clear()
+        for t in all_types:
+            item = QtWidgets.QListWidgetItem(t)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            # Restore previous state, default to checked
+            state = QtCore.Qt.CheckState.Checked if (
+                not previously_checked or t in previously_checked
+            ) else QtCore.Qt.CheckState.Unchecked
+            item.setCheckState(state)
+            self._type_list.addItem(item)
+        self._type_list.setFixedHeight(min(len(all_types), 15) * 24 + 8)
+        self._type_list.blockSignals(False)
+        self._update_type_btn_label()
+
+    def _show_type_filter_popup(self):
+        btn = self.type_filter_btn
+        pos = btn.mapToGlobal(QtCore.QPoint(0, btn.height()))
+        self._type_popup.move(pos)
+        self._type_popup.show()
+        self._type_popup.raise_()
+
+    def _on_type_filter_changed(self):
+        self._update_type_btn_label()
+        self._apply_filter()
+
+    def _update_type_btn_label(self):
+        total   = self._type_list.count()
+        checked = sum(
+            1 for i in range(total)
+            if self._type_list.item(i).checkState() == QtCore.Qt.CheckState.Checked
+        )
+        if checked == total:
+            self.type_filter_btn.setText("Type: All")
+        elif checked == 0:
+            self.type_filter_btn.setText("Type: None")
+        else:
+            self.type_filter_btn.setText(f"Type: {checked}/{total}")
+
+    def _type_filter_select_all(self):
+        self._type_list.blockSignals(True)
+        for i in range(self._type_list.count()):
+            self._type_list.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+        self._type_list.blockSignals(False)
+        self._on_type_filter_changed()
+
+    def _type_filter_select_none(self):
+        self._type_list.blockSignals(True)
+        for i in range(self._type_list.count()):
+            self._type_list.item(i).setCheckState(QtCore.Qt.CheckState.Unchecked)
+        self._type_list.blockSignals(False)
+        self._on_type_filter_changed()
         v_scroll = self.table.verticalScrollBar().value()
         self.table.setRowCount(0)
         for row_idx, e in enumerate(self._filtered):
