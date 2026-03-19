@@ -9,9 +9,8 @@
     <script><![CDATA[from PySide6 import QtWidgets, QtCore
 import asset_manager # your saved module filename without .py
 
-def onCreateInterface():
-    # Return an instance of your SwatchViewer widget
-    return asset_manager.AssetManagerPanel()]]></script>
+def createInterface():
+    return asset_manager.AssetManagerWindow()]]></script>
     <includeInToolbarMenu menu_position="418" create_separator="false"/>
     <help><![CDATA[]]></help>
   </interface>
