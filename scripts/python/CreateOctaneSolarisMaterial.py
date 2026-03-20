@@ -68,7 +68,7 @@ def createOctaneMaterial():
     #create materials  
     def createMaterial(name, matnet):
         # Create Octane Material Builder and delete all existing nodes
-        material = matNode.createNode('octane_solaris_material_builder', "OR_" + name)
+        material = matNode.createNode('octane_solaris_material_builder', name)
         # material.deleteItems(material.children())
         # Recreate Octane Material network
         collect = matNode.createNode('collect', name+"_collect")

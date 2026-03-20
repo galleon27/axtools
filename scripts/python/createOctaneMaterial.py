@@ -2,167 +2,195 @@ import hou
 import os
 import re
 
-def createOctaneMaterial():
-	#global variables
-	node = hou.pwd()
-	matNode = hou.node(str(node.path() + '/material1'))
-	directory = node.parm('directory').unexpandedString()
-	directory_path = node.parm('directory').eval()
-	matnet = None
-	iteration = 0
+class OctaneMaterialBuilder:
+    def __init__(self):
+        # 1. Global / State Variables
+        self.node = hou.pwd()
+        self.mat_node = hou.node(f"{self.node.path()}/material1")
+        self.directory = self.node.parm('directory').unexpandedString()
+        self.directory_path = self.node.parm('directory').eval()
+        self.iteration = 0
+        
+        # 2. Setup the Material Network subnet
+        self.matnet = self._get_or_create_matnet()
 
-	basecolor = ["albedo", "basecolor", "base_color", "diffuse"]
-	basecolor_dict = {item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_SRGB"} for item in basecolor}
+        # 3. Define Texture Dictionaries
+        self.basecolor_dict = {
+            item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_SRGB"} 
+            for item in ["albedo", "basecolor", "base_color", "diffuse"]
+        }
+        self.roughness_dict = {
+            item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
+            for item in ["roughness"]
+        }
+        self.metallic_dict = {
+            item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
+            for item in ["metallic", "metalness"]
+        }
+        self.opacity_dict = {
+            item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
+            for item in ["opacity"]
+        }
+        self.normal_dict = {
+            item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
+            for item in ["normal"]
+        }
+        self.displacement_dict = {
+            item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
+            for item in ["displacement", "height"]
+        }
+        self.emission_dict = {
+            item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_SRGB"} 
+            for item in ["emission", "emissive"]
+        }
 
-	roughness = ["roughness"]
-	roughness_dict = {item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in roughness}
+        self.preview_keywords = ["Preview", "preview"]
 
-	metallic = ["metallic", "metalness"]
-	metallic_dict = {item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in metallic}
+    def _get_or_create_matnet(self):
+        """Creates or retrieves the AX_MATNET subnet."""
+        matnet = hou.node(f"{self.node.path()}/AX_MATNET")
+        if matnet is None:
+            matnet = self.node.createNode('matnet', 'AX_MATNET')
+        return matnet
 
-	opacity = ["opacity"]
-	opacity_dict = {item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in opacity}
+    def get_material_names(self):
+        """Scans the directory and returns a list of unique material base names."""
+        temp = []
+        if not os.path.exists(self.directory_path):
+            return temp
 
-	normal = ["normal"]
-	normal_dict = {item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in normal}
+        for filename in os.listdir(self.directory_path):
+            if not any(p in filename for p in self.preview_keywords):
+                if filename.lower().endswith(('.png', '.jpg', '.tga', '.tif', '.exr')):
+                    # Remove extension
+                    name_part = os.path.splitext(filename)[0]
+                    # Replace non-alphanumeric separators with underscores
+                    name_part = re.sub(r'[^a-zA-Z0-9]+', '_', name_part).rstrip('_')
+                    # Remove channel keyword from end
+                    name = "_".join(name_part.split('_')[:-1])
+                    temp.append(name)
+                    
+        return list(set(temp))
 
-	displacement = ["displacement", "height"]
-	displacement_dict = {item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in displacement}
+    def set_groups(self, total_materials, name):
+        """Sets the group and material path parameters on the HDA and internal nodes."""
+        if not self.mat_node:
+            return
 
-	emission = ["emission", "emissive"]
-	emission_dict = {item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_SRGB"} for item in emission}
+        self.mat_node.parm('num_materials').set(total_materials)
+        self.mat_node.parm(f'shop_materialpath{self.iteration}').set(f'../AX_MATNET/{name}')
+        
+        self.node.parm('groupnum').set(total_materials)
+        
+        # Note: In your original script, the group parameter is set twice. 
+        # I preserved your original logic here.
+        groupnum_parm = self.node.parm(f'groupnum{self.iteration}')
+        if groupnum_parm:
+            self.mat_node.parm(f'group{self.iteration}').set(groupnum_parm)
+            
+        self.mat_node.parm(f'group{self.iteration}').set(f'@shop_materialpath={name}')
+        
+        texsets_parm = self.node.parm('texSets')
+        if texsets_parm:
+            texsets_parm.set(total_materials)
 
-	preview = ["Preview", "preview"]
+    def create_material_network(self, name):
+        """Creates the Octane VOPNET and the base Universal Material nodes."""
+        material = self.matnet.createNode('octane_vopnet', name)
+        
+        # Delete existing default nodes
+        material.deleteItems(material.children())
+        
+        # Recreate Octane Material network
+        material_node = material.createNode('NT_MAT_UNIVERSAL')
+        output_node = material.createNode('octane_material')
+        output_node.setNamedInput('material', material_node, 'NT_MAT_UNIVERSAL')
+        
+        return material, material_node
 
-	def setGroups(filename, name):
-		matNode.parm('num_materials').set(len(filename))
-		matNode.parm('shop_materialpath' + str(iteration)).set('../AX_MATNET/' + name)
-		node.parm('groupnum').set(len(filename))
-		matNode.parm('group' + str(iteration)).set(node.parm('groupnum' + str(iteration)))
-		matNode.parm('group' + str(iteration)).set('@shop_materialpath=' + name)
-		node.parm('texSets').set(len(filename))
+    def create_texture_node(self, texture_set, material, material_node, name, ch_input, texdir, secondary_node_type=None, secondary_input='texture', defaults=None):
+        """Finds the correct texture file and wires it into the material node."""
+        file_dict = {}
+        for filename in os.listdir(self.directory_path):
+            base, ext = os.path.splitext(filename)
+            if ext.lower() in ['.png', '.jpg', '.tga', '.tif', '.exr']:
+                base = re.sub(r'[^a-zA-Z0-9]+', '_', base).rstrip('_')
+                if base not in file_dict or ext.lower() == '.exr':
+                    file_dict[base] = filename
 
-	#create matnet
-	def createMatnet():
-		matnet = hou.node(node.path() + '/AX_MATNET')
-		if (matnet == None):
-			matnet = node.createNode('matnet', 'AX_MATNET')
-		return matnet
+        for base, filename in file_dict.items():
+            if material.name() in filename:
+                for channel, properties in texture_set.items():
+                    if channel.lower() in filename.lower():
+                        # Create primary image node, set name, filename, and color space
+                        image = material.createNode(properties["type"])
+                        image.setName(name, unique_name=True)
+                        image.parm('A_FILENAME').set(os.path.join(self.directory, filename))
+                        image.parm('colorSpace').set(properties["color_space"])
 
-	def materialName():
-	    temp = []
-	    for filename in os.listdir(directory_path):
-	        if not any(p in filename for p in preview):
-	            if filename.lower().endswith(('.png', '.jpg', '.tga', '.tif', '.exr')):
-	                # Remove extension
-	                name_part = os.path.splitext(filename)[0]
-	                
-	                # Replace any non-alphanumeric separator with underscores
-	                name_part = re.sub(r'[^a-zA-Z0-9]+', '_', name_part)
-	                
-	                # Remove trailing underscores
-	                name_part = name_part.rstrip('_')
-	                
-	                # Remove channel keyword from end
-	                name = "_".join(name_part.split('_')[:-1])
-	                
-	                temp.append(name)
-	    return list(set(temp))
+                        # Handle secondary node (e.g., displacement or emission)
+                        if secondary_node_type:
+                            secondary_node = material.createNode(secondary_node_type)
+                            secondary_node.setNamedInput(secondary_input, image, properties["type"])
 
+                            if defaults:
+                                for param, value in defaults.items():
+                                    secondary_node.parm(param).set(value)
 
-	#create materials  
-	def createMaterial(name, matnet):
-	    # Create Octane Material Builder and delete all existing nodes
-	    material = matnet.createNode('octane_vopnet', name)
-	    material.deleteItems(material.children())
-	    # Recreate Octane Material network
-	    materialNode = material.createNode('NT_MAT_UNIVERSAL')
-	    outputNode = material.createNode('octane_material')
-	    outputNode.setNamedInput('material', materialNode, 'NT_MAT_UNIVERSAL')
-	    return material, materialNode
+                            material_node.setNamedInput(ch_input, secondary_node, secondary_node_type)
+                        else:
+                            # Direct connection to the material node
+                            material_node.setNamedInput(ch_input, image, properties["type"])
 
-	def createMaterialNode(textureSet, material, materialNode, name, ch_input, texdir, secondary_node_type=None, secondary_input='texture', defaults=None):
-	    # Build a dict to track best files by base name
-	    file_dict = {}
-	    for filename in os.listdir(directory_path):
-	        base, ext = os.path.splitext(filename)
-	        if ext.lower() in ['.png', '.jpg', '.tga', '.tif', '.exr']:
-	            base = re.sub(r'[^a-zA-Z0-9]+', '_', base).rstrip('_')
-	            if base not in file_dict or ext.lower() == '.exr':
-	                file_dict[base] = filename
+                        # Update UI parameter on the main node
+                        texdir_parm = self.node.parm(f"{texdir}{self.iteration}")
+                        if texdir_parm:
+                            texdir_parm.set(image.parm('A_FILENAME'))
+                            
+                        return # Exit once a match is successfully found and wired
 
-	    for base, filename in file_dict.items():
-	        if material.name() in filename:
-	            for channel, properties in textureSet.items():
-	                if channel.lower() in filename.lower():
-	                    # Create primary image node, set name, filename, and color space
-	                    image = material.createNode(properties["type"])
-	                    image.setName(name, unique_name=True)
-	                    image.parm('A_FILENAME').set(os.path.join(directory, filename))
-	                    image.parm('colorSpace').set(properties["color_space"])
+    def build(self):
+        """The main execution method that orchestrates the material creation."""
+        material_names = self.get_material_names()
+        total_materials = len(material_names)
 
-	                    # If a secondary node is needed (e.g., for displacement or emission)
-	                    if secondary_node_type:
-	                        secondary_node = material.createNode(secondary_node_type)
-	                        secondary_node.setNamedInput(secondary_input, image, properties["type"])
+        for name in material_names:
+            self.iteration += 1
+            material, material_node = self.create_material_network(name)
+            self.set_groups(total_materials, name)
 
-	                        # Apply default parameters to the secondary node if provided
-	                        if defaults:
-	                            for param, value in defaults.items():
-	                                secondary_node.parm(param).set(value)
+            # Wire up all the texture channels
+            self.create_texture_node(self.basecolor_dict, material, material_node, 'basecolor', 'albedo', 'basecolordir')
+            self.create_texture_node(self.roughness_dict, material, material_node, 'roughness', 'roughness', 'roughnessdir')
+            self.create_texture_node(self.metallic_dict, material, material_node, 'metallic', 'metallic', 'metallicdir')
+            self.create_texture_node(self.normal_dict, material, material_node, 'normal', 'normal', 'normaldir')
+            self.create_texture_node(self.opacity_dict, material, material_node, 'opacity', 'opacity', 'opacitydir')
 
-	                        # Set material node input to the secondary node
-	                        materialNode.setNamedInput(ch_input, secondary_node, secondary_node_type)
-	                    else:
-	                        # Set material node input directly to the image node
-	                        materialNode.setNamedInput(ch_input, image, properties["type"])
+            self.create_texture_node(
+                self.displacement_dict, material, material_node, 'displacement', 'displacement', 'displacementdir', 
+                secondary_node_type='NT_VERTEX_DISPLACEMENT', 
+                secondary_input='texture', 
+                defaults={'black_level': 0.5, 'amount': 0.01}
+            )
 
-	                    # Set the directory parameter with iteration
-	                    node.parm(f"{texdir}{iteration}").set(image.parm('A_FILENAME'))
-	                    break  # Stop searching channels once a match is found
+            self.create_texture_node(
+                self.emission_dict, material, material_node, 'emission', 'emission', 'emissivedir',
+                secondary_node_type='NT_EMIS_TEXTURE', 
+                secondary_input='efficiency_or_texture'
+            )
+
+            # Rearrange nodes inside the material
+            material.layoutChildren() 
+
+        # Rearrange materials inside the matnet
+        self.matnet.layoutChildren() 
 
 
+# --- Execution ---
+# To run this script (e.g., inside a button callback or Python module script), 
+# you just need to initialize the class and call `.build()`.
 
-	# print(matnet)
-	for material_name in materialName():
-		iteration = iteration + 1
-		matnet = createMatnet()
-		material, materialNode = createMaterial(material_name, matnet)
-		setGroups(materialName(), material_name)
-
-		# Usage examples for different node types:
-		createMaterialNode(
-		    basecolor_dict, material, materialNode, 'basecolor', 'albedo', 'basecolordir'
-		)
-
-		createMaterialNode(
-		    roughness_dict, material, materialNode, 'roughness', 'roughness', 'roughnessdir'
-		)
-
-		createMaterialNode(
-		    metallic_dict, material, materialNode, 'metallic', 'metallic', 'metallicdir'
-		)
-
-		createMaterialNode(
-		    normal_dict, material, materialNode, 'normal', 'normal', 'normaldir'
-		)
-
-		createMaterialNode(
-		    opacity_dict, material, materialNode, 'opacity', 'opacity', 'opacitydir'
-		)
-
-		createMaterialNode(
-		    displacement_dict, material, materialNode, 'displacement', 'displacement', 'displacementdir', 
-		    secondary_node_type='NT_VERTEX_DISPLACEMENT', 
-		    secondary_input='texture', defaults={'black_level': 0.5, 'amount': 0.01}
-		)
-
-		createMaterialNode(
-		    emission_dict, material, materialNode, 'emission_dict', 'emission', 'emissivedir',
-		    secondary_node_type='NT_EMIS_TEXTURE', 
-		    secondary_input='efficiency_or_texture'
-)
-		material.layoutChildren() #rearrange texture nodes
-		matnet.layoutChildren() #rearange material nodes
-
+def execute():
+    builder = OctaneMaterialBuilder()
+    builder.build()
 
