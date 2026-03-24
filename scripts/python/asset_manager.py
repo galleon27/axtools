@@ -947,6 +947,14 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self._sel_timer.stop()
         super().closeEvent(event)
 
+    def hideEvent(self, event):
+        self._sel_timer.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        self._sel_timer.start()
+        super().showEvent(event)
+
     def _on_abs_view_toggled(self, checked):
         self._show_absolute = checked
         self._populate_table()
@@ -967,8 +975,12 @@ class AssetManagerWindow(QtWidgets.QWidget):
         for row in range(self.table.rowCount()):
             if row >= len(self._filtered):
                 break
-            if self._filtered[row]["node"].path() in selected_paths:
-                self.table.selectRow(row)
+            try:
+                if self._filtered[row]["node"].path() in selected_paths:
+                    self.table.selectRow(row)
+            except hou.ObjectWasDeleted:
+                # Node was deleted since last refresh — force a stale-check next tick
+                self._last_hou_selection = None
         self.table.blockSignals(False)
 
     def _apply_filter(self):
