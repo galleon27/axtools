@@ -946,13 +946,9 @@ if not output_labels:
     hou.ui.displayMessage("The selected node has no outputs.", title="No Outputs Found")
     raise SystemExit
 
-# -------------------------------------------------------------------
-# NEW CODE: Input Dialog
-# -------------------------------------------------------------------
 # This opens a small window asking for text.
-# It returns a tuple: (button_index, text_entered)
 button_idx, prefix_text = hou.ui.readInput(
-    "Enter the prefix for the Null nodes:", 
+    "Enter the prefix for the Null nodes (leave empty for no prefix):", 
     buttons=("OK", "Cancel"), 
     title="Set Prefix",
     initial_contents="OUT" # Default text
@@ -961,45 +957,69 @@ button_idx, prefix_text = hou.ui.readInput(
 # If the user clicks "Cancel" (index 1) or closes the window, stop the script.
 if button_idx != 0:
     raise SystemExit
-# -------------------------------------------------------------------
 
 processed_nodes = []
 
+# --- First loop for NULLs ---
 for i, label in enumerate(output_labels):
     
-    # Use the input text here combined with the label
-    # This creates "YourPrefix_LabelName"
-    node_name = f"{prefix_text}_{label}"
+    # Determine the target node name
+    if prefix_text:
+        node_name = f"{prefix_text}_{label}"
+    else:
+        node_name = label
     
-    null_node = parent.createNode("null", node_name)
+    # -------------------------------------------------------------------
+    # MODIFIED LOGIC: Check if the NULL node already exists
+    # -------------------------------------------------------------------
+    null_node = parent.node(node_name)
+    
+    if not null_node:
+        # Node does not exist, so create and position it
+        print(f"Creating new NULL node: {node_name}")
+        null_node = parent.createNode("null", node_name)
+        null_pos = hou.Vector2(pos.x() + 3, pos.y() - i * 1.5)
+        null_node.setPosition(null_pos)
+    else:
+        # Node already exists, just print a message
+        print(f"NULL node '{node_name}' already exists. Skipping creation.")
+    # -------------------------------------------------------------------
 
+    # For both new and existing nodes, ensure the input and parameter are correct
     null_node.setInput(0, selected_node, i)
-
-    null_pos = hou.Vector2(pos.x() + 3, pos.y() - i * 1.5)
-    null_node.setPosition(null_pos)
-
-    # Added a safety check in case the parameter doesn't exist on a standard Null
     if null_node.parm("outputname1"):
         null_node.parm("outputname1").set(label)
 
     processed_nodes.append((null_node, label))
 
 
+# --- Second loop for ROPs ---
 for null_node, label in processed_nodes:
-
     null_pos = null_node.position()
-
     rop_name = f"ROP_{label}"
     
-    # Check if 'rop_image' is a valid node type in your context before creating
-    # (Assuming it is valid based on your previous code)
-    rop_node = parent.createNode("rop_image", rop_name)
+    # -------------------------------------------------------------------
+    # MODIFIED LOGIC: Check if the ROP node already exists
+    # -------------------------------------------------------------------
+    rop_node = parent.node(rop_name)
+    
+    if not rop_node:
+        # Node does not exist, so create and position it
+        print(f"Creating new ROP node: {rop_name}")
+        try:
+            rop_node = parent.createNode("rop_image", rop_name)
+            rop_pos = hou.Vector2(null_pos.x() + 3, null_pos.y())
+            rop_node.setPosition(rop_pos)
+        except hou.OperationFailed:
+            print(f"Could not create node of type 'rop_image'. Skipping ROP for {label}.")
+            continue
+    else:
+        # Node already exists, just print a message
+        print(f"ROP node '{rop_name}' already exists. Skipping creation.")
+    # -------------------------------------------------------------------
 
+    # For both new and existing nodes, ensure the input and parameter are correct
     rop_node.setInput(0, null_node, 0)
-
-    rop_pos = hou.Vector2(null_pos.x() + 3, null_pos.y())
-    rop_node.setPosition(rop_pos)
-
     if rop_node.parm("aov1"):
         rop_node.parm("aov1").set(label)]]></script>
   </tool>

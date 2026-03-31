@@ -4,36 +4,45 @@ import re
 def split():
     parent = hou.parent()
     root = hou.pwd()
-    attribName = root.parm('attrib_name').eval()
+    attrib_name = root.parm('attrib_name').eval()
     rootGeo = root.geometry()
-    list = rootGeo.findPrimAttrib(attribName)
-
-    if (list != None):
-        attList = list.strings()
-        for i in attList:
-            blast = parent.createNode('blast')
-            blast.setFirstInput(root, 0)
-            blast.moveToGoodPosition()
-            blast.parm('group').set("@"+ attribName + "=" + "\"" + i + "\"")
-            blast.parm('negate').set(1)
+    attrib = rootGeo.findPrimAttrib(attrib_name)
 
 
+    if attrib is not None:
+        attrib_type = attrib.dataType()
+
+        if attrib_type == hou.attribData.String:
+            attributes = attrib.strings()
+            for attribute_value in attributes:
+                blast = parent.createNode('blast')
+                blast.setFirstInput(root, 0)
+                blast.moveToGoodPosition()
+                blast.parm('group').set(f"@{attrib_name}=\"{attribute_value}\"")
+                blast.parm('negate').set(1)
+
+        elif attrib_type == hou.attribData.Int:
+            if rootGeo.findPrimAttrib(attrib_name):
+                raw_int_values = rootGeo.primIntAttribValues(attrib_name)
+                unique_string_values = [str(value) for value in set(raw_int_values)]
+
+                for string in unique_string_values:
+                    blast = parent.createNode('blast')
+                    blast.setFirstInput(root, 0)
+                    blast.moveToGoodPosition()
+                    blast.parm('group').set(f"@{attrib_name}={string}")
+                    blast.parm('negate').set(1)
     else:
-        print("There is no attibute by that name")
-
-
-
-
-
+        print(f"There is no attribute named '{attrib_name}'")
 
 
 def out():
     context = hou.node('/obj')
     parent = hou.parent()
     root = hou.pwd()
-    attribName = root.parm('attrib_name').eval()
+    attrib_name = root.parm('attrib_name').eval()
     rootGeo = root.geometry()
-    list = rootGeo.findPrimAttrib(attribName)
+    list = rootGeo.findPrimAttrib(attrib_name)
     msg = hou.ui.displayMessage('Object Merge', buttons=('None', 'Into This Object', 'Into Specified Object'), severity=hou.severityType.Message, 
                 default_choice=0, close_choice=2, help='Select transform type for object merge', title='Transform', 
                 details=None, details_label=None, details_expanded=False)
@@ -47,5 +56,5 @@ def out():
             path = hou.pwd().path()
             om = node.createNode('object_merge')
             om.parm('objpath1').set(path)
-            om.parm('group1').set("@" + attribName + "=" + "\"" +originalName + "\"")
+            om.parm('group1').set("@" + attrib_name + "=" + "\"" +originalName + "\"")
             om.parm('xformtype').set(msg)
