@@ -7,6 +7,7 @@
 
   <toolshelf name="AX Shortcut Tools" label="AX Shortcut Tools">
     <memberTool name="Reveal in Explorer"/>
+    <memberTool name="trace_psd_link_parameters"/>
   </toolshelf>
 
   <tool name="Reveal in Explorer" label="Reveal in Explorer" icon="custom_hda_icon">
@@ -60,5 +61,35 @@ def open_directory_from_node():
 
 # Run the function
 open_directory_from_node()]]></script>
+  </tool>
+
+  <tool name="trace_psd_link_parameters" label="Trace PSD parm linker" icon="custom_hda_icon">
+    <script scriptType="python"><![CDATA[import hou
+
+node = hou.selectedNodes()
+
+for n in node:
+    if n.type().name() == 'labs::trace_psd_file::3.0':
+        num_layers = n.evalParm('fd_layers')
+        source_parm = 'resampleamt1'
+        source_parm2 = 'size1'
+        
+        for i in range(2, num_layers + 1):
+            n.parm("resample{}".format(i)).set(1)
+            resample = "resampleamt{}".format(i)
+            resample = n.parm(resample)
+            
+            
+            n.parm("dilateerode{}".format(i)).set(1)
+            erode = "size{}".format(i)
+            erode = n.parm(erode)
+            
+            if resample:
+                resample.setExpression('ch("{}")'.format(source_parm))
+                erode.setExpression('ch("{}")'.format(source_parm2))
+                
+                print(f"Linked {resample} to {source_parm}")
+            else:
+                print(f"Warning: {resample} not found on node.")]]></script>
   </tool>
 </shelfDocument>
