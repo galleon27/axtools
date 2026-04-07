@@ -17,11 +17,19 @@ class OctaneMaterialBuilder:
         # 3. Define Texture Dictionaries
         self.basecolor_dict = {
             item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_SRGB"} 
-            for item in ["albedo", "basecolor", "base_color", "diffuse"]
+            for item in ["albedo", "basecolor", "base_color", "diffuse", "diff"]
+        }
+        self.ao_dict = {
+            item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
+            for item in ["ao", "ambientocclusion", "ambient_occlusion", "mixed_ao"]
+        }
+        self.specular_dict = {
+            item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
+            for item in ["specular", "spec", "reflectance", "reflection", "reflect", "refl", "gloss", "glossiness", "gloss_map", "specular_map"]
         }
         self.roughness_dict = {
             item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
-            for item in ["roughness"]
+            for item in ["roughness", "rough", "rough_map", "roughness_map"]
         }
         self.metallic_dict = {
             item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
@@ -29,15 +37,15 @@ class OctaneMaterialBuilder:
         }
         self.opacity_dict = {
             item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
-            for item in ["opacity"]
+            for item in ["opacity", "transparency"]
         }
         self.normal_dict = {
             item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
-            for item in ["normal"]
+            for item in ["normal", "normalmap", "normal_map", "nrm", "norm"]
         }
         self.displacement_dict = {
             item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} 
-            for item in ["displacement", "height"]
+            for item in ["displacement", "height", "disp", "displacement_map", "height_map", "disp_map"]
         }
         self.emission_dict = {
             item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_SRGB"} 
@@ -128,6 +136,9 @@ class OctaneMaterialBuilder:
                         image.parm('A_FILENAME').set(os.path.join(self.directory, filename))
                         image.parm('colorSpace').set(properties["color_space"])
 
+                        final_node = image
+                        final_type = properties["type"]
+
                         # Handle secondary node (e.g., displacement or emission)
                         if secondary_node_type:
                             secondary_node = material.createNode(secondary_node_type)
@@ -137,17 +148,22 @@ class OctaneMaterialBuilder:
                                 for param, value in defaults.items():
                                     secondary_node.parm(param).set(value)
 
-                            material_node.setNamedInput(ch_input, secondary_node, secondary_node_type)
-                        else:
-                            # Direct connection to the material node
-                            material_node.setNamedInput(ch_input, image, properties["type"])
+                            final_node = secondary_node
+                            final_type = secondary_node_type
+                        
+                        # Only wire directly if ch_input is provided
+                        if ch_input:
+                            material_node.setNamedInput(ch_input, final_node, final_type)
 
                         # Update UI parameter on the main node
-                        texdir_parm = self.node.parm(f"{texdir}{self.iteration}")
-                        if texdir_parm:
-                            texdir_parm.set(image.parm('A_FILENAME'))
-                            
-                        return # Exit once a match is successfully found and wired
+                        if texdir:
+                            texdir_parm = self.node.parm(f"{texdir}{self.iteration}")
+                            if texdir_parm:
+                                texdir_parm.set(image.parm('A_FILENAME'))
+                                
+                        return final_node, final_type # Return nodes for advanced wiring
+
+        return None, None # Return empty if no match found
 
     def build(self):
         """The main execution method that orchestrates the material creation."""
@@ -159,9 +175,26 @@ class OctaneMaterialBuilder:
             material, material_node = self.create_material_network(name)
             self.set_groups(total_materials, name)
 
-            # Wire up all the texture channels
-            self.create_texture_node(self.basecolor_dict, material, material_node, 'basecolor', 'albedo', 'basecolordir')
+            # --- Albedo and AO Logic ---
+            # Fetch nodes without wiring them directly to the material node yet (ch_input=None)
+            albedo_node, albedo_type = self.create_texture_node(self.basecolor_dict, material, material_node, 'basecolor', None, 'basecolordir')
+            ao_node, ao_type = self.create_texture_node(self.ao_dict, material, material_node, 'ao', None, 'aodir')
+
+            if albedo_node and ao_node:
+                # If both exist, create a multiply node
+                mult_node = material.createNode('NT_TEX_MULTIPLY', 'albedo_ao_mult')
+                mult_node.setNamedInput('texture1', albedo_node, albedo_type)
+                mult_node.setNamedInput('texture2', ao_node, ao_type)
+                
+                # Plug the multiply node into the material's albedo channel
+                material_node.setNamedInput('albedo', mult_node, 'NT_TEX_MULTIPLY')
+            elif albedo_node:
+                # If only albedo exists, plug it directly
+                material_node.setNamedInput('albedo', albedo_node, albedo_type)
+
+            # --- Wire remaining texture channels ---
             self.create_texture_node(self.roughness_dict, material, material_node, 'roughness', 'roughness', 'roughnessdir')
+            self.create_texture_node(self.specular_dict, material, material_node, 'specular', 'specular', 'speculardir')
             self.create_texture_node(self.metallic_dict, material, material_node, 'metallic', 'metallic', 'metallicdir')
             self.create_texture_node(self.normal_dict, material, material_node, 'normal', 'normal', 'normaldir')
             self.create_texture_node(self.opacity_dict, material, material_node, 'opacity', 'opacity', 'opacitydir')
@@ -193,4 +226,3 @@ class OctaneMaterialBuilder:
 def execute():
     builder = OctaneMaterialBuilder()
     builder.build()
-
