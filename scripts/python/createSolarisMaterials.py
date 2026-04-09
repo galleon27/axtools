@@ -73,32 +73,43 @@ class MaterialBuilder:
         return None
 
     def _setup_config(self):
+        
         """Loads the correct node types, parameter names, and ports based on the renderer."""
+        albedo_suffix = self.node.parm('albedo_suffix').evalAsString()
+        ambientocclusion_suffix = self.node.parm('ambientocclusion_suffix').evalAsString()
+        specular_suffix = self.node.parm('specular_suffix').evalAsString()
+        roughness_suffix = self.node.parm('roughness_suffix').evalAsString()
+        metallic_suffix = self.node.parm('metallic_suffix').evalAsString()
+        opacity_suffix = self.node.parm('opacity_suffix').evalAsString()
+        normal_suffix = self.node.parm('normal_suffix').evalAsString()
+        displacement_suffix = self.node.parm('displacement_suffix').evalAsString()
+        emission_suffix = self.node.parm('emission_suffix').evalAsString()
+    
         if self.renderer == "octane":
             self.file_parm = 'A_FILENAME'
             
-            self.basecolor_dict = {k: {"type": "NT_TEX_IMAGE", "port": "albedo", "color_space": "NAMED_COLOR_SPACE_SRGB"} for k in ["albedo", "basecolor", "base_color", "diffuse", "diff"]}
-            self.ao_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "none", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ["ao", "ambientocclusion", "ambient_occlusion", "occlusion"]}
-            self.specular_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "specular", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ["specular", "spec"]}
-            self.roughness_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "roughness", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ["roughness", "rough"]}
-            self.metallic_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "metallic", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ["metallic", "metalness"]}
-            self.opacity_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "opacity", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ["opacity", "transmission", "transparency"]}
-            self.normal_dict = {k: {"type": "NT_TEX_IMAGE", "port": "normal", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ["normal", "normals", "normalmap", "normal_map", "norm"]}
-            self.displacement_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "displacement", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ["displacement", "height", "disp", "displace"]}
-            self.emission_dict = {k: {"type": "NT_TEX_IMAGE", "port": "emission", "color_space": "NAMED_COLOR_SPACE_SRGB"} for k in ["emission", "emissive"]}
+            self.basecolor_dict = {k: {"type": "NT_TEX_IMAGE", "port": "albedo", "color_space": "NAMED_COLOR_SPACE_SRGB"} for k in albedo_suffix }
+            self.ao_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "none", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ambientocclusion_suffix }
+            self.specular_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "specular", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in specular_suffix }
+            self.roughness_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "roughness", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in roughness_suffix }
+            self.metallic_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "metallic", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in metallic_suffix }
+            self.opacity_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "opacity", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in opacity_suffix }
+            self.normal_dict = {k: {"type": "NT_TEX_IMAGE", "port": "normal", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in normal_suffix }
+            self.displacement_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "displacement", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in displacement_suffix }
+            self.emission_dict = {k: {"type": "NT_TEX_IMAGE", "port": "emission", "color_space": "NAMED_COLOR_SPACE_SRGB"} for k in emission_suffix }
             
         elif self.renderer == "karma":
             self.file_parm = 'file'
             
-            self.basecolor_dict = {k: {"type": "mtlximage", "port": "base_color", "signature": "color3"} for k in ["albedo", "basecolor", "base_color", "diffuse", "diff"]}
-            self.ao_dict = {k: {"type": "mtlximage", "port": "none", "signature": "float"} for k in ["ao", "ambientocclusion", "ambient_occlusion", "occlusion"]}
-            self.specular_dict = {k: {"type": "mtlximage", "port": "specular", "signature": "float"} for k in ["specular", "spec"]}
-            self.roughness_dict = {k: {"type": "mtlximage", "port": "specular_roughness", "signature": "float"} for k in ["roughness", "rough"]}
-            self.metallic_dict = {k: {"type": "mtlximage", "port": "metalness", "signature": "float"} for k in ["metallic", "metalness"]}
-            self.opacity_dict = {k: {"type": "mtlximage", "port": "transmission", "signature": "float"} for k in ["opacity", "transmission", "transparency"]}
-            self.normal_dict = {k: {"type": "mtlximage", "port": "normal", "signature": "vector3"} for k in ["normal", "normals", "normalmap", "normal_map", "norm"]}
-            self.displacement_dict = {k: {"type": "mtlximage", "port": "displacement", "signature": "float"} for k in ["displacement", "height", "disp", "displace"]}
-            self.emission_dict = {k: {"type": "mtlximage", "port": "emission", "signature": "color3"} for k in ["emission", "emissive"]}
+            self.basecolor_dict = {k: {"type": "mtlximage", "port": "base_color", "signature": "color3"} for k in albedo_suffix }
+            self.ao_dict = {k: {"type": "mtlximage", "port": "none", "signature": "float"} for k in ambientocclusion_suffix }
+            self.specular_dict = {k: {"type": "mtlximage", "port": "specular", "signature": "float"} for k in specular_suffix }
+            self.roughness_dict = {k: {"type": "mtlximage", "port": "specular_roughness", "signature": "float"} for k in roughness_suffix }
+            self.metallic_dict = {k: {"type": "mtlximage", "port": "metalness", "signature": "float"} for k in metallic_suffix }
+            self.opacity_dict = {k: {"type": "mtlximage", "port": "transmission", "signature": "float"} for k in opacity_suffix }
+            self.normal_dict = {k: {"type": "mtlximage", "port": "normal", "signature": "vector3"} for k in normal_suffix }
+            self.displacement_dict = {k: {"type": "mtlximage", "port": "displacement", "signature": "float"} for k in displacement_suffix }
+            self.emission_dict = {k: {"type": "mtlximage", "port": "emission", "signature": "color3"} for k in emission_suffix }
 
     def get_material_names(self):
         """Scans the directory and returns a list of unique material base names."""
