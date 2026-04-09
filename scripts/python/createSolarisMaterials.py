@@ -75,15 +75,15 @@ class MaterialBuilder:
     def _setup_config(self):
         
         """Loads the correct node types, parameter names, and ports based on the renderer."""
-        albedo_suffix = self.node.parm('albedo_suffix').evalAsString()
-        ambientocclusion_suffix = self.node.parm('ambientocclusion_suffix').evalAsString()
-        specular_suffix = self.node.parm('specular_suffix').evalAsString()
-        roughness_suffix = self.node.parm('roughness_suffix').evalAsString()
-        metallic_suffix = self.node.parm('metallic_suffix').evalAsString()
-        opacity_suffix = self.node.parm('opacity_suffix').evalAsString()
-        normal_suffix = self.node.parm('normal_suffix').evalAsString()
-        displacement_suffix = self.node.parm('displacement_suffix').evalAsString()
-        emission_suffix = self.node.parm('emission_suffix').evalAsString()
+        albedo_suffix = self.node.parm('albedo_suffix').eval().split()
+        ambientocclusion_suffix = self.node.parm('ambientocclusion_suffix').eval().split()
+        specular_suffix = self.node.parm('specular_suffix').eval().split()
+        roughness_suffix = self.node.parm('roughness_suffix').eval().split()
+        metallic_suffix = self.node.parm('metallic_suffix').eval().split()
+        opacity_suffix = self.node.parm('opacity_suffix').eval().split()
+        normal_suffix = self.node.parm('normal_suffix').eval().split()
+        displacement_suffix = self.node.parm('displacement_suffix').eval().split()
+        emission_suffix = self.node.parm('emission_suffix').eval().split()
     
         if self.renderer == "octane":
             self.file_parm = 'A_FILENAME'
