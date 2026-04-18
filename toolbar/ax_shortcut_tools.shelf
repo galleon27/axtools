@@ -8,6 +8,7 @@
   <toolshelf name="AX Shortcut Tools" label="AX Shortcut Tools">
     <memberTool name="Reveal in Explorer"/>
     <memberTool name="trace_psd_link_parameters"/>
+    <memberTool name="convert_to_relative_path"/>
   </toolshelf>
 
   <tool name="Reveal in Explorer" label="Reveal in Explorer" icon="custom_hda_icon">
@@ -91,5 +92,34 @@ for n in node:
                 print(f"Linked {resample} to {source_parm}")
             else:
                 print(f"Warning: {resample} not found on node.")]]></script>
+  </tool>
+
+  <tool name="convert_to_relative_path" label="Convert to Relative Path" icon="convert.svg">
+    <script scriptType="python"><![CDATA[import hou
+
+def convertToRelativePath():
+    nodes = hou.selectedNodes()
+    
+    for node in nodes:
+        # Iterate through every parameter on the current node
+        for parm in node.parms():
+            # Check if it's a string parameter first
+            template = parm.parmTemplate()
+            if template.type() == hou.parmTemplateType.String:
+                # Check if the string type is specifically a Node Reference
+                if template.stringType() == hou.stringParmType.NodeReference:
+                    
+                    path = parm.eval()
+                    target_node = hou.node(path)
+                    
+                    # Only convert if the path points to a valid, existing node
+                    if target_node:
+                        # Avoid converting if it's already a relative path (starts with .)
+                        if not path.startswith('.'):
+                            rel_path = node.relativePathTo(target_node)
+                            parm.set(rel_path)
+                            print(f"Converted {parm.name()} on {node.name()} to relative.")
+
+convertToRelativePath()]]></script>
   </tool>
 </shelfDocument>

@@ -112,7 +112,7 @@ class OctaneMaterialBuilder:
         # Recreate Octane Material network
         material_node = material.createNode('NT_MAT_UNIVERSAL')
         output_node = material.createNode('octane_material')
-        output_node.setNamedInput('material', material_node, 'NT_MAT_UNIVERSAL')
+        output_node.setNamedInput('material', material_node, 0)
         
         return material, material_node
 

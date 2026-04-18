@@ -26,6 +26,7 @@
     <memberTool name="Copernicus Heightmap Layers Export"/>
     <memberTool name="Relink Files"/>
     <memberTool name="Loop Sequence"/>
+    <memberTool name="set_item_color"/>
   </toolshelf>
 
   <tool name="GSG Octane Material" label="GSG Octane Material" icon="custom_hda_icon">
@@ -1197,5 +1198,31 @@ for node in nodes:
                 expr = "`padzero({}, ($F - 1) % {} + 1)`".format(padding_str, file_count)
             
             parm.set(raw_path.replace(f_token, expr))]]></script>
+  </tool>
+
+  <tool name="set_item_color" label="Set Item Color" icon="color_palette.png">
+    <script scriptType="python"><![CDATA[from PySide6 import QtGui, QtWidgets
+
+# Get everything selected (Nodes, Boxes, Stickies)
+items = hou.selectedItems()
+
+# Use a default color (black) if nothing is selected
+initial_hou_color = hou.Color(0, 0, 0)
+
+if items:
+    # Try .color() (Nodes), fallback to .getColor() (NetworkBoxes)
+    first = items[0]
+    initial_hou_color = first.color() if hasattr(first, 'color') else first.getColor()
+
+# Open Dialog
+initial_qcolor = QtGui.QColor()
+initial_qcolor.setRgbF(*initial_hou_color.rgb())
+new_qcolor = QtWidgets.QColorDialog.getColor(initial_qcolor)
+
+# Apply if valid
+if new_qcolor.isValid():
+    new_hou_color = hou.Color(new_qcolor.getRgbF()[:3])
+    for item in items:
+        item.setColor(new_hou_color)]]></script>
   </tool>
 </shelfDocument>
