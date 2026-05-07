@@ -38,6 +38,7 @@ NODE_PARAM_MAP = {
     # COPs / texture nodes
     "file::2.0":        ["filename"],
     "cop2_file":        ["filename"],
+    "copnet":           ["coppath"],
 
     # Redshift
     "redshift::TextureSampler":  ["tex0"],
@@ -111,7 +112,7 @@ FALLBACK_PARM_RE = re.compile(
 
 # Values that look like paths but are actually Houdini-internal tokens
 BLOCKED_VALUE_PATTERNS = re.compile(
-    r"^(\$HFS|\$HH|\$HOUDINI_PATH|\$HOME/houdini|opdef:|oplib:|temp:|op:)",
+    r"^(\$HFS|\$HH|\$HOUDINI_PATH|\$HOME/houdini|opdef:|oplib:|temp:)",
     re.IGNORECASE,
 )
 
@@ -121,12 +122,23 @@ BLOCKED_VALUE_PATTERNS = re.compile(
 # ---------------------------------------------------------------------------
 
 def _looks_like_path(value: str) -> bool:
-    """Return True if the string looks like an external file-system path."""
-    if not value or len(value) < 4:
+    if not value:
         return False
     if BLOCKED_VALUE_PATTERNS.match(value):
         return False
-    # Must contain a slash/backslash OR a file extension
+    
+    # Allow 'op:' prefixes explicitly
+    if value.lower().startswith("op:"):
+        return True
+        
+    # Allow strings that resolve to an actual node in the scene
+    if hou.node(value) is not None:
+        return True
+        
+    if len(value) < 4:
+        return False
+        
+    # Standard file path fallback
     has_sep = "/" in value or "\\" in value
     has_ext = bool(re.search(r'\.[a-zA-Z0-9]{2,6}$', value))
     return has_sep or has_ext
@@ -152,11 +164,6 @@ def _is_inside_locked_hda(node):
 
 
 def collect_nodes(root=None):
-    """
-    Walk the entire node graph and return a list of dicts:
-        {node, parm, parm_name, raw, resolved, expanded, exists}
-    Only returns nodes/parms that represent external asset inputs.
-    """
     if root is None:
         root = hou.node("/")
 
@@ -168,27 +175,26 @@ def collect_nodes(root=None):
             return
         visited.add(node.path())
 
-        # If this node is a locked HDA, don't scan it or any of its children
-        try:
-            if node.isLockedHDA():
-                return
-        except AttributeError:
-            pass
-
-        # If we've already determined we're inside a locked HDA, stop here
+        # If we are already deep inside a locked HDA's network, skip this internal node
         if inside_locked:
             return
 
-        type_name = node.type().name()
+        # Check if THIS node is a locked HDA. We want to read its parameters,
+        # but we flag it so we don't scan its internal children.
+        is_locked_hda = False
+        try:
+            if node.isLockedHDA():
+                is_locked_hda = True
+        except AttributeError:
+            pass
 
-        # Skip blocked node types outright
+        type_name = node.type().name()
         base_type = type_name.split("::")[0]
         if base_type in BLOCKED_NODE_TYPES:
             for child in node.children():
-                _walk(child, inside_locked=False)
+                _walk(child, inside_locked=is_locked_hda)
             return
 
-        # --- 1. known explicit parm map ---
         known_parms = list(NODE_PARAM_MAP.get(type_name, []))
         for key in NODE_PARAM_MAP:
             if type_name.startswith(key) and NODE_PARAM_MAP[key] not in [known_parms]:
@@ -211,22 +217,16 @@ def collect_nodes(root=None):
             except Exception:
                 pass
 
-        # --- 2. narrow fallback: only if no known parms matched ---
         if not found_parms:
             for parm in node.parms():
                 pname = parm.name()
-                if pname in found_parms:
-                    continue
-                if pname in BLOCKED_PARM_NAMES:
+                if pname in found_parms or pname in BLOCKED_PARM_NAMES:
                     continue
                 if not FALLBACK_PARM_RE.match(pname):
                     continue
                 try:
                     tmpl = parm.parmTemplate()
-                    if tmpl.type() != hou.parmTemplateType.String:
-                        continue
-                    # Only pick up file-chooser parms, not plain string fields
-                    if tmpl.stringType() != hou.stringParmType.FileReference:
+                    if tmpl.type() != hou.parmTemplateType.String or tmpl.stringType() != hou.stringParmType.FileReference:
                         continue
                     raw = parm.rawValue()
                     resolved = parm.eval()
@@ -235,11 +235,9 @@ def collect_nodes(root=None):
                 except Exception:
                     pass
 
+        # Pass the is_locked_hda state down to the children
         for child in node.children():
-            # Mark children as inside_locked if this node is an unlocked HDA
-            # that contains children (subnet-style). The locked case already
-            # returned early above, so anything reaching here is unlocked.
-            _walk(child, inside_locked=False)
+            _walk(child, inside_locked=is_locked_hda)
 
     _walk(root, inside_locked=False)
     return results
@@ -247,7 +245,21 @@ def collect_nodes(root=None):
 
 def _make_entry(node, parm, raw, resolved):
     expanded = hou.expandString(resolved)
-    exists = os.path.exists(expanded) if expanded else False
+    
+    # Clean the path to check if it's a node
+    clean_node_path = expanded
+    if clean_node_path.lower().startswith("op:"):
+        clean_node_path = clean_node_path[3:] # Strip the 'op:' prefix to test the node
+        
+    # Check if the node actually exists in the Houdini scene
+    is_node = hou.node(clean_node_path) is not None
+    
+    if is_node:
+        exists = True
+    else:
+        # Fallback to checking the hard drive
+        exists = os.path.exists(expanded) if expanded else False
+        
     return {
         "node":      node,
         "parm":      parm,
@@ -716,6 +728,7 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self._replace_str  = None
         self._last_hou_selection = set()
         self._show_absolute = False
+        self._solo_mode = False
 
         self._build_ui()
         self.refresh()
@@ -767,6 +780,15 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self.type_filter_btn.setFixedWidth(130)
         self.type_filter_btn.clicked.connect(self._show_type_filter_popup)
         h_lay.addWidget(self.type_filter_btn)
+
+#        --- ADD THE SOLO BUTTON HERE ---
+        self.btn_solo = QtWidgets.QPushButton("Solo")
+        self.btn_solo.setCheckable(True)
+        self.btn_solo.setChecked(False)
+        self.btn_solo.setToolTip("Show only paths inside the currently selected node(s)")
+        self.btn_solo.toggled.connect(self._on_solo_toggled)
+        h_lay.addWidget(self.btn_solo)
+        # --------------------------------
 
         # Popup panel (hidden until button clicked)
         self._type_popup = QtWidgets.QFrame(self, QtCore.Qt.WindowType.Popup)
@@ -926,6 +948,10 @@ class AssetManagerWindow(QtWidgets.QWidget):
     # Data
     # ------------------------------------------------------------------
 
+    def _on_solo_toggled(self, checked):
+        self._solo_mode = checked
+        self._apply_filter()
+
     def refresh(self):
         self.status_label.setText("Scanning scene …")
         QtWidgets.QApplication.processEvents()
@@ -960,61 +986,77 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self._populate_table()
 
     def _sync_houdini_selection(self):
-        """Select table rows whose node is currently selected in Houdini."""
-        try:
-            selected_paths = {n.path() for n in hou.selectedNodes()}
-        except Exception:
-            return
-
-        if selected_paths == self._last_hou_selection:
-            return
-        self._last_hou_selection = selected_paths
-
-        self.table.blockSignals(True)
-        self.table.clearSelection()
-        for row in range(self.table.rowCount()):
-            if row >= len(self._filtered):
-                break
             try:
-                if self._filtered[row]["node"].path() in selected_paths:
-                    self.table.selectRow(row)
-            except hou.ObjectWasDeleted:
-                # Node was deleted since last refresh — force a stale-check next tick
-                self._last_hou_selection = None
-        self.table.blockSignals(False)
+                selected_paths = {n.path() for n in hou.selectedNodes()}
+            except Exception:
+                return
+
+            if selected_paths == self._last_hou_selection:
+                return
+            self._last_hou_selection = selected_paths
+
+            # If Solo is active, re-filter the table whenever selection changes
+            if self._solo_mode:
+                self._apply_filter()
+
+            self.table.blockSignals(True)
+            self.table.clearSelection()
+            for row in range(self.table.rowCount()):
+                if row >= len(self._filtered):
+                    break
+                try:
+                    if self._filtered[row]["node"].path() in selected_paths:
+                        self.table.selectRow(row)
+                except hou.ObjectWasDeleted:
+                    self._last_hou_selection = None
+            self.table.blockSignals(False)
 
     def _apply_filter(self):
-        text = self.search_box.text().lower()
-        mode = self.filter_combo.currentIndex()   # 0=all, 1=missing, 2=found
+            text = self.search_box.text().lower()
+            mode = self.filter_combo.currentIndex()
 
-        # Collect checked types
-        checked_types = set()
-        for i in range(self._type_list.count()):
-            item = self._type_list.item(i)
-            if item.checkState() == QtCore.Qt.CheckState.Checked:
-                checked_types.add(item.text())
-        all_types = {self._type_list.item(i).text() for i in range(self._type_list.count())}
-        # Only skip filtering if ALL types are checked (or list is empty = not yet built)
-        type_filter_active = bool(all_types) and checked_types != all_types
+            checked_types = set()
+            for i in range(self._type_list.count()):
+                item = self._type_list.item(i)
+                if item.checkState() == QtCore.Qt.CheckState.Checked:
+                    checked_types.add(item.text())
+            all_types = {self._type_list.item(i).text() for i in range(self._type_list.count())}
+            type_filter_active = bool(all_types) and checked_types != all_types
 
-        self._filtered = []
-        for e in self._entries:
-            if mode == 1 and e["exists"]:
-                continue
-            if mode == 2 and not e["exists"]:
-                continue
-            if type_filter_active and e["node"].type().name() not in checked_types:
-                continue
-            if text:
-                blob = " ".join([
-                    e["node"].name(), e["node"].type().name(),
-                    e["parm_name"], e["raw"], e["resolved"]
-                ]).lower()
-                if text not in blob:
+            # Get the paths of currently selected nodes for the Solo check
+            solo_paths = [n.path() for n in hou.selectedNodes()] if self._solo_mode else []
+
+            self._filtered = []
+            for e in self._entries:
+                if mode == 1 and e["exists"]:
                     continue
-            self._filtered.append(e)
+                if mode == 2 and not e["exists"]:
+                    continue
+                if type_filter_active and e["node"].type().name() not in checked_types:
+                    continue
+                
+                # --- SOLO LOGIC ---
+                if self._solo_mode:
+                    if not solo_paths:
+                        continue  # If Solo is checked but nothing is selected, show empty table
+                    
+                    e_path = e["node"].path()
+                    # Keep node if it IS the selected node, or if it is a CHILD of the selected node
+                    is_solo = any(e_path == sp or e_path.startswith(sp + "/") for sp in solo_paths)
+                    if not is_solo:
+                        continue
+                # ------------------
 
-        self._populate_table()
+                if text:
+                    blob = " ".join([
+                        e["node"].name(), e["node"].type().name(),
+                        e["parm_name"], e["raw"], e["resolved"]
+                    ]).lower()
+                    if text not in blob:
+                        continue
+                self._filtered.append(e)
+
+            self._populate_table()
 
     def _populate_table(self):
         v_scroll = self.table.verticalScrollBar().value()
