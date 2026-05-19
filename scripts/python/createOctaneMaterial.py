@@ -137,12 +137,12 @@ class OctaneMaterialBuilder:
                         image.parm('colorSpace').set(properties["color_space"])
 
                         final_node = image
-                        final_type = properties["type"]
+                        final_type = 'out'
 
                         # Handle secondary node (e.g., displacement or emission)
                         if secondary_node_type:
                             secondary_node = material.createNode(secondary_node_type)
-                            secondary_node.setNamedInput(secondary_input, image, properties["type"])
+                            secondary_node.setNamedInput(secondary_input, image, 'out')
 
                             if defaults:
                                 for param, value in defaults.items():
@@ -153,7 +153,7 @@ class OctaneMaterialBuilder:
                         
                         # Only wire directly if ch_input is provided
                         if ch_input:
-                            material_node.setNamedInput(ch_input, final_node, final_type)
+                            material_node.setNamedInput(ch_input, final_node, 'out')
 
                         # Update UI parameter on the main node
                         if texdir:
@@ -183,14 +183,14 @@ class OctaneMaterialBuilder:
             if albedo_node and ao_node:
                 # If both exist, create a multiply node
                 mult_node = material.createNode('NT_TEX_MULTIPLY', 'albedo_ao_mult')
-                mult_node.setNamedInput('texture1', albedo_node, albedo_type)
-                mult_node.setNamedInput('texture2', ao_node, ao_type)
+                mult_node.setNamedInput('texture1', albedo_node, 'out')
+                mult_node.setNamedInput('texture2', ao_node, 'out')
                 
                 # Plug the multiply node into the material's albedo channel
-                material_node.setNamedInput('albedo', mult_node, 'NT_TEX_MULTIPLY')
+                material_node.setNamedInput('albedo', mult_node, 'out')
             elif albedo_node:
                 # If only albedo exists, plug it directly
-                material_node.setNamedInput('albedo', albedo_node, albedo_type)
+                material_node.setNamedInput('albedo', albedo_node, 'out')
 
             # --- Wire remaining texture channels ---
             self.create_texture_node(self.roughness_dict, material, material_node, 'roughness', 'roughness', 'roughnessdir')
