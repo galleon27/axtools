@@ -101,14 +101,37 @@ class OctaneMaterialBuilder:
         return matnet
 
     def get_material_names(self):
-        """Scans the directory and returns a list of unique material base names."""
-        temp = set()
-        for filename in self.cached_files:
-            name_part = os.path.splitext(filename)[0]
-            name_part = re.sub(r'[^a-zA-Z0-9]+', '_', name_part).rstrip('_')
-            name = "_".join(name_part.split('_')[:-1])
-            temp.add(name)
-        return list(temp)
+            """Scans the directory and returns a list of unique material base names based on recognized suffixes."""
+            temp = set()
+            
+            # Collect all recognized suffixes to cleanly strip them from filenames
+            all_suffixes = []
+            for d in [self.basecolor_dict, self.ao_dict, self.specular_dict, 
+                    self.roughness_dict, self.metallic_dict, self.opacity_dict, 
+                    self.normal_dict, self.displacement_dict, self.emission_dict]:
+                all_suffixes.extend(list(d.keys()))
+                
+            # Sort by length descending so longer suffixes (e.g., 'mixed_ao') match before shorter ones ('ao')
+            all_suffixes.sort(key=len, reverse=True)
+
+            for filename in self.cached_files:
+                name_part = os.path.splitext(filename)[0]
+                
+                for suffix in all_suffixes:
+                    # Look for the suffix in the filename (case-insensitive)
+                    idx = name_part.lower().rfind(suffix.lower())
+                    if idx != -1:
+                        # Isolate the base name by slicing up to where the suffix begins
+                        base_name = name_part[:idx]
+                        
+                        # Clean up trailing non-alphanumeric chars (like trailing underscores)
+                        base_name = re.sub(r'[^a-zA-Z0-9]+$', '', base_name)
+                        
+                        if base_name:
+                            temp.add(base_name)
+                        break 
+                        
+            return list(temp)
 
     def set_groups(self, total_materials, name):
         """Sets the group and material path parameters on the HDA and internal nodes."""
