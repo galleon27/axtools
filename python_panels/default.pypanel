@@ -20,7 +20,7 @@
     <interfaceItem name="clone_control"/>
     <interfaceItem name="HydraSceneBrowser"/>
     <separatorItem/>
-    <interfaceItem name="MatLib"/>
+    <separatorItem/>
     <separatorItem/>
     <interfaceItem name="rig_tree"/>
     <interfaceItem name="sesi_bookmarks_editor"/>
@@ -42,7 +42,8 @@
     <interfaceItem name="layout_asset_gallery"/>
     <interfaceItem name="Image Preview"/>
     <interfaceItem name="swatches"/>
-    <interfaceItem name="Asset Manager"/>
     <separatorItem/>
+    <separatorItem/>
+    <interfaceItem name="MIndMap"/>
   </interfacesMenu>
 </pythonPanelDocument>

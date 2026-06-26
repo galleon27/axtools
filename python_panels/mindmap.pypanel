@@ -1,0 +1,1410 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <!-- This file contains definitions of Python interfaces and the
+ interfaces menu.  It should not be hand-edited when it is being
+ used by the application.  Note, that two definitions of the
+ same interface or of the interfaces menu are not allowed
+ in a single file. -->
+  <interface name="MIndMap" label="MindMap" icon="custom_hda_Icon" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA["""
+MindMap Panel for SideFX Houdini 21+  (Python 3.11 / PySide6 / Qt6)
+=====================================================================
+A fully interactive mind-mapping tool built as a Houdini Python Panel.
+
+INSTALLATION
+------------
+1. In Houdini go to:  Windows > Python Panel Editor
+2. Click [+] to create a new panel and name it "MindMap"
+3. Paste the entire contents of this file into the Script tab
+4. Set Entry Function to:  createInterface
+5. Click [Apply] then [Accept]
+6. Open via Windows > MindMap, or drag into any pane tab
+
+CONTROLS
+--------
+  Double-click canvas       Create new node at cursor
+  Double-click connection   Insert an intermediary node between connected nodes
+  Double-click node/note    Rename node / Edit multi-line note text
+  Left-click item           Select item
+  Left-drag item            Move items with real-time snap-to-grid
+  Rubber-band drag          Multi-select
+  Right-click node          Context menu (rename / connect / layout selected / color / delete)
+  Right-click edge          Context menu (delete connection)
+  Right-click canvas        Context menu (new node / new note / layout map / clear / fit)
+  Middle-drag / Alt+drag    Pan canvas
+  Scroll wheel              Zoom in / out
+  Delete / Backspace        Delete selected items
+  Ctrl+Z / Ctrl+Y           Undo / Redo (50 levels)
+  Ctrl+A                    Select all
+  Escape                    Cancel pending connection / deselect
+  Enter                     Extend linear stream from active node
+  Ctrl+Enter                Create a new stream branch from root node
+  Hold Y + Left-Drag        Draw slice stroke to delete intersecting connections
+"""
+
+import json
+import math
+import os
+from typing import Dict, List, Optional
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout,
+    QGraphicsView, QGraphicsScene, QGraphicsItem,
+    QGraphicsPathItem, QGraphicsRectItem,
+    QMenu, QInputDialog, QFileDialog,
+    QLabel, QPushButton, QFrame,
+    QMessageBox, QApplication, QColorDialog,
+)
+from PySide6.QtCore import Qt, QPointF, QRectF, QRect, QTimer, Signal, QLineF
+from PySide6.QtGui import (
+    QPainter, QPen, QBrush, QColor, QPainterPath,
+    QFont, QFontMetrics, QLinearGradient,
+    QKeySequence, QShortcut, QAction, QCursor,
+)
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# THEME
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+class Theme:
+    BG          = QColor("#1a1a1a")
+    GRID_LINE   = QColor("#242424")
+    GRID_MAJOR  = QColor("#2e2e2e")
+
+    NODE_FILL   = QColor("#2d2d2d")
+    NODE_HOVER  = QColor("#363636")
+    NODE_SEL    = QColor("#3a3a3a")
+    NODE_BORDER = QColor("#505050")
+    NODE_SEL_BD = QColor("#e88c2e")
+    NODE_TEXT   = QColor("#d0d0d0")
+    NODE_TEXT_S = QColor("#ffffff")
+    NODE_SHADOW = QColor(0, 0, 0, 90)
+
+    EDGE_COL    = QColor("#5a5a5a")
+    EDGE_WIDTH  = 1.8
+
+    ACCENT      = QColor("#e88c2e")
+    ACCENT2     = QColor("#c0782a")
+    TOOLBAR_BG  = QColor("#252525")
+    TOOLBAR_BTN = QColor("#333333")
+    TOOLBAR_HOV = QColor("#404040")
+    STATUS_FG   = QColor("#777777")
+
+    FONT_NODE   = QFont("Consolas", 10)
+    FONT_UI     = QFont("Consolas", 9)
+    FONT_TITLE  = QFont("Consolas", 11)
+
+    RADIUS      = 10
+    NODE_PAD_X  = 18
+    NODE_PAD_Y  = 10
+    MIN_W       = 100
+    MIN_H       = 36
+    
+    GRID_SNAP   = 30.0
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# EDGE
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+class Edge(QGraphicsPathItem):
+    """Cubic-bezier connection between two MindNodes."""
+
+    def __init__(self, src, dst):
+        super().__init__()
+        self.src = src
+        self.dst = dst
+        self.setZValue(-1)
+        self.setAcceptHoverEvents(True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self._hovered = False
+        self.update_path()
+
+    def update_path(self):
+        if not self.src or not self.dst:
+            return
+        p1 = self.src.pos()
+        p2 = self.dst.pos()
+        dx = abs(p2.x() - p1.x())
+        c  = max(60.0, dx * 0.45)
+        path = QPainterPath(p1)
+        path.cubicTo(QPointF(p1.x() + c, p1.y()),
+                     QPointF(p2.x() - c, p2.y()), p2)
+        self.setPath(path)
+        self._refresh_pen()
+
+    def _refresh_pen(self):
+        col = Theme.ACCENT if self._hovered else Theme.EDGE_COL
+        w   = Theme.EDGE_WIDTH + (1.0 if self._hovered else 0.0)
+        self.setPen(QPen(col, w, Qt.PenStyle.SolidLine,
+                         Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+
+    def hoverEnterEvent(self, e):
+        self._hovered = True
+        self._refresh_pen()
+
+    def hoverLeaveEvent(self, e):
+        self._hovered = False
+        self._refresh_pen()
+
+    def other(self, node):
+        return self.dst if self.src is node else self.src
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# STICKY NOTE
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+class StickyNote(QGraphicsItem):
+    """Text wrapped canvas documentation block container."""
+
+    def __init__(self, nid, text, x=0.0, y=0.0):
+        super().__init__()
+        self.nid = nid
+        self._text = text
+        
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        
+        sx = round(x / Theme.GRID_SNAP) * Theme.GRID_SNAP
+        sy = round(y / Theme.GRID_SNAP) * Theme.GRID_SNAP
+        self.setPos(sx, sy)
+        self._recalc_size()
+
+    def _recalc_size(self):
+        fm = QFontMetrics(Theme.FONT_NODE)
+        self._w = 180.0
+        
+        # FIXED: Converted to a clean integer QRect and integer cast flags to satisfy PySide6's strict signatures
+        target_rect = QRect(0, 0, int(self._w - 20), 4000)
+        text_rect = fm.boundingRect(target_rect, int(Qt.TextFlag.TextWordWrap), self._text)
+        
+        self._h = max(110.0, text_rect.height() + 32.0)
+        self.prepareGeometryChange()
+
+    def boundingRect(self):
+        return QRectF(-self._w / 2.0, -self._h / 2.0, self._w, self._h)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(-self._w / 2.0, -self._h / 2.0, self._w, self._h)
+        sel = self.isSelected()
+        
+        painter.fillRect(r.translated(3, 4), QColor(0, 0, 0, 50))
+        
+        bg = QColor("#2b251a") if not sel else QColor("#383021")
+        painter.fillRect(r, bg)
+        
+        bd_col = Theme.ACCENT if sel else QColor("#8c7142")
+        painter.setPen(QPen(bd_col, 1.2, Qt.PenStyle.DashLine if not sel else Qt.PenStyle.SolidLine))
+        painter.drawRect(r)
+        
+        painter.fillRect(QRectF(-self._w / 2.0, -self._h / 2.0, self._w, 5.0), QColor("#cfa14c"))
+        
+        painter.setFont(Theme.FONT_NODE)
+        painter.setPen(QColor("#d9cfbd"))
+        inner_r = r.adjusted(10, 12, -10, -10)
+        painter.drawText(inner_r, Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, self._text)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            if self.scene():
+                nx = round(value.x() / Theme.GRID_SNAP) * Theme.GRID_SNAP
+                ny = round(value.y() / Theme.GRID_SNAP) * Theme.GRID_SNAP
+                return QPointF(nx, ny)
+        return super().itemChange(change, value)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.edit_dialog()
+            e.accept()
+        else:
+            super().mouseDoubleClickEvent(e)
+
+    def edit_dialog(self):
+        view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+        new_text, ok = QInputDialog.getMultiLineText(
+            view, "Edit Note Content", "Documentation String:", text=self._text)
+        if ok and new_text.strip() and new_text.strip() != self._text:
+            self._text = new_text.strip()
+            self._recalc_size()
+            self.update()
+
+    def to_dict(self):
+        return {"id": self.nid, "text": self._text, "x": self.pos().x(), "y": self.pos().y()}
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# NODE
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+class MindNode(QGraphicsItem):
+    """Rounded-rect node with built-in live grid snapping mechanics."""
+
+    def __init__(self, nid, label, x=0.0, y=0.0, color=None):
+        super().__init__()
+        self.nid    = nid
+        self._label = label
+        self._color = QColor(color) if color else None
+        self.edges  = []  # type: List[Edge]
+
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges |
+            QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges,
+        )
+        self.setAcceptHoverEvents(True)
+        
+        sx = round(x / Theme.GRID_SNAP) * Theme.GRID_SNAP
+        sy = round(y / Theme.GRID_SNAP) * Theme.GRID_SNAP
+        self.setPos(sx, sy)
+        
+        self._hovered = False
+        self._recalc_size()
+
+    def _recalc_size(self):
+        fm = QFontMetrics(Theme.FONT_NODE)
+        self._w = max(Theme.MIN_W, fm.horizontalAdvance(self._label) + Theme.NODE_PAD_X * 2)
+        self._h = max(Theme.MIN_H, fm.height() + Theme.NODE_PAD_Y * 2)
+        self.prepareGeometryChange()
+
+    def boundingRect(self):
+        return QRectF(-self._w / 2 - 4, -self._h / 2 - 4,
+                       self._w + 10,     self._h + 10)
+
+    def shape(self):
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(-self._w / 2, -self._h / 2, self._w, self._h),
+                            Theme.RADIUS, Theme.RADIUS)
+        return path
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r   = QRectF(-self._w / 2, -self._h / 2, self._w, self._h)
+        sel = self.isSelected()
+
+        # Manual shadow
+        shadow_r = r.translated(3, 4)
+        painter.setBrush(QBrush(Theme.NODE_SHADOW))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(shadow_r, Theme.RADIUS, Theme.RADIUS)
+
+        # Fill gradient
+        base = self._color if self._color else (
+            Theme.NODE_SEL if sel else
+            Theme.NODE_HOVER if self._hovered else
+            Theme.NODE_FILL)
+        grad = QLinearGradient(r.topLeft(), r.bottomLeft())
+        grad.setColorAt(0, base.lighter(112))
+        grad.setColorAt(1, base.darker(112))
+        painter.setBrush(QBrush(grad))
+
+        # Border
+        bd_col = Theme.NODE_SEL_BD if sel else (
+            Theme.ACCENT.lighter(130) if self._hovered else Theme.NODE_BORDER)
+        bd_w = 2.0 if sel else (1.5 if self._hovered else 1.0)
+        painter.setPen(QPen(bd_col, bd_w))
+        painter.drawRoundedRect(r, Theme.RADIUS, Theme.RADIUS)
+
+        # Label
+        painter.setFont(Theme.FONT_NODE)
+        painter.setPen(Theme.NODE_TEXT_S if sel else Theme.NODE_TEXT)
+        painter.drawText(r, Qt.AlignmentFlag.AlignCenter, self._label)
+
+    def hoverEnterEvent(self, e):
+        self._hovered = True
+        self.update()
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def hoverLeaveEvent(self, e):
+        self._hovered = False
+        self.update()
+        self.unsetCursor()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(e)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            if self.scene():
+                nx = round(value.x() / Theme.GRID_SNAP) * Theme.GRID_SNAP
+                ny = round(value.y() / Theme.GRID_SNAP) * Theme.GRID_SNAP
+                return QPointF(nx, ny)
+                
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            if self.scene():
+                for edge in self.edges:
+                    edge.update_path()
+        return super().itemChange(change, value)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.rename_dialog()
+            e.accept()
+        else:
+            super().mouseDoubleClickEvent(e)
+
+    def rename_dialog(self):
+        view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+        new_label, ok = QInputDialog.getText(
+            view, "Rename Node", "Label:", text=self._label)
+        if ok and new_label.strip() and new_label.strip() != self._label:
+            self._label = new_label.strip()
+            self._recalc_size()
+            for edge in self.edges:
+                edge.update_path()
+            self.update()
+
+    @property
+    def label(self):
+        return self._label
+
+    def to_dict(self):
+        return {
+            "id":    self.nid,
+            "label": self._label,
+            "x":     self.pos().x(),
+            "y":     self.pos().y(),
+            "color": self._color.name() if self._color else None,
+        }
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# SCENE
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+class MindScene(QGraphicsScene):
+    status_changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setBackgroundBrush(QBrush(Theme.BG))
+        self.setSceneRect(-5000, -5000, 10000, 10000)
+
+        self._nodes        = {}    # type: Dict[int, MindNode]
+        self._sticky_notes = {}    # type: Dict[int, StickyNote]
+        self._edges        = []    # type: List[Edge]
+        self._nid_ctr      = 0
+        self._connect_src  = None  # type: Optional[MindNode]
+        self._pending_line = None  # type: Optional[QGraphicsPathItem]
+        self._undo_stack   = []    # type: List
+        self._redo_stack   = []    # type: List
+        self._save_path    = None  # type: Optional[str]
+
+    def _snapshot(self):
+        return {
+            "nodes": [n.to_dict() for n in self._nodes.values()],
+            "notes": [t.to_dict() for t in self._sticky_notes.values()],
+            "edges": [(e.src.nid, e.dst.nid) for e in self._edges],
+            "ctr":   self._nid_ctr,
+        }
+
+    def _push_undo(self):
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore(self._undo_stack.pop())
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        self._restore(self._redo_stack.pop())
+
+    def _safe_clear(self):
+        if self._pending_line is not None:
+            try:
+                self.removeItem(self._pending_line)
+            except Exception:
+                pass
+            self._pending_line = None
+        self._connect_src = None
+
+        for node in list(self._nodes.values()):
+            node.edges = []
+
+        for edge in list(self._edges):
+            try:
+                self.removeItem(edge)
+            except Exception:
+                pass
+        self._edges.clear()
+
+        for node in list(self._nodes.values()):
+            try:
+                self.removeItem(node)
+            except Exception:
+                pass
+        self._nodes.clear()
+
+        for note in list(self._sticky_notes.values()):
+            try:
+                self.removeItem(note)
+            except Exception:
+                pass
+        self._sticky_notes.clear()
+
+    def _restore(self, snap):
+        self._safe_clear()
+        self._nid_ctr = snap["ctr"]
+        for nd in snap["nodes"]:
+            self._add_node_raw(nd["id"], nd["label"], nd["x"], nd["y"], nd.get("color"))
+        for nt in snap.get("notes", []):
+            self._add_sticky_raw(nt["id"], nt["text"], nt["x"], nt["y"])
+        for (s, d) in snap["edges"]:
+            if s in self._nodes and d in self._nodes:
+                self._add_edge_raw(self._nodes[s], self._nodes[d])
+
+    def _add_node_raw(self, nid, label, x, y, color=None):
+        node = MindNode(nid, label, x, y, color)
+        self._nodes[nid] = node
+        self.addItem(node)
+        return node
+
+    def add_node(self, label="New Node", x=0.0, y=0.0, color=None):
+        self._push_undo()
+        self._nid_ctr += 1
+        node = self._add_node_raw(self._nid_ctr, label, x, y, color)
+        self.status_changed.emit('Created node "%s"' % label)
+        return node
+
+    def _add_sticky_raw(self, nid, text, x, y):
+        note = StickyNote(nid, text, x, y)
+        self._sticky_notes[nid] = note
+        self.addItem(note)
+        return note
+
+    def add_sticky(self, text="Double-click to edit note...", x=0.0, y=0.0):
+        self._push_undo()
+        self._nid_ctr += 1
+        note = self._add_sticky_raw(self._nid_ctr, text, x, y)
+        self.status_changed.emit("Added documentation note block")
+        return note
+
+    def _add_edge_raw(self, src, dst):
+        if src is dst:
+            return None
+        for e in self._edges:
+            if (e.src is src and e.dst is dst) or (e.src is dst and e.dst is src):
+                return None
+        edge = Edge(src, dst)
+        src.edges.append(edge)
+        dst.edges.append(edge)
+        self._edges.append(edge)
+        self.addItem(edge)
+        return edge
+
+    def add_edge(self, src, dst):
+        self._push_undo()
+        edge = self._add_edge_raw(src, dst)
+        if edge:
+            self.status_changed.emit('Connected "%s" -> "%s"' % (src.label, dst.label))
+        return edge
+
+    def delete_selected(self):
+        sel_nodes = [i for i in self.selectedItems() if isinstance(i, MindNode)]
+        sel_notes = [i for i in self.selectedItems() if isinstance(i, StickyNote)]
+        if not sel_nodes and not sel_notes:
+            return
+        self._push_undo()
+        for node in sel_nodes:
+            self._remove_node(node)
+        for note in sel_notes:
+            self._remove_sticky(note)
+        self.status_changed.emit("Deleted elements")
+
+    def _remove_node(self, node):
+        for edge in list(node.edges):
+            self._remove_edge(edge)
+        node.edges = []
+        if node.nid in self._nodes:
+            del self._nodes[node.nid]
+        try:
+            self.removeItem(node)
+        except Exception:
+            pass
+
+    def _remove_sticky(self, note):
+        if note.nid in self._sticky_notes:
+            del self._sticky_notes[note.nid]
+        try:
+            self.removeItem(note)
+        except Exception:
+            pass
+
+    def _remove_edge(self, edge):
+        if edge in self._edges:
+            self._edges.remove(edge)
+        if edge in edge.src.edges:
+            edge.src.edges.remove(edge)
+        if edge in edge.dst.edges:
+            edge.dst.edges.remove(edge)
+        try:
+            self.removeItem(edge)
+        except Exception:
+            pass
+
+    def delete_edge_between(self, a, b):
+        for e in list(self._edges):
+            if (e.src is a and e.dst is b) or (e.src is b and e.dst is a):
+                self._push_undo()
+                self._remove_edge(e)
+                return
+
+    def start_connect(self, src):
+        self._connect_src = src
+        self._pending_line = QGraphicsPathItem()
+        self._pending_line.setPen(QPen(Theme.ACCENT, 1.5, Qt.PenStyle.DashLine))
+        self._pending_line.setZValue(-1)
+        self.addItem(self._pending_line)
+        self.status_changed.emit('Click target node to connect from "%s"' % src.label)
+
+    def cancel_connect(self):
+        if self._pending_line is not None:
+            try:
+                self.removeItem(self._pending_line)
+            except Exception:
+                pass
+            self._pending_line = None
+        self._connect_src = None
+
+    def update_pending_line(self, pos):
+        if not self._connect_src or self._pending_line is None:
+            return
+        p1 = self._connect_src.scenePos()
+        p2 = pos
+        c  = max(50.0, abs(p2.x() - p1.x()) * 0.4)
+        path = QPainterPath(p1)
+        path.cubicTo(QPointF(p1.x() + c, p1.y()), QPointF(p2.x() - c, p2.y()), p2)
+        self._pending_line.setPath(path)
+
+    def execute_auto_layout(self, target_nodes=None):
+        self._push_undo()
+        nodes_pool = target_nodes if target_nodes is not None else list(self._nodes.values())
+        if not nodes_pool:
+            return
+
+        children_map = {n: [] for n in nodes_pool}
+        has_parent_flag = {n: False for n in nodes_pool}
+
+        for edge in self._edges:
+            if edge.src in children_map and edge.dst in children_map:
+                children_map[edge.src].append(edge.dst)
+                has_parent_flag[edge.dst] = True
+
+        roots = [n for n in nodes_pool if not has_parent_flag[n]]
+        if not roots and nodes_pool:
+            roots = [nodes_pool[0]]
+
+        row_space = 75.0
+        col_space = 240.0
+        current_y = 0.0
+        visited = set()
+
+        def layout_branch(node, current_x):
+            nonlocal current_y
+            if node in visited:
+                return
+            visited.add(node)
+
+            start_y = current_y
+            valid_children = [c for c in children_map[node] if c not in visited]
+
+            if valid_children:
+                for idx, child in enumerate(valid_children):
+                    if idx > 0:
+                        current_y += row_space
+                    layout_branch(child, current_x + col_space)
+                target_node_y = (start_y + current_y) / 2.0
+            else:
+                target_node_y = current_y
+
+            rx = round(current_x / Theme.GRID_SNAP) * Theme.GRID_SNAP
+            ry = round(target_node_y / Theme.GRID_SNAP) * Theme.GRID_SNAP
+            node.setPos(rx, ry)
+
+        base_x_offset = target_nodes[0].pos().x() if target_nodes else 0.0
+        for root in roots:
+            layout_branch(root, base_x_offset)
+            current_y += row_space * 2.0
+
+        for edge in self._edges:
+            edge.update_path()
+        self.status_changed.emit("Layout calculation complete")
+
+    def to_dict(self):
+        return self._snapshot()
+
+    def from_dict(self, data):
+        self._safe_clear()
+        self._nid_ctr = data.get("ctr", 0)
+        for nd in data.get("nodes", []):
+            self._add_node_raw(nd["id"], nd["label"], nd["x"], nd["y"], nd.get("color"))
+        for nt in data.get("notes", []):
+            self._add_sticky_raw(nt["id"], nt["text"], nt["x"], nt["y"])
+        for (s, d) in data.get("edges", []):
+            if s in self._nodes and d in self._nodes:
+                self._add_edge_raw(self._nodes[s], self._nodes[d])
+        self.status_changed.emit("Loaded map data")
+
+    def save(self, path):
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+        self._save_path = path
+        self.status_changed.emit("Saved -> %s" % os.path.basename(path))
+
+    def load(self, path):
+        with open(path) as f:
+            data = json.load(f)
+        self.from_dict(data)
+        self._save_path = path
+
+    def clear_map(self):
+        self._push_undo()
+        self._safe_clear()
+        self._nid_ctr = 0
+        self.status_changed.emit("Map cleared")
+
+    def keyPressEvent(self, e):
+        key = e.key()
+        mod = e.modifiers()
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.delete_selected()
+        elif key == Qt.Key.Key_Escape:
+            self.cancel_connect()
+            self.clearSelection()
+        elif (mod & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_Z:
+            self.undo()
+        elif (mod & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_Y:
+            self.redo()
+        elif (mod & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_A:
+            for item in self.items():
+                if isinstance(item, (MindNode, StickyNote)):
+                    item.setSelected(True)
+        else:
+            super().keyPressEvent(e)
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# VIEW
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+class MindView(QGraphicsView):
+    zoomChanged = Signal(float)
+
+    def __init__(self, scene):
+        super().__init__(scene)
+        self.mind_scene = scene
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        
+        self.setRenderHints(
+            QPainter.RenderHint.Antialiasing |
+            QPainter.RenderHint.SmoothPixmapTransform |
+            QPainter.RenderHint.TextAntialiasing,
+        )
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setBackgroundBrush(QBrush(Theme.BG))
+
+        self._panning  = False
+        self._pan_last = QPointF()
+        self._zoom     = 1.0
+        self._zoom_min = 0.12
+        self._zoom_max = 4.0
+        
+        self._cut_mode = False
+        self._cutting = False
+        self._cut_last_pt = QPointF()
+        self._cut_path = QPainterPath()
+        self._cut_item = None
+
+    def drawBackground(self, painter, rect):
+        painter.fillRect(rect, Theme.BG)
+        z = self.transform().m11()
+        spacing = 120.0 if z < 0.3 else (60.0 if z < 0.6 else 30.0)
+        left  = int(rect.left()   / spacing) * spacing
+        top   = int(rect.top()    / spacing) * spacing
+        major = 5
+        x = left; ci = int(left / spacing)
+        while x <= rect.right():
+            pen = QPen(Theme.GRID_MAJOR if ci % major == 0 else Theme.GRID_LINE, 0)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            x += spacing; ci += 1
+        y = top; ri = int(top / spacing)
+        while y <= rect.bottom():
+            pen = QPen(Theme.GRID_MAJOR if ri % major == 0 else Theme.GRID_LINE, 0)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            y += spacing; ri += 1
+
+    def wheelEvent(self, e):
+        factor = 1.12 if e.angleDelta().y() > 0 else (1 / 1.12)
+        new_z  = self._zoom * factor
+        if self._zoom_min <= new_z <= self._zoom_max:
+            self._zoom = new_z
+            self.scale(factor, factor)
+            self.zoomChanged.emit(self._zoom)
+
+    def enterEvent(self, event):
+        self.setFocus()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._reset_cut_state()
+        super().leaveEvent(event)
+
+    def focusOutEvent(self, event):
+        self._reset_cut_state()
+        super().focusOutEvent(event)
+
+    def _reset_cut_state(self):
+        self._cut_mode = False
+        if self._cutting:
+            self._cutting = False
+            if self._cut_item:
+                self.scene().removeItem(self._cut_item)
+                self._cut_item = None
+        self.unsetCursor()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Y and not e.isAutoRepeat():
+            self._cut_mode = True
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.mind_scene.status_changed.emit("Wire cutting stroke mode active")
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e):
+        if e.key() == Qt.Key.Key_Y and not e.isAutoRepeat():
+            self._reset_cut_state()
+            self.mind_scene.status_changed.emit("Wire cutting deactivated")
+            e.accept()
+            return
+        super().keyReleaseEvent(e)
+
+    def mousePressEvent(self, e):
+        self.setFocus()
+
+        if self._cut_mode and e.button() == Qt.MouseButton.LeftButton:
+            self._cutting = True
+            self._cut_last_pt = self.mapToScene(e.position().toPoint())
+            self._cut_path = QPainterPath(self._cut_last_pt)
+            self._cut_item = QGraphicsPathItem()
+            self._cut_item.setPen(QPen(QColor("#ef4444"), 2.2, Qt.PenStyle.SolidLine))
+            self.scene().addItem(self._cut_item)
+            e.accept()
+            return
+
+        if e.button() == Qt.MouseButton.MiddleButton or (
+            e.button() == Qt.MouseButton.LeftButton and
+            e.modifiers() & Qt.KeyboardModifier.AltModifier
+        ):
+            self._panning  = True
+            self._pan_last = e.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            e.accept()
+            return
+
+        if e.button() == Qt.MouseButton.LeftButton and self.mind_scene._connect_src:
+            sp     = self.mapToScene(e.position().toPoint())
+            items  = self.mind_scene.items(sp)
+            target = next((i for i in items if isinstance(i, MindNode)), None)
+            src    = self.mind_scene._connect_src
+            self.mind_scene.cancel_connect()
+            if target and target is not src:
+                self.mind_scene.add_edge(src, target)
+            e.accept()
+            return
+
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._cut_mode and self._cutting:
+            curr_pt = self.mapToScene(e.position().toPoint())
+            self._cut_path.lineTo(curr_pt)
+            self._cut_item.setPath(self._cut_path)
+            
+            # FIXED: Converted stroke detection into a thread-safe QPainterPath lookup to support curved wire intersections natively
+            stroke_segment_path = QPainterPath()
+            stroke_segment_path.moveTo(self._cut_last_pt)
+            stroke_segment_path.lineTo(curr_pt)
+            
+            crossed_items = self.scene().items(stroke_segment_path, Qt.ItemSelectionMode.IntersectsItemShape)
+            hit_edges = [i for i in crossed_items if isinstance(i, Edge)]
+            
+            if hit_edges:
+                self.mind_scene._push_undo()
+                for edge in hit_edges:
+                    self.mind_scene._remove_edge(edge)
+                self.mind_scene.status_changed.emit("Sliced connection wire")
+                
+            self._cut_last_pt = curr_pt
+            e.accept()
+            return
+
+        if self._panning:
+            delta = e.position() - self._pan_last
+            self._pan_last = e.position()
+            self.horizontalScrollBar().setValue(
+                int(self.horizontalScrollBar().value() - delta.x()))
+            self.verticalScrollBar().setValue(
+                int(self.verticalScrollBar().value() - delta.y()))
+            e.accept()
+            return
+        if self.mind_scene._connect_src:
+            self.mind_scene.update_pending_line(
+                self.mapToScene(e.position().toPoint()))
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._cutting and e.button() == Qt.MouseButton.LeftButton:
+            self._cutting = False
+            if self._cut_item:
+                self.scene().removeItem(self._cut_item)
+                self._cut_item = None
+            e.accept()
+            return
+
+        if self._panning and e.button() in (
+            Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton
+        ):
+            self._panning = False
+            self.unsetCursor()
+            if self._cut_mode:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        sp    = self.mapToScene(e.position().toPoint())
+        items = self.scene().items(sp)
+        
+        hit   = next((i for i in items if isinstance(i, (MindNode, StickyNote))), None)
+        if hit:
+            super().mouseDoubleClickEvent(e)
+            return
+            
+        hit_edge = next((i for i in items if isinstance(i, Edge)), None)
+        if hit_edge:
+            label, ok = QInputDialog.getText(self, "Insert Intermediary Node", "Label:")
+            if ok and label.strip():
+                src = hit_edge.src
+                dst = hit_edge.dst
+                
+                new_node = self.mind_scene.add_node(label.strip(), sp.x(), sp.y())
+                self.mind_scene._remove_edge(hit_edge)
+                
+                self.mind_scene.add_edge(src, new_node)
+                self.mind_scene.add_edge(new_node, dst)
+            e.accept()
+            return
+            
+        if e.button() == Qt.MouseButton.LeftButton:
+            label, ok = QInputDialog.getText(self, "New Node", "Label:")
+            if ok and label.strip():
+                self.mind_scene.add_node(label.strip(), sp.x(), sp.y())
+            e.accept()
+
+    def contextMenuEvent(self, e):
+        sp    = self.mapToScene(e.pos())
+        items = self.scene().items(sp)
+        
+        hit_node  = next((i for i in items if isinstance(i, MindNode)), None)
+        hit_edge  = next((i for i in items if isinstance(i, Edge)), None) if not hit_node else None
+        hit_sticky = next((i for i in items if isinstance(i, StickyNote)), None) if not hit_node and not hit_edge else None
+        
+        menu  = QMenu(self)
+        menu.setStyleSheet(self._menu_css())
+        
+        if hit_node:
+            self._node_menu(menu, hit_node)
+        elif hit_edge:
+            self._edge_menu(menu, hit_edge)
+        elif hit_sticky:
+            self._sticky_menu(menu, hit_sticky)
+        else:
+            self._canvas_menu(menu, sp)
+
+    def _node_menu(self, menu, node):
+        a_rename = menu.addAction("Rename")
+        a_conn   = menu.addAction("Connect from here...")
+        menu.addSeparator()
+        
+        sel_nodes = [i for i in self.mind_scene.selectedItems() if isinstance(i, MindNode)]
+        a_layout_sel = None
+        if len(sel_nodes) > 1:
+            a_layout_sel = menu.addAction("Auto layout selected nodes")
+            menu.addSeparator()
+
+        if node.edges:
+            sub = menu.addMenu("Disconnect from...")
+            sub.setStyleSheet(self._menu_css())
+            for edge in node.edges:
+                other = edge.other(node)
+                act   = sub.addAction(other.label)
+                act.setData(("disc", node, other))
+        menu.addSeparator()
+        a_color = menu.addAction("Set color...")
+        a_del   = menu.addAction("Delete node")
+
+        chosen = menu.exec(QCursor.pos())
+        if not chosen:
+            return
+        data = chosen.data()
+        if isinstance(data, tuple) and data[0] == "disc":
+            self.mind_scene.delete_edge_between(data[1], data[2])
+        elif chosen is a_rename:
+            node.rename_dialog()
+        elif chosen is a_conn:
+            self.mind_scene.start_connect(node)
+        elif chosen is a_layout_sel:
+            self.mind_scene.execute_auto_layout(sel_nodes)
+        elif chosen is a_color:
+            c = QColorDialog.getColor(
+                node._color or Theme.NODE_FILL, self, "Node Color")
+            if c.isValid():
+                node._color = c
+                node.update()
+        elif chosen is a_del:
+            node.setSelected(True)
+            self.mind_scene.delete_selected()
+
+    def _edge_menu(self, menu, edge):
+        a_del = menu.addAction("Delete connection")
+        chosen = menu.exec(QCursor.pos())
+        if chosen is a_del:
+            self.mind_scene._push_undo()
+            self.mind_scene._remove_edge(edge)
+            self.mind_scene.status_changed.emit("Removed connection wire")
+
+    def _sticky_menu(self, menu, note):
+        a_edit = menu.addAction("Edit note text")
+        a_del = menu.addAction("Delete note")
+        chosen = menu.exec(QCursor.pos())
+        if chosen is a_edit:
+            note.edit_dialog()
+        elif chosen is a_del:
+            note.setSelected(True)
+            self.mind_scene.delete_selected()
+
+    def _canvas_menu(self, menu, sp):
+        a_add   = menu.addAction("New node here")
+        a_note  = menu.addAction("New note here")
+        a_layout_all = menu.addAction("Auto layout whole map")
+        a_clear = menu.addAction("Clear all")
+        a_fit   = menu.addAction("Fit all")
+        chosen  = menu.exec(QCursor.pos())
+        if chosen is a_add:
+            label, ok = QInputDialog.getText(self, "New Node", "Label:")
+            if ok and label.strip():
+                self.mind_scene.add_node(label.strip(), sp.x(), sp.y())
+        elif chosen is a_note:
+            text, ok = QInputDialog.getMultiLineText(self, "New Canvas Note", "Note text:")
+            if ok and text.strip():
+                self.mind_scene.add_sticky(text.strip(), sp.x(), sp.y())
+        elif chosen is a_layout_all:
+            self.mind_scene.execute_auto_layout(None)
+        elif chosen is a_clear:
+            if QMessageBox.question(self, "Clear Map", "Clear all?") == \
+               QMessageBox.StandardButton.Yes:
+                self.mind_scene.clear_map()
+        elif chosen is a_fit:
+            self.fit_all()
+
+    def fit_all(self):
+        all_items = list(self.mind_scene._nodes.values()) + list(self.mind_scene._sticky_notes.values())
+        rects = [n.sceneBoundingRect() for n in all_items]
+        if not rects:
+            return
+        union = rects[0]
+        for r in rects[1:]:
+            union = union.united(r)
+        self.fitInView(union.adjusted(-60, -60, 60, 60),
+                       Qt.AspectRatioMode.KeepAspectRatio)
+        self._zoom = self.transform().m11()
+        self.zoomChanged.emit(self._zoom)
+
+    @staticmethod
+    def _menu_css():
+        return """
+            QMenu {
+                background: #2a2a2a; color: #d0d0d0;
+                border: 1px solid #404040; border-radius: 6px; padding: 4px;
+            }
+            QMenu::item { padding: 6px 22px 6px 14px; border-radius: 4px; }
+            QMenu::item:selected { background: #e88c2e; color: #fff; }
+            QMenu::separator { height: 1px; background: #404040; margin: 3px 8px; }
+        """
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# TOOLBAR BUTTON HELPER
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+def _btn(label, tip, callback):
+    b = QPushButton(label)
+    b.setToolTip(tip)
+    b.setFont(Theme.FONT_UI)
+    b.setFixedHeight(26)
+    b.setMinimumWidth(30)
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    b.setStyleSheet("""
+        QPushButton {
+            background: #333; color: #c8c8c8;
+            border: 1px solid #404040; border-radius: 4px; padding: 0 10px;
+        }
+        QPushButton:hover  { background: #404040; color: #fff; border-color: #e88c2e; }
+        QPushButton:pressed { background: #c0782a; color: #fff; }
+    """)
+    b.clicked.connect(callback)
+    return b
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# MAIN PANEL
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+class MindMapPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(600, 400)
+        
+        self._current_stream_root = None
+        self._current_stream_tail = None
+        self._is_loading = True 
+        
+        self._build_ui()
+        self._connect_shortcuts()
+        
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(500)
+        self._autosave_timer.timeout.connect(self._auto_save_to_hip)
+
+        try:
+            import hou
+            hou.hipFile.addEventCallback(self._on_hip_file_event)
+            self.destroyed.connect(self._cleanup_houdini_callbacks)
+        except ImportError:
+            pass
+
+        self._load_from_hip_or_seed()
+        self._is_loading = False
+
+    def _build_ui(self):
+        self.setStyleSheet("background: #1a1a1a; color: #d0d0d0;")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Header
+        header = QWidget()
+        header.setFixedHeight(38)
+        header.setStyleSheet("background: #252525; border-bottom: 1px solid #333;")
+        hlay = QHBoxLayout(header)
+        hlay.setContentsMargins(8, 4, 8, 4)
+        hlay.setSpacing(6)
+
+        title = QLabel("  MINDMAP")
+        title.setFont(Theme.FONT_TITLE)
+        title.setStyleSheet("color: #e88c2e; letter-spacing: 2px;")
+        hlay.addWidget(title)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet("color: #404040;")
+        hlay.addWidget(sep)
+
+        hlay.addWidget(_btn("+ Node",   "Add node",          self._add_node))
+        hlay.addWidget(_btn("+ Note",   "Add canvas note",   self._add_note_btn))
+        hlay.addWidget(_btn("Link",     "Connect two nodes", self._connect_mode))
+        hlay.addWidget(_btn("Delete",   "Delete selected",   self._delete_sel))
+        hlay.addWidget(_btn("Undo",     "Undo  Ctrl+Z",      lambda: self.scene.undo()))
+        hlay.addWidget(_btn("Redo",     "Redo  Ctrl+Y",      lambda: self.scene.redo()))
+
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setStyleSheet("color: #404040;")
+        hlay.addWidget(sep2)
+
+        hlay.addWidget(_btn("Fit",      "Fit all in view",   self._fit))
+        hlay.addWidget(_btn("Clear",    "Clear all",         self._clear))
+        hlay.addWidget(_btn("Save",     "Save  Ctrl+S",      self._save))
+        hlay.addWidget(_btn("Open",     "Open  Ctrl+O",      self._load))
+        hlay.addStretch()
+
+        self._zoom_lbl = QLabel("100%")
+        self._zoom_lbl.setFont(Theme.FONT_UI)
+        self._zoom_lbl.setStyleSheet("color: #555; min-width: 42px;")
+        hlay.addWidget(self._zoom_lbl)
+        root.addWidget(header)
+
+        # Scene / view
+        self.scene = MindScene()
+        self.view  = MindView(self.scene)
+        root.addWidget(self.view, 1)
+
+        self.scene.selectionChanged.connect(self._on_selection_changed)
+
+        self.view.zoomChanged.connect(
+            lambda zoom_val: self._zoom_lbl.setText("%d%%" % int(zoom_val * 100))
+        )
+
+        # Status bar
+        sbar = QWidget()
+        sbar.setFixedHeight(22)
+        sbar.setStyleSheet("background: #252525; border-top: 1px solid #333;")
+        slay = QHBoxLayout(sbar)
+        slay.setContentsMargins(10, 0, 10, 0)
+        self._status = QLabel("Double-click canvas to create a node  |  Right-click for options  |  Hold Y to Cut Wires")
+        self._status.setFont(Theme.FONT_UI)
+        self._status.setStyleSheet("color: #666;")
+        slay.addWidget(self._status)
+        slay.addStretch()
+        self._count_lbl = QLabel("0 nodes")
+        self._count_lbl.setFont(Theme.FONT_UI)
+        self._count_lbl.setStyleSheet("color: #555;")
+        slay.addWidget(self._count_lbl)
+        root.addWidget(sbar)
+
+        self.scene.status_changed.connect(self._status.setText)
+        self.scene.changed.connect(self._refresh_count)
+
+    def _connect_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+S"), self, self._save)
+        QShortcut(QKeySequence("Ctrl+O"), self, self._load)
+        QShortcut(QKeySequence("Ctrl+Z"), self, self.scene.undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self.scene.redo)
+        QShortcut(QKeySequence("Ctrl+A"), self, self._select_all)
+        QShortcut(QKeySequence("Delete"),    self, self._delete_sel)
+        QShortcut(QKeySequence("Backspace"), self, self._delete_sel)
+        
+        QShortcut(QKeySequence("Return"), self, self._handle_stream_enter)
+        QShortcut(QKeySequence("Enter"), self, self._handle_stream_enter)
+        QShortcut(QKeySequence("Ctrl+Return"), self, self._handle_stream_ctrl_enter)
+        QShortcut(QKeySequence("Ctrl+Enter"), self, self._handle_stream_ctrl_enter)
+
+    # ââ native session persistence logic ââââââââââââââââââââââââââââââââââ
+    def _load_from_hip_or_seed(self):
+        try:
+            import hou
+            if hou.root():
+                raw_data = hou.root().userData("mindmap_session")
+                if raw_data:
+                    parsed_dict = json.loads(raw_data)
+                    self.scene.from_dict(parsed_dict)
+                    self.scene._undo_stack.clear()
+                    QTimer.singleShot(50, self.view.fit_all)
+                    return
+        except Exception:
+            pass
+        self._seed_default_map()
+
+    def _auto_save_to_hip(self):
+        if self._is_loading:
+            return
+        try:
+            import hou
+            if hou.root():
+                current_state_json = json.dumps(self.scene.to_dict())
+                hou.root().setUserData("mindmap_session", current_state_json)
+        except Exception:
+            pass
+
+    def _on_hip_file_event(self, event_type):
+        import hou
+        if event_type in (hou.hipFileEventType.AfterLoad, hou.hipFileEventType.AfterClear):
+            QTimer.singleShot(0, self._handle_hip_switched_sync)
+
+    def _handle_hip_switched_sync(self):
+        self._is_loading = True
+        self._load_from_hip_or_seed()
+        self._is_loading = False
+
+    def _cleanup_houdini_callbacks(self):
+        try:
+            import hou
+            hou.hipFile.removeEventCallback(self._on_hip_file_event)
+        except Exception:
+            pass
+
+    # ââ stream node generation logic ââââââââââââââââââââââââââââââââââââââ
+    def _on_selection_changed(self):
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, MindNode)]
+        if len(sel) == 1:
+            if sel[0] != self._current_stream_root:
+                self._current_stream_root = sel[0]
+                self._current_stream_tail = sel[0]
+        else:
+            self._current_stream_root = None
+            self._current_stream_tail = None
+
+    def _handle_stream_enter(self):
+        if not self._current_stream_tail:
+            return
+            
+        label, ok = QInputDialog.getText(self, "Extend Stream Node", "Label:")
+        if ok and label.strip():
+            tail = self._current_stream_tail
+            gap_offset = max(210.0, round((tail._w / 2.0 + Theme.MIN_W / 2.0 + 80.0) / Theme.GRID_SNAP) * Theme.GRID_SNAP)
+            
+            nx = tail.pos().x() + gap_offset
+            ny = tail.pos().y()
+            
+            new_node = self.scene.add_node(label.strip(), nx, ny)
+            self.scene.add_edge(tail, new_node)
+            self._current_stream_tail = new_node
+
+    def _handle_stream_ctrl_enter(self):
+        if not self._current_stream_root:
+            return
+            
+        label, ok = QInputDialog.getText(self, "New Stream Branch", "Label:")
+        if ok and label.strip():
+            root = self._current_stream_root
+            branches = sum(1 for e in root.edges if e.src is root)
+            
+            gap_offset = max(210.0, round((root._w / 2.0 + Theme.MIN_W / 2.0 + 80.0) / Theme.GRID_SNAP) * Theme.GRID_SNAP)
+            
+            nx = root.pos().x() + gap_offset
+            ny = root.pos().y() + round((branches * 60.0) / Theme.GRID_SNAP) * Theme.GRID_SNAP
+            
+            new_node = self.scene.add_node(label.strip(), nx, ny)
+            self.scene.add_edge(root, new_node)
+            self._current_stream_tail = new_node
+
+    # ââ seed map default fallback âââââââââââââââââââââââââââââââââââââââââ
+    def _seed_default_map(self):
+        cx, cy = 0.0, 0.0
+        root_n = self.scene.add_node("PROJECT", cx, cy)
+        topics = ["Research", "Design", "Technical", "Delivery"]
+        subs   = {
+            "Research":  ["References", "Mood board"],
+            "Design":    ["Layout", "Materials", "Lighting"],
+            "Technical": ["Houdini FX", "Rendering", "Pipeline"],
+            "Delivery":  ["Review", "Export", "Archive"],
+        }
+        for i, topic in enumerate(topics):
+            angle = math.radians(-135 + i * 90)
+            tx = cx + 240 * math.cos(angle)
+            ty = cy + 150 * math.sin(angle)
+            tn = self.scene.add_node(topic, tx, ty)
+            self.scene.add_edge(root_n, tn)
+            for j, sl in enumerate(subs.get(topic, [])):
+                sa = angle + math.radians(-25 + j * 50)
+                sn = self.scene.add_node(sl,
+                    tx + 210 * math.cos(sa), ty + 120 * math.sin(sa))
+                self.scene.add_edge(tn, sn)
+        self.scene._undo_stack.clear()
+        QTimer.singleShot(50, self.view.fit_all)
+
+    # ââ toolbar actions âââââââââââââââââââââââââââââââââââââââââââââââââââ
+    def _add_node(self):
+        sp = self.view.mapToScene(self.view.viewport().rect().center())
+        label, ok = QInputDialog.getText(self, "New Node", "Label:")
+        if ok and label.strip():
+            self.scene.add_node(label.strip(), sp.x() + 40, sp.y() + 40)
+
+    def _add_note_btn(self):
+        sp = self.view.mapToScene(self.view.viewport().rect().center())
+        text, ok = QInputDialog.getMultiLineText(self, "New Canvas Note", "Content:")
+        if ok and text.strip():
+            self.scene.add_sticky(text.strip(), sp.x() + 40, sp.y() + 40)
+
+    def _connect_mode(self):
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, MindNode)]
+        if sel:
+            self.scene.start_connect(sel[0])
+        else:
+            self._status.setText("Select a source node first, then click 'Link'")
+
+    def _delete_sel(self):
+        self.scene.delete_selected()
+
+    def _fit(self):
+        self.view.fit_all()
+
+    def _clear(self):
+        if QMessageBox.question(self, "Clear Map", "Clear all nodes and edges?") == \
+           QMessageBox.StandardButton.Yes:
+            self.scene.clear_map()
+
+    def _save(self):
+        path = self.scene._save_path
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Mind Map", os.path.expanduser("~"),
+                "Mind Map JSON (*.json)")
+        if path:
+            if not path.endswith(".json"):
+                path += ".json"
+            self.scene.save(path)
+
+    def _load(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Mind Map", os.path.expanduser("~"),
+            "Mind Map JSON (*.json)")
+        if path:
+            try:
+                self.scene.load(path)
+                QTimer.singleShot(50, self.view.fit_all)
+            except Exception as exc:
+                QMessageBox.critical(self, "Load Error", str(exc))
+
+    def _select_all(self):
+        for item in self.scene.items():
+            if isinstance(item, (MindNode, StickyNote)):
+                item.setSelected(True)
+
+    def _refresh_count(self, *_):
+        n = len(self.scene._nodes)
+        t = len(self.scene._sticky_notes)
+        e = len(self.scene._edges)
+        self._count_lbl.setText(
+            "%d node%s | %d note%s | %d edge%s" % (
+                n, "s" if n != 1 else "", 
+                t, "s" if t != 1 else "", 
+                e, "s" if e != 1 else ""
+            )
+        )
+        if not self._is_loading:
+            self._autosave_timer.start()
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# HOUDINI ENTRY POINT
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+def createInterface():
+    return MindMapPanel()
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# STANDALONE TEST
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+if __name__ == "__main__":
+    import sys
+    app = QApplication.instance() or QApplication(sys.argv)
+    w = MindMapPanel()
+    w.setWindowTitle("MindMap â Standalone")
+    w.resize(1280, 800)
+    w.show()
+    sys.exit(app.exec())]]></script>
+    <includeInToolbarMenu menu_position="419" create_separator="false"/>
+    <help><![CDATA[]]></help>
+  </interface>
+</pythonPanelDocument>
