@@ -3,6 +3,7 @@ import os
 import re
 import json
 import voptoolutils
+import octane_material_builder
 
 class MaterialBuilder:
     def __init__(self, node, renderer="octane"):
@@ -21,133 +22,148 @@ class MaterialBuilder:
         self.iteration = 0
         self.renderer = renderer.lower() 
         
-        self.preview_keywords = ["Preview", "preview"]
+        # Using sets for O(1) lookups
+        self.preview_keywords = {"preview"}
+        self.valid_exts = {'.png', '.jpg', '.tga', '.tif', '.exr'}
 
-        self.cached_files = self._cache_directory_files()
         self._setup_config()
+        self.cached_files, self.file_lower_map = self._cache_directory_files()
 
     def _cache_directory_files(self):
-        """Pre-scans the directory to avoid repeated OS calls."""
+        """Pre-scans the directory to avoid repeated OS calls and builds a lowercase mapping."""
         files = []
+        file_lower_map = {}
         if os.path.exists(self.directory_path):
-            for filename in os.listdir(self.directory_path):
-                if not any(p in filename for p in self.preview_keywords):
-                    if filename.lower().endswith(('.png', '.jpg', '.tga', '.tif', '.exr')):
-                        files.append(filename)
-        return files
+            try:
+                # os.scandir is faster than os.listdir
+                for entry in os.scandir(self.directory_path):
+                    if entry.is_file():
+                        lower_name = entry.name.lower()
+                        if not any(p in lower_name for p in self.preview_keywords):
+                            if os.path.splitext(lower_name)[1] in self.valid_exts:
+                                files.append(entry.name)
+                                file_lower_map[lower_name] = entry.name
+            except OSError:
+                pass
+        return files, file_lower_map
 
     def _get_megascans_displacement_scale(self):
         """Scans for a JSON file and attempts to extract Megascans height scale."""
         if not os.path.exists(self.directory_path):
             return None
             
-        for filename in os.listdir(self.directory_path):
-            if filename.lower().endswith('.json'):
-                filepath = os.path.join(self.directory_path, filename)
-                try:
-                    with open(filepath, 'r') as f:
-                        data = json.load(f)
-                        
-                        def find_height(obj):
-                            if isinstance(obj, dict):
-                                if obj.get("key") == "height" and "value" in obj:
-                                    return obj.get("value")
-                                for k, v in obj.items():
-                                    result = find_height(v)
-                                    if result is not None: 
-                                        return result
-                            elif isinstance(obj, list):
-                                for item in obj:
-                                    result = find_height(item)
-                                    if result is not None: 
-                                        return result
-                            return None
+        try:
+            for entry in os.scandir(self.directory_path):
+                if entry.is_file() and entry.name.lower().endswith('.json'):
+                    try:
+                        with open(entry.path, 'r') as f:
+                            data = json.load(f)
                             
-                        val_str = find_height(data)
-                        if val_str:
-                            match = re.search(r"([0-9]*\.?[0-9]+)", str(val_str))
-                            if match:
-                                return float(match.group(1))
-                except Exception:
-                    pass
+                            def find_height(obj):
+                                if isinstance(obj, dict):
+                                    if obj.get("key") == "height" and "value" in obj:
+                                        return obj.get("value")
+                                    for v in obj.values():
+                                        result = find_height(v)
+                                        if result is not None: return result
+                                elif isinstance(obj, list):
+                                    for item in obj:
+                                        result = find_height(item)
+                                        if result is not None: return result
+                                return None
+                                
+                            val_str = find_height(data)
+                            if val_str is not None:
+                                match = re.search(r"([0-9]*\.?[0-9]+)", str(val_str))
+                                if match:
+                                    return float(match.group(1))
+                    except Exception:
+                        continue
+        except OSError:
+            pass
         return None
 
     def _setup_config(self):
-        
         """Loads the correct node types, parameter names, and ports based on the renderer."""
-        albedo_suffix = self.node.parm('albedo_suffix').eval().split()
-        ambientocclusion_suffix = self.node.parm('ambientocclusion_suffix').eval().split()
-        specular_suffix = self.node.parm('specular_suffix').eval().split()
-        roughness_suffix = self.node.parm('roughness_suffix').eval().split()
-        metallic_suffix = self.node.parm('metallic_suffix').eval().split()
-        opacity_suffix = self.node.parm('opacity_suffix').eval().split()
-        normal_suffix = self.node.parm('normal_suffix').eval().split()
-        displacement_suffix = self.node.parm('displacement_suffix').eval().split()
-        emission_suffix = self.node.parm('emission_suffix').eval().split()
+        # Fetching parameters once
+        parms = {
+            'albedo': self.node.parm('albedo_suffix').eval().split(),
+            'ao': self.node.parm('ambientocclusion_suffix').eval().split(),
+            'specular': self.node.parm('specular_suffix').eval().split(),
+            'roughness': self.node.parm('roughness_suffix').eval().split(),
+            'metallic': self.node.parm('metallic_suffix').eval().split(),
+            'opacity': self.node.parm('opacity_suffix').eval().split(),
+            'normal': self.node.parm('normal_suffix').eval().split(),
+            'displacement': self.node.parm('displacement_suffix').eval().split(),
+            'emission': self.node.parm('emission_suffix').eval().split()
+        }
     
         if self.renderer == "octane":
             self.file_parm = 'A_FILENAME'
-            
-            self.basecolor_dict = {k: {"type": "NT_TEX_IMAGE", "port": "albedo", "color_space": "NAMED_COLOR_SPACE_SRGB"} for k in albedo_suffix }
-            self.ao_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "none", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in ambientocclusion_suffix }
-            self.specular_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "specular", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in specular_suffix }
-            self.roughness_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "roughness", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in roughness_suffix }
-            self.metallic_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "metallic", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in metallic_suffix }
-            self.opacity_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "opacity", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in opacity_suffix }
-            self.normal_dict = {k: {"type": "NT_TEX_IMAGE", "port": "normal", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in normal_suffix }
-            self.displacement_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "displacement", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in displacement_suffix }
-            self.emission_dict = {k: {"type": "NT_TEX_IMAGE", "port": "emission", "color_space": "NAMED_COLOR_SPACE_SRGB"} for k in emission_suffix }
+            self.basecolor_dict = {k: {"type": "NT_TEX_IMAGE", "port": "baseColor", "color_space": "NAMED_COLOR_SPACE_SRGB"} for k in parms['albedo']}
+            self.ao_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "none", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in parms['ao']}
+            self.specular_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "specular", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in parms['specular']}
+            self.roughness_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "roughness", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in parms['roughness']}
+            self.metallic_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "metallic", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in parms['metallic']}
+            self.opacity_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "opacity", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in parms['opacity']}
+            self.normal_dict = {k: {"type": "NT_TEX_IMAGE", "port": "normal", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in parms['normal']}
+            self.displacement_dict = {k: {"type": "NT_TEX_FLOATIMAGE", "port": "displacement", "color_space": "NAMED_COLOR_SPACE_OTHER"} for k in parms['displacement']}
+            self.emission_dict = {k: {"type": "NT_TEX_IMAGE", "port": "emission", "color_space": "NAMED_COLOR_SPACE_SRGB"} for k in parms['emission']}
             
         elif self.renderer == "karma":
             self.file_parm = 'file'
-            
-            self.basecolor_dict = {k: {"type": "mtlximage", "port": "base_color", "signature": "color3"} for k in albedo_suffix }
-            self.ao_dict = {k: {"type": "mtlximage", "port": "none", "signature": "float"} for k in ambientocclusion_suffix }
-            self.specular_dict = {k: {"type": "mtlximage", "port": "specular", "signature": "float"} for k in specular_suffix }
-            self.roughness_dict = {k: {"type": "mtlximage", "port": "specular_roughness", "signature": "float"} for k in roughness_suffix }
-            self.metallic_dict = {k: {"type": "mtlximage", "port": "metalness", "signature": "float"} for k in metallic_suffix }
-            self.opacity_dict = {k: {"type": "mtlximage", "port": "transmission", "signature": "float"} for k in opacity_suffix }
-            self.normal_dict = {k: {"type": "mtlximage", "port": "normal", "signature": "vector3"} for k in normal_suffix }
-            self.displacement_dict = {k: {"type": "mtlximage", "port": "displacement", "signature": "float"} for k in displacement_suffix }
-            self.emission_dict = {k: {"type": "mtlximage", "port": "emission", "signature": "color3"} for k in emission_suffix }
+            self.basecolor_dict = {k: {"type": "mtlximage", "port": "base_color", "signature": "color3"} for k in parms['albedo']}
+            self.ao_dict = {k: {"type": "mtlximage", "port": "none", "signature": "float"} for k in parms['ao']}
+            self.specular_dict = {k: {"type": "mtlximage", "port": "specular", "signature": "float"} for k in parms['specular']}
+            self.roughness_dict = {k: {"type": "mtlximage", "port": "specular_roughness", "signature": "float"} for k in parms['roughness']}
+            self.metallic_dict = {k: {"type": "mtlximage", "port": "metalness", "signature": "float"} for k in parms['metallic']}
+            self.opacity_dict = {k: {"type": "mtlximage", "port": "transmission", "signature": "float"} for k in parms['opacity']}
+            self.normal_dict = {k: {"type": "mtlximage", "port": "normal", "signature": "vector3"} for k in parms['normal']}
+            self.displacement_dict = {k: {"type": "mtlximage", "port": "displacement", "signature": "float"} for k in parms['displacement']}
+            self.emission_dict = {k: {"type": "mtlximage", "port": "emission", "signature": "color3"} for k in parms['emission']}
+
+        elif self.renderer == "redshift":
+            self.file_parm = 'tex0'
+            self.basecolor_dict = {k: {"type": "redshift::TextureSampler", "port": "base_color", "color_space": "sRGB"} for k in parms['albedo']}
+            self.ao_dict = {k: {"type": "redshift::TextureSampler", "port": "none", "color_space": "Raw"} for k in parms['ao']}
+            self.specular_dict = {k: {"type": "redshift::TextureSampler", "port": "specular_weight", "color_space": "Raw"} for k in parms['specular']}
+            self.roughness_dict = {k: {"type": "redshift::TextureSampler", "port": "specular_roughness", "color_space": "Raw"} for k in parms['roughness']}
+            self.metallic_dict = {k: {"type": "redshift::TextureSampler", "port": "metalness", "color_space": "Raw"} for k in parms['metallic']}
+            self.opacity_dict = {k: {"type": "redshift::TextureSampler", "port": "geometry_opacity", "color_space": "Raw"} for k in parms['opacity']}
+            self.normal_dict = {k: {"type": "redshift::TextureSampler", "port": "BumpMap", "color_space": "Raw"} for k in parms['normal']}
+            self.displacement_dict = {k: {"type": "redshift::TextureSampler", "port": "Displacement", "color_space": "Raw"} for k in parms['displacement']}
+            self.emission_dict = {k: {"type": "redshift::TextureSampler", "port": "emission_luminance", "color_space": "sRGB"} for k in parms['emission']}
 
     def get_material_names(self):
-            """Scans the directory and returns a list of unique material base names based on recognized suffixes."""
-            temp = set()
+        """Scans the directory and returns a list of unique material base names."""
+        temp = set()
+        
+        all_suffixes = []
+        for d in [self.basecolor_dict, self.ao_dict, self.specular_dict, 
+                self.roughness_dict, self.metallic_dict, self.opacity_dict, 
+                self.normal_dict, self.displacement_dict, self.emission_dict]:
+            all_suffixes.extend(list(d.keys()))
             
-            # Collect all recognized suffixes to cleanly strip them from filenames
-            all_suffixes = []
-            for d in [self.basecolor_dict, self.ao_dict, self.specular_dict, 
-                    self.roughness_dict, self.metallic_dict, self.opacity_dict, 
-                    self.normal_dict, self.displacement_dict, self.emission_dict]:
-                all_suffixes.extend(list(d.keys()))
-                
-            # Sort by length descending so longer suffixes (e.g., 'mixed_ao') match before shorter ones ('ao')
-            all_suffixes.sort(key=len, reverse=True)
+        # Compile a single regex to match any of the suffixes
+        escaped_suffixes = [re.escape(s.lower()) for s in all_suffixes]
+        pattern = re.compile(r'(.+?)(' + '|'.join(escaped_suffixes) + r')', re.IGNORECASE)
 
-            for filename in self.cached_files:
-                name_part = os.path.splitext(filename)[0]
-                
-                for suffix in all_suffixes:
-                    # Look for the suffix in the filename (case-insensitive)
-                    idx = name_part.lower().rfind(suffix.lower())
-                    if idx != -1:
-                        # Isolate the base name by slicing up to where the suffix begins
-                        base_name = name_part[:idx]
-                        
-                        # Clean up trailing non-alphanumeric chars (like trailing underscores)
-                        base_name = re.sub(r'[^a-zA-Z0-9]+$', '', base_name)
-                        
-                        if base_name:
-                            temp.add(base_name)
-                        break 
-                        
-            return list(temp)
+        for filename in self.cached_files:
+            name_part = os.path.splitext(filename)[0]
+            match = pattern.search(name_part)
+            
+            if match:
+                base_name = match.group(1)
+                # Strip trailing non-alphanumerics
+                base_name = re.sub(r'[^a-zA-Z0-9]+$', '', base_name)
+                if base_name:
+                    temp.add(base_name)
+                    
+        return list(temp)
 
     def setGroups(self, total_materials, target_node):
         """Sets the group and material path parameters on the HDA and internal nodes."""
-        if not self.mat_node:
-            return
+        if not self.mat_node: return
 
         if self.mat_node.parm('materials'):
             self.mat_node.parm('materials').set(total_materials)
@@ -169,56 +185,60 @@ class MaterialBuilder:
         if not material:
             is_new = True
             if self.renderer == "octane":
-                material = self.mat_node.createNode('octane_solaris_material_builder', name)
+                material = octane_material_builder.createMaskedOctaneSubnet(target_node=self.mat_node, name=name)
             elif self.renderer == "karma":
                 mask = voptoolutils.KARMAMTLX_TAB_MASK
                 material = voptoolutils._setupMtlXBuilderSubnet(
                     destination_node=self.mat_node, 
-                    name=name, 
-                    mask=mask, 
-                    folder_label='Karma Material Builder'
+                    name=name, mask=mask, folder_label='Karma Material Builder'
                 )
+            elif self.renderer == "redshift":
+                material = self.mat_node.createNode('rs_usd_material_builder', name)
 
         materialNode = None
         output = None
         dispNode = None
 
         if self.renderer == "octane":
-            unwanted_node = material.node('Material_Standard_Surface1')
-            if unwanted_node:
-                unwanted_node.destroy()
-
-            for child in material.children():
-                if child.type().name() == 'NT_MAT_UNIVERSAL':
-                    materialNode = child
-                elif child.type().name() == 'octane_material':
-                    output = child
-            
-            if not materialNode:
-                materialNode = material.createNode('NT_MAT_UNIVERSAL')
-            if not output:
-                output = material.createNode('octane_material')
+            output = material.node('surface_output')
+            if output and len(output.inputs()) > 0:
+                materialNode = output.inputs()[0]
                 
-            output.setNamedInput('material', materialNode, 'NT_MAT_UNIVERSAL')
+            if not materialNode:
+                for child in material.children():
+                    if 'STANDARD_SURFACE' in child.type().name().upper():
+                        materialNode = child
+                        if output: output.setInput(0, materialNode)
+                        break
+                        
+            if not materialNode:
+                materialNode = material.createNode('NT_MAT_STANDARD_SURFACE')
+                if output: output.setInput(0, materialNode)
                 
         elif self.renderer == "karma":
             for child in material.children():
-                if child.type().name() == 'mtlxstandard_surface':
-                    materialNode = child
-                elif child.type().name() == 'suboutput':  
-                    output = child
-                elif child.type().name() == 'mtlxdisplacement': 
-                    dispNode = child
+                ctype = child.type().name()
+                if ctype == 'mtlxstandard_surface': materialNode = child
+                elif ctype == 'suboutput': output = child
+                elif ctype == 'mtlxdisplacement': dispNode = child
             
-            if not materialNode:
-                materialNode = material.createNode('mtlxstandard_surface')
-            if not output:
-                output = material.createNode('suboutput')
-            if not dispNode:
-                dispNode = material.createNode('mtlxdisplacement')
+            if not materialNode: materialNode = material.createNode('mtlxstandard_surface')
+            if not output: output = material.createNode('suboutput')
+            if not dispNode: dispNode = material.createNode('mtlxdisplacement')
                 
             output.setNamedInput('surface', materialNode, 0)
             output.setNamedInput('displacement', dispNode, 0)
+            
+        elif self.renderer == "redshift":
+            for child in material.children():
+                ctype = child.type().name()
+                if ctype == 'redshift_usd_material': output = child
+                elif 'OpenPBRMaterial' in ctype: materialNode = child
+            
+            if not output: output = material.createNode('redshift_usd_material')
+            if not materialNode: materialNode = material.createNode('redshift::OpenPBRMaterial')
+                
+            output.setNamedInput('Surface', materialNode, 0)
                 
         return material, materialNode, output, dispNode, is_new
 
@@ -226,12 +246,14 @@ class MaterialBuilder:
         """Internal helper to locate, create, or update a single image node."""
         target_file = None
         matched_channel = None
+        name_lower = name.lower()
 
-        for filename in self.cached_files:
-            if name.lower() in filename.lower():
+        # Optimized search using the pre-built lowercase map
+        for lower_file, original_file in self.file_lower_map.items():
+            if name_lower in lower_file:
                 for channel in texture_set.keys():
-                    if channel.lower() in filename.lower():
-                        target_file = filename
+                    if channel.lower() in lower_file:
+                        target_file = original_file
                         matched_channel = channel
                         break
             if target_file:
@@ -258,8 +280,7 @@ class MaterialBuilder:
             
             if current_eval_path != eval_file_path or ui_eval_path != eval_file_path:
                 existing_image.parm(self.file_parm).set(file_path)
-                if texdir_parm:
-                    texdir_parm.set(existing_image.parm(self.file_parm))
+                if texdir_parm: texdir_parm.set(existing_image.parm(self.file_parm))
                 made_change = True
         else:
             image = material.createNode(properties["type"])
@@ -268,8 +289,11 @@ class MaterialBuilder:
             
             if self.renderer == "octane" and "color_space" in properties:
                 image.parm('colorSpace').set(properties["color_space"])
-            if self.renderer == "karma" and "signature" in properties:
+            elif self.renderer == "karma" and "signature" in properties:
                 image.parm('signature').set(properties["signature"])
+            elif self.renderer == "redshift" and "color_space" in properties:
+                image.parm('tex0_colorSpace').set(properties["color_space"])
+                
             if texdir_parm:
                 texdir_parm.set(image.parm(self.file_parm))
                 
@@ -284,8 +308,7 @@ class MaterialBuilder:
         
         made_change = albedo_changed or ao_changed
         
-        if not albedo_img:
-            return made_change
+        if not albedo_img: return made_change
             
         target_port = albedo_props["port"]
         
@@ -305,12 +328,15 @@ class MaterialBuilder:
                     mult_node.parm('signature').set('color3')
                     mult_node.setNamedInput('in1', albedo_img, 0)
                     mult_node.setNamedInput('in2', ao_img, 0)
+                elif self.renderer == "redshift":
+                    mult_node = material.createNode('redshift::RSMathMul')
+                    mult_node.setName(mult_node_name, unique_name=True)
+                    mult_node.setInput(0, albedo_img)
+                    mult_node.setInput(1, ao_img)
                 made_change = True
                 
-            # Always ensure the multiply node is connected to the material base color
             materialNode.setNamedInput(target_port, mult_node, 0)
         else:
-            # No AO map exists, connect albedo directly to the material
             materialNode.setNamedInput(target_port, albedo_img, 0)
             
         return made_change
@@ -319,8 +345,7 @@ class MaterialBuilder:
         """Finds the texture file and wires standard nodes/secondary utilities."""
         image, properties, made_change = self._get_or_update_image_node(texture_set, material, name, texdir)
         
-        if not image:
-            return False
+        if not image: return False
 
         target_port = properties["port"]
 
@@ -348,7 +373,6 @@ class MaterialBuilder:
                             parm_obj.set(value)
                             made_change = True
         else:
-            # No secondary node requested, ensure the image is plugged directly in
             target_node.setNamedInput(target_port, image, 0)
             
         return made_change
@@ -365,6 +389,7 @@ class MaterialBuilder:
         custom_disp_scale = self._get_megascans_displacement_scale()
         octane_disp_amount = custom_disp_scale if custom_disp_scale is not None else 0.01
         karma_disp_amount = custom_disp_scale if custom_disp_scale is not None else 0.1
+        redshift_disp_amount = custom_disp_scale if custom_disp_scale is not None else 0.1
 
         created_count = 0
         updated_count = 0
@@ -374,8 +399,13 @@ class MaterialBuilder:
             
             existing_material = self.mat_node.node(name)
             if existing_material:
-                is_octane = (existing_material.type().name() == 'octane_solaris_material_builder')
-                if (self.renderer == "octane" and not is_octane) or (self.renderer == "karma" and is_octane):
+                is_octane = existing_material.node('surface_output') is not None
+                is_redshift = existing_material.type().name() == 'rs_usd_material_builder'
+                is_karma = not is_octane and not is_redshift
+                
+                if (self.renderer == "octane" and not is_octane) or \
+                   (self.renderer == "karma" and not is_karma) or \
+                   (self.renderer == "redshift" and not is_redshift):
                     skipped_count += 1
                     continue
 
@@ -402,6 +432,8 @@ class MaterialBuilder:
 
             if self.renderer == "karma":
                 changes.append(self.create_texture_node(self.normal_dict, material, materialNode, name, 'normaldir', secondary_node_type='mtlxnormalmap', secondary_input='in'))
+            elif self.renderer == "redshift":
+                changes.append(self.create_texture_node(self.normal_dict, material, outputNode, name, 'normaldir', secondary_node_type='redshift::BumpMap', secondary_input='input', defaults={'inputType': '1'}))
             else:
                 changes.append(self.create_texture_node(self.normal_dict, material, materialNode, name, 'normaldir'))
 
@@ -423,6 +455,12 @@ class MaterialBuilder:
                         dispNode.parm('scale').set(karma_disp_amount)
                         changes.append(True)
                         
+                changes.append(self.create_texture_node(self.emission_dict, material, materialNode, name, 'emissivedir'))
+            elif self.renderer == "redshift":
+                changes.append(self.create_texture_node(
+                    self.displacement_dict, material, outputNode, name, 'displacementdir', 
+                    secondary_node_type='redshift::Displacement', secondary_input='texMap', defaults={'scale': redshift_disp_amount}
+                ))
                 changes.append(self.create_texture_node(self.emission_dict, material, materialNode, name, 'emissivedir'))
 
             made_changes = any(changes)

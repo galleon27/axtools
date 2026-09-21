@@ -2,6 +2,7 @@ import hou
 import os
 import re
 import json
+import octane_material_builder
 
 class OctaneMaterialBuilder:
     def __init__(self):
@@ -17,45 +18,102 @@ class OctaneMaterialBuilder:
         self.directory_path = self.node.parm('directory').eval()
         self.iteration = 0
         
+        # Pre-compile regex for performance
+        self.clean_name_re = re.compile(r'[^a-zA-Z0-9]+$')
+        self.json_height_re = re.compile(r"([0-9]*\.?[0-9]+)")
+        
         # 2. Setup the Material Network subnet
         self.matnet = self._get_or_create_matnet()
-        self.preview_keywords = ["Preview", "preview"]
+        self.preview_keywords = {"Preview", "preview"} # Set for faster lookup
 
-        # 3. Cache directory files and set configuration
+        # 3. Setup Config and Map Files
+        self.channel_configs = self._setup_config()
         self.cached_files = self._cache_directory_files()
-        self._setup_config()
+        self.material_inventory = self._scan_and_map_textures()
 
     def _setup_config(self):
-        """Loads the texture parameters and maps them to Octane properties."""
-        basecolor_suffix = self.node.parm('basecolor_suffix').eval().split()
-        ambientocclusion_suffix = self.node.parm('ambientocclusion_suffix').eval().split()
-        specular_suffix = self.node.parm('specular_suffix').eval().split()
-        roughness_suffix = self.node.parm('roughness_suffix').eval().split()
-        metallic_suffix = self.node.parm('metallic_suffix').eval().split()
-        opacity_suffix = self.node.parm('opacity_suffix').eval().split()
-        normal_suffix = self.node.parm('normal_suffix').eval().split()
-        displacement_suffix = self.node.parm('displacement_suffix').eval().split()
-        emission_suffix = self.node.parm('emission_suffix').eval().split()
-
-        self.basecolor_dict = { item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_SRGB"} for item in basecolor_suffix }
-        self.ao_dict = { item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in ambientocclusion_suffix }
-        self.specular_dict = { item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in specular_suffix }
-        self.roughness_dict = { item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in roughness_suffix }
-        self.metallic_dict = { item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in metallic_suffix }
-        self.opacity_dict = { item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in opacity_suffix }
-        self.normal_dict = { item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in normal_suffix }
-        self.displacement_dict = { item: {"type": "NT_TEX_FLOATIMAGE", "color_space": "NAMED_COLOR_SPACE_OTHER"} for item in displacement_suffix }
-        self.emission_dict = { item: {"type": "NT_TEX_IMAGE", "color_space": "NAMED_COLOR_SPACE_SRGB"} for item in emission_suffix }
+        """Centralizes channel configurations, mapping suffixes to Octane properties."""
+        return {
+            'basecolor': {
+                'suffixes': self.node.parm('basecolor_suffix').eval().split(),
+                'type': 'NT_TEX_IMAGE', 'color_space': 'NAMED_COLOR_SPACE_SRGB', 'dir_parm': 'basecolordir'
+            },
+            'ao': {
+                'suffixes': self.node.parm('ambientocclusion_suffix').eval().split(),
+                'type': 'NT_TEX_IMAGE', 'color_space': 'NAMED_COLOR_SPACE_OTHER', 'dir_parm': 'aodir'
+            },
+            'specular': {
+                'suffixes': self.node.parm('specular_suffix').eval().split(),
+                'type': 'NT_TEX_FLOATIMAGE', 'color_space': 'NAMED_COLOR_SPACE_OTHER', 'dir_parm': 'speculardir'
+            },
+            'roughness': {
+                'suffixes': self.node.parm('roughness_suffix').eval().split(),
+                'type': 'NT_TEX_FLOATIMAGE', 'color_space': 'NAMED_COLOR_SPACE_OTHER', 'dir_parm': 'roughnessdir'
+            },
+            'metallic': {
+                'suffixes': self.node.parm('metallic_suffix').eval().split(),
+                'type': 'NT_TEX_FLOATIMAGE', 'color_space': 'NAMED_COLOR_SPACE_OTHER', 'dir_parm': 'metallicdir'
+            },
+            'opacity': {
+                'suffixes': self.node.parm('opacity_suffix').eval().split(),
+                'type': 'NT_TEX_FLOATIMAGE', 'color_space': 'NAMED_COLOR_SPACE_OTHER', 'dir_parm': 'opacitydir'
+            },
+            'normal': {
+                'suffixes': self.node.parm('normal_suffix').eval().split(),
+                'type': 'NT_TEX_IMAGE', 'color_space': 'NAMED_COLOR_SPACE_OTHER', 'dir_parm': 'normaldir'
+            },
+            'displacement': {
+                'suffixes': self.node.parm('displacement_suffix').eval().split(),
+                'type': 'NT_TEX_FLOATIMAGE', 'color_space': 'NAMED_COLOR_SPACE_OTHER', 'dir_parm': 'displacementdir'
+            },
+            'emission': {
+                'suffixes': self.node.parm('emission_suffix').eval().split(),
+                'type': 'NT_TEX_IMAGE', 'color_space': 'NAMED_COLOR_SPACE_SRGB', 'dir_parm': 'emissivedir'
+            }
+        }
 
     def _cache_directory_files(self):
         """Pre-scans the directory to avoid repeated OS calls."""
         files = []
         if os.path.exists(self.directory_path):
+            valid_exts = ('.png', '.jpg', '.tga', '.tif', '.exr')
             for filename in os.listdir(self.directory_path):
+                # Faster exclusion check using sets/generators
                 if not any(p in filename for p in self.preview_keywords):
-                    if filename.lower().endswith(('.png', '.jpg', '.tga', '.tif', '.exr')):
+                    if filename.lower().endswith(valid_exts):
                         files.append(filename)
         return files
+
+    def _scan_and_map_textures(self):
+        """Builds a master dictionary mapping base names to their respective texture files. O(N) complexity."""
+        inventory = {}
+        
+        # Flatten and sort all suffixes by length descending to match longest suffix first
+        suffix_to_channel = {}
+        for chan_name, config in self.channel_configs.items():
+            for suffix in config['suffixes']:
+                suffix_to_channel[suffix.lower()] = chan_name
+                
+        sorted_suffixes = sorted(suffix_to_channel.keys(), key=len, reverse=True)
+
+        for filename in self.cached_files:
+            name_part = os.path.splitext(filename)[0]
+            name_lower = name_part.lower()
+            
+            for suffix in sorted_suffixes:
+                idx = name_lower.rfind(suffix)
+                if idx != -1:
+                    base_name = name_part[:idx]
+                    base_name = self.clean_name_re.sub('', base_name)
+                    
+                    if base_name:
+                        if base_name not in inventory:
+                            inventory[base_name] = {}
+                        channel_type = suffix_to_channel[suffix]
+                        inventory[base_name][channel_type] = filename
+                    break 
+                        
+        return inventory
 
     def _get_megascans_displacement_scale(self):
         """Scans for a JSON file and attempts to extract Megascans height scale."""
@@ -75,22 +133,20 @@ class OctaneMaterialBuilder:
                                     return obj.get("value")
                                 for k, v in obj.items():
                                     result = find_height(v)
-                                    if result is not None: 
-                                        return result
+                                    if result is not None: return result
                             elif isinstance(obj, list):
                                 for item in obj:
                                     result = find_height(item)
-                                    if result is not None: 
-                                        return result
+                                    if result is not None: return result
                             return None
                             
                         val_str = find_height(data)
                         if val_str:
-                            match = re.search(r"([0-9]*\.?[0-9]+)", str(val_str))
+                            match = self.json_height_re.search(str(val_str))
                             if match:
                                 return float(match.group(1))
                 except Exception:
-                    pass
+                    continue # Continue to next json file if parsing fails
         return None
 
     def _get_or_create_matnet(self):
@@ -100,39 +156,6 @@ class OctaneMaterialBuilder:
             matnet = self.node.createNode('matnet', 'AX_MATNET')
         return matnet
 
-    def get_material_names(self):
-            """Scans the directory and returns a list of unique material base names based on recognized suffixes."""
-            temp = set()
-            
-            # Collect all recognized suffixes to cleanly strip them from filenames
-            all_suffixes = []
-            for d in [self.basecolor_dict, self.ao_dict, self.specular_dict, 
-                    self.roughness_dict, self.metallic_dict, self.opacity_dict, 
-                    self.normal_dict, self.displacement_dict, self.emission_dict]:
-                all_suffixes.extend(list(d.keys()))
-                
-            # Sort by length descending so longer suffixes (e.g., 'mixed_ao') match before shorter ones ('ao')
-            all_suffixes.sort(key=len, reverse=True)
-
-            for filename in self.cached_files:
-                name_part = os.path.splitext(filename)[0]
-                
-                for suffix in all_suffixes:
-                    # Look for the suffix in the filename (case-insensitive)
-                    idx = name_part.lower().rfind(suffix.lower())
-                    if idx != -1:
-                        # Isolate the base name by slicing up to where the suffix begins
-                        base_name = name_part[:idx]
-                        
-                        # Clean up trailing non-alphanumeric chars (like trailing underscores)
-                        base_name = re.sub(r'[^a-zA-Z0-9]+$', '', base_name)
-                        
-                        if base_name:
-                            temp.add(base_name)
-                        break 
-                        
-            return list(temp)
-
     def set_groups(self, total_materials, name):
         """Sets the group and material path parameters on the HDA and internal nodes."""
         if not self.mat_node:
@@ -140,7 +163,6 @@ class OctaneMaterialBuilder:
 
         self.mat_node.parm('num_materials').set(total_materials)
         self.mat_node.parm(f'shop_materialpath{self.iteration}').set(f'../AX_MATNET/{name}')
-        
         self.node.parm('groupnum').set(total_materials)
         
         groupnum_parm = self.node.parm(f'groupnum{self.iteration}')
@@ -154,62 +176,47 @@ class OctaneMaterialBuilder:
             texsets_parm.set(total_materials)
 
     def get_or_create_material(self, name):
-        """Retrieves existing Octane VOPNET/components, or creates them if missing."""
+        """Retrieves existing Octane Standard Surface material nodes, or creates them via the builder if missing."""
         is_new = False
         material = self.matnet.node(name)
         
         if not material:
             is_new = True
-            material = self.matnet.createNode('octane_vopnet', name)
-            # Delete default nodes immediately so we have a clean slate
-            material.deleteItems(material.children())
+            material = octane_material_builder.createMaskedOctaneSubnet(target_node=self.matnet, name=name)
             
         material_node = None
-        output_node = None
+        output_node = material.node('surface_output')
         
-        # For existing networks, find our components; for new networks, this just passes
-        for child in material.children():
-            if child.type().name() == 'NT_MAT_UNIVERSAL':
-                material_node = child
-            elif child.type().name() == 'octane_material':
-                output_node = child
-                
-        if not material_node:
-            material_node = material.createNode('NT_MAT_UNIVERSAL')
-        if not output_node:
-            output_node = material.createNode('octane_material')
+        if output_node and len(output_node.inputs()) > 0:
+            material_node = output_node.inputs()[0]
             
-        # Ensure they are connected properly
-        output_node.setNamedInput('material', material_node, 0)
+        if not material_node:
+            for child in material.children():
+                if 'STANDARD_SURFACE' in child.type().name().upper():
+                    material_node = child
+                    if output_node: output_node.setInput(0, material_node)
+                    break
+                    
+        if not material_node:
+            material_node = material.createNode('NT_MAT_STANDARD_SURFACE')
+            if output_node: output_node.setInput(0, material_node)
         
-        return material, material_node, output_node, is_new
+        return material, material_node, is_new
 
-    def _get_or_update_image_node(self, texture_set, material, name, texdir):
-        """Internal helper to locate, create, or update a single image node."""
-        target_file = None
-        matched_channel = None
-
-        for filename in self.cached_files:
-            if name.lower() in filename.lower():
-                for channel in texture_set.keys():
-                    if channel.lower() in filename.lower():
-                        target_file = filename
-                        matched_channel = channel
-                        break
-            if target_file:
-                break
-        
+    def _get_or_update_image_node(self, channel_key, material, name):
+        """Internal helper to locate, create, or update a single image node using pre-mapped data."""
+        target_file = self.material_inventory.get(name, {}).get(channel_key)
         if not target_file:
             return None, None, False
 
-        node_name = f"{name}_{matched_channel}"
-        properties = texture_set[matched_channel]
+        properties = self.channel_configs[channel_key]
+        node_name = f"{name}_{channel_key}"
         
         file_path = os.path.join(self.directory, target_file)
         eval_file_path = os.path.join(self.directory_path, target_file)
         
         existing_image = material.node(node_name)
-        texdir_parm = self.node.parm(f"{texdir}{self.iteration}")
+        texdir_parm = self.node.parm(f"{properties['dir_parm']}{self.iteration}")
         
         made_change = False
 
@@ -239,9 +246,9 @@ class OctaneMaterialBuilder:
         return image, properties, made_change
 
     def setup_albedo_ao(self, material, material_node, name):
-        """Handles combining Albedo and AO maps using a Multiply node."""
-        albedo_img, albedo_props, albedo_changed = self._get_or_update_image_node(self.basecolor_dict, material, name, 'basecolordir')
-        ao_img, ao_props, ao_changed = self._get_or_update_image_node(self.ao_dict, material, name, 'aodir')
+        """Handles combining Base Color and AO maps using a Multiply node."""
+        albedo_img, _, albedo_changed = self._get_or_update_image_node('basecolor', material, name)
+        ao_img, _, ao_changed = self._get_or_update_image_node('ao', material, name)
         
         made_change = albedo_changed or ao_changed
         
@@ -259,17 +266,15 @@ class OctaneMaterialBuilder:
                 mult_node.setNamedInput('texture2', ao_img, 0)
                 made_change = True
                 
-            # Connect the multiply node to the material base color
-            material_node.setNamedInput('albedo', mult_node, 0)
+            material_node.setNamedInput('baseColor', mult_node, 0)
         else:
-            # Connect albedo directly if no AO exists
-            material_node.setNamedInput('albedo', albedo_img, 0)
+            material_node.setNamedInput('baseColor', albedo_img, 0)
             
         return made_change
 
-    def create_texture_node(self, texture_set, material, target_node, name, ch_input, texdir, secondary_node_type=None, secondary_input='texture', defaults=None):
-        """Finds the texture file and wires standard nodes/secondary utilities."""
-        image, properties, made_change = self._get_or_update_image_node(texture_set, material, name, texdir)
+    def create_texture_node(self, channel_key, material, target_node, name, ch_input, secondary_node_type=None, secondary_input='texture', defaults=None):
+        """Wires standard nodes and optional secondary utilities using pre-mapped data."""
+        image, _, made_change = self._get_or_update_image_node(channel_key, material, name)
         
         if not image:
             return False
@@ -304,14 +309,13 @@ class OctaneMaterialBuilder:
 
     def build(self):
         """The main execution method that orchestrates the material creation and updates."""
-        material_names = sorted(self.get_material_names())
+        material_names = sorted(self.material_inventory.keys())
         total_materials = len(material_names)
 
         if total_materials == 0:
             hou.ui.displayMessage("No valid textures found in the selected directory.", severity=hou.severityType.Warning, title="No Textures Found")
             return
 
-        # Fetch JSON custom displacement 
         custom_disp_scale = self._get_megascans_displacement_scale()
         oct_disp_amount = custom_disp_scale if custom_disp_scale is not None else 0.01
 
@@ -322,42 +326,26 @@ class OctaneMaterialBuilder:
         for name in material_names:
             self.iteration += 1
             
-            material, material_node, output_node, is_new = self.get_or_create_material(name)
+            material, material_node, is_new = self.get_or_create_material(name)
             self.set_groups(total_materials, name)
 
-            changes = []
-            
-            # --- Albedo & AO ---
-            changes.append(self.setup_albedo_ao(material, material_node, name))
-            
-            # --- Standard Nodes ---
-            changes.append(self.create_texture_node(self.roughness_dict, material, material_node, name, 'roughness', 'roughnessdir'))
-            changes.append(self.create_texture_node(self.specular_dict, material, material_node, name, 'specular', 'speculardir'))
-            changes.append(self.create_texture_node(self.metallic_dict, material, material_node, name, 'metallic', 'metallicdir'))
-            changes.append(self.create_texture_node(self.normal_dict, material, material_node, name, 'normal', 'normaldir'))
-            changes.append(self.create_texture_node(self.opacity_dict, material, material_node, name, 'opacity', 'opacitydir'))
-            
-            # Displacement
-            changes.append(self.create_texture_node(
-                self.displacement_dict, material, material_node, name, 'displacement', 'displacementdir', 
-                secondary_node_type='NT_VERTEX_DISPLACEMENT', 
-                secondary_input='texture', 
-                defaults={'black_level': 0.5, 'amount': oct_disp_amount}
-            ))
-
-            # Emission
-            changes.append(self.create_texture_node(
-                self.emission_dict, material, material_node, name, 'emission', 'emissivedir',
-                secondary_node_type='NT_EMIS_TEXTURE', 
-                secondary_input='efficiency_or_texture'
-            ))
-
-            made_changes = any(changes)
+            changes = [
+                self.setup_albedo_ao(material, material_node, name),
+                self.create_texture_node('roughness', material, material_node, name, 'roughness'),
+                self.create_texture_node('specular', material, material_node, name, 'specular'),
+                self.create_texture_node('metallic', material, material_node, name, 'metallic'),
+                self.create_texture_node('normal', material, material_node, name, 'normal'),
+                self.create_texture_node('opacity', material, material_node, name, 'opacity'),
+                self.create_texture_node('displacement', material, material_node, name, 'displacement', 
+                                         secondary_node_type='NT_VERTEX_DISPLACEMENT', defaults={'black_level': 0.5, 'amount': oct_disp_amount}),
+                self.create_texture_node('emission', material, material_node, name, 'emission', 
+                                         secondary_node_type='NT_EMIS_TEXTURE', secondary_input='efficiency_or_texture')
+            ]
 
             if is_new:
                 created_count += 1
                 material.layoutChildren()
-            elif made_changes:
+            elif any(changes):
                 updated_count += 1
                 material.layoutChildren()
             else:
@@ -366,16 +354,13 @@ class OctaneMaterialBuilder:
         self.matnet.layoutChildren() 
 
         msg_lines = [f"Processed {total_materials} Octane material(s)."]
-        if custom_disp_scale is not None:
-            msg_lines.append(f"- JSON Custom Scale Applied: {custom_disp_scale}")
-        
+        if custom_disp_scale is not None: msg_lines.append(f"- JSON Custom Scale Applied: {custom_disp_scale}")
         if created_count > 0: msg_lines.append(f"- Created: {created_count}")
         if updated_count > 0: msg_lines.append(f"- Updated: {updated_count}")
         if skipped_count > 0: msg_lines.append(f"- Skipped (unchanged): {skipped_count}")
             
         hou.ui.displayMessage("\n".join(msg_lines), title="Material Builder Completed")
 
-# --- Execution ---
 def execute():
     builder = OctaneMaterialBuilder()
     builder.build()

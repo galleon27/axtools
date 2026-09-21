@@ -93,7 +93,7 @@ class SelectableLabel(QtWidgets.QLabel):
     selected_labels = set()
     last_clicked = None
 
-    KARMA_CONTEXTS = ('materialbuilder', 'materiallibrary', 'karmamaterialbuilder')
+    KARMA_CONTEXTS = ('materialbuilder', 'materiallibrary', 'karmamaterialbuilder', 'subnet')
     OCTANE_CONTEXTS = ('octane_vopnet', 'octane_solaris_material_builder')
     REDSHIFT_CONTEXTS = ('redshift_vopnet', 'rs_usd_material_builder')
     MATNET_CONTEXTS = ('matnet',)
