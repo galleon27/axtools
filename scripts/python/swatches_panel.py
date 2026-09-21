@@ -4,8 +4,13 @@ import hou
 import json
 import re
 import math
+import colorsys
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
+
+# --- GLOBAL CONSTANTS ---
+RAMP_PARM_NAMES = ("ramp", "colorramp", "gradient", "vramp", "NT_TEX_GRADIENT", "rampcolordefault", "octane_gradient")
+COLOR_PARM_NAMES = ("color", "singlevalue", "base_color", "NT_TEX_RGB")
 
 def cmyk_to_rgb(c, m, y, k):
     """Converts CMYK color values to RGB."""
@@ -219,9 +224,9 @@ class GradientLabel(SelectableLabel):
             return
             
         target_node = selected_nodes[0]
-        ramp_parm_names = ["ramp", "colorramp", "gradient", "vramp", "NT_TEX_GRADIENT", "rampcolordefault", "octane_gradient"]
         target_parm = None
-        for name in ramp_parm_names:
+        
+        for name in RAMP_PARM_NAMES:
             parm = target_node.parm(name)
             if parm and isinstance(parm.parmTemplate(), hou.RampParmTemplate):
                 target_parm = parm
@@ -331,17 +336,8 @@ class SwatchLabel(SelectableLabel):
 
     @staticmethod
     def sort_colors_by_hue(swatches):
-        def rgb_to_hsv(rgb):
-            r, g, b = rgb; mx, mn = max(rgb), min(rgb); diff = mx - mn
-            h = 0
-            if diff > 1e-6:
-                if mx == r: h = (g - b) / diff
-                elif mx == g: h = 2.0 + (b - r) / diff
-                elif mx == b: h = 4.0 + (r - g) / diff
-            h *= 60
-            if h < 0: h += 360
-            return (h, mx)
-        return sorted(swatches, key=lambda s: rgb_to_hsv(s.rgb))
+        """Sorts swatches based on their hue value using standard colorsys."""
+        return sorted(swatches, key=lambda s: colorsys.rgb_to_hsv(*s.rgb)[0])
 
     def handle_network_drop(self, pane, pos, from_context_menu=None, context_override=None):
         if context_override:
@@ -368,15 +364,15 @@ class SwatchLabel(SelectableLabel):
             category = context.childTypeCategory().name()
 
             if category == 'Sop':
-                created_nodes = self._handle_sop_creation(context, swatches_to_create, pos, self._create_sop_nodes, self._create_sop_gradient)
+                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_sop_nodes, self._create_sop_gradient)
             elif context_type in self.KARMA_CONTEXTS:
-                created_nodes = self._handle_material_creation(context, swatches_to_create, pos, self._create_karma_nodes, self._create_karma_gradient)
+                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_karma_nodes, self._create_karma_gradient)
             elif context_type in self.OCTANE_CONTEXTS:
-                created_nodes = self._handle_material_creation(context, swatches_to_create, pos, self._create_octane_nodes, self._create_octane_gradient)
+                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_octane_nodes, self._create_octane_gradient)
             elif context_type in self.REDSHIFT_CONTEXTS:
-                created_nodes = self._handle_material_creation(context, swatches_to_create, pos, self._create_redshift_nodes, self._create_redshift_gradient)
+                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_redshift_nodes, self._create_redshift_gradient)
             elif context_type in self.MATNET_CONTEXTS or category == 'Vop':
-                created_nodes = self._handle_matnet_creation(context, swatches_to_create, pos, self._create_matnet_nodes, self._create_matnet_gradient)
+                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_matnet_nodes, self._create_matnet_gradient)
             elif category == 'Object':
                 created_nodes = self._create_object_nodes(context, swatches_to_create, pos)
             else:
@@ -393,7 +389,7 @@ class SwatchLabel(SelectableLabel):
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
 
-    def _handle_sop_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
+    def _handle_node_or_gradient_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
         if len(selected) > 1:
             choice = hou.ui.displayMessage("Create individual nodes or a gradient?", buttons=["Nodes", "Gradient", "Cancel"], default_choice=0, close_choice=2)
             if choice == 0: return node_creation_func(context, selected, pos)
@@ -405,11 +401,6 @@ class SwatchLabel(SelectableLabel):
             else: return []
         else:
             return node_creation_func(context, selected, pos)
-
-    def _handle_material_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
-        return self._handle_sop_creation(context, selected, pos, node_creation_func, gradient_creation_func)
-    def _handle_matnet_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
-        return self._handle_sop_creation(context, selected, pos, node_creation_func, gradient_creation_func)
 
     def _create_nodes(self, context, selected, pos, node_type, parm_names):
         created = []
@@ -513,9 +504,8 @@ class SwatchLabel(SelectableLabel):
                 self.create_single_color_in_node(target_node, selected_swatches[0])
 
     def create_gradient_in_node(self, node, swatches):
-        ramp_parm_names = ["ramp", "colorramp", "gradient", "vramp", "NT_TEX_GRADIENT", "rampcolordefault"]
         target_parm = None
-        for name in ramp_parm_names:
+        for name in RAMP_PARM_NAMES:
             parm = node.parm(name)
             if parm and isinstance(parm.parmTemplate(), hou.RampParmTemplate):
                 target_parm = parm
@@ -537,8 +527,7 @@ class SwatchLabel(SelectableLabel):
         self.viewer.log(f"Set gradient on '{node.path()}.{target_parm.name()}'.")
 
     def create_single_color_in_node(self, node, swatch):
-        color_parm_names = ["color", "singlevalue", "base_color", "NT_TEX_RGB"]
-        for parm_name in color_parm_names:
+        for parm_name in COLOR_PARM_NAMES:
             parm = node.parmTuple(parm_name)
             if parm and parm.parmTemplate().numComponents() == 3:
                 try:
@@ -788,8 +777,7 @@ class SwatchViewer(QtWidgets.QWidget):
         self.folder_tree.setCurrentItem(current_item)
 
     def get_ramp_parm_from_node(self, node):
-        ramp_parm_names = ["ramp", "colorramp", "gradient", "vramp", "NT_TEX_GRADIENT", "rampcolordefault", "octane_gradient"]
-        for name in ramp_parm_names:
+        for name in RAMP_PARM_NAMES:
             parm = node.parm(name)
             if parm and isinstance(parm.parmTemplate(), hou.RampParmTemplate):
                 return parm
