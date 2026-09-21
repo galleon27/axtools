@@ -27,6 +27,7 @@
     <memberTool name="Relink Files"/>
     <memberTool name="Loop Sequence"/>
     <memberTool name="set_item_color"/>
+    <memberTool name="Advanced Notes"/>
   </toolshelf>
 
   <tool name="GSG Octane Material" label="GSG Octane Material" icon="custom_hda_icon">
@@ -1249,5 +1250,811 @@ if new_qcolor.isValid():
     new_hou_color = hou.Color(new_qcolor.getRgbF()[:3])
     for item in items:
         item.setColor(new_hou_color)]]></script>
+  </tool>
+
+  <tool name="Advanced Notes" label="Advanced Notes" shortLabel="AdvNotes" icon="custom_hda_icon">
+    <script scriptType="python"><![CDATA["""
+Rich Sticky Note - rich-text editing for Houdini's NETWORK EDITOR sticky notes.
+
+Select a sticky note in the network editor and run this tool (shelf button).
+With nothing selected it creates a new sticky note in the current network.
+A small editor opens; everything you type is written live into the note.
+
+Sticky notes only store plain text, so styling is converted to characters:
+    bullets      -> \u2022 / \u25E6         numbered -> 1. 2. 3.
+    to-do        -> \u2610 / \u2611  (click a box in the editor to tick it)
+    bold/italic  -> Unicode math letters   strikethrough/underline -> combining marks
+    divider      -> a line of \u2500
+Text/highlight colours cannot be shown in a note, so they are not offered here;
+use the note's own right-click menu for size and colour.
+
+The editable rich version is kept as user data on the note's parent node, so
+you can re-open a note later and continue editing. If you edit the note's text
+by hand in Houdini, the editor falls back to that plain text.
+Works with PySide2 (Houdini 18.5-20.5) and PySide6 (Houdini 21+).
+"""
+
+import hou
+
+try:
+    from PySide2 import QtCore, QtGui, QtWidgets
+    QShortcut = QtWidgets.QShortcut
+    BOLD, NORMAL = 75, 50
+except ImportError:  # Houdini builds that ship PySide6
+    from PySide6 import QtCore, QtGui, QtWidgets
+    QShortcut = QtGui.QShortcut
+    BOLD, NORMAL = 700, 400
+
+Qt = QtCore.Qt
+QTextCursor = QtGui.QTextCursor
+QTextCharFormat = QtGui.QTextCharFormat
+QTextListFormat = QtGui.QTextListFormat
+
+STORAGE_KEY = "custom_notes_html"      # user-data key on the root node (/)
+BOX_OFF = "\u2610"                     # â
+BOX_ON = "\u2611"                      # â
+BOXES = (BOX_OFF, BOX_ON)
+DONE_COLOR = (130, 130, 130)
+
+HEADING_SIZES = {0: None, 1: 22.0, 2: 17.0, 3: 14.0}
+
+TEXT_COLORS = [
+    ("Default", None), ("Red", "#ff6b6b"), ("Orange", "#ffa94d"),
+    ("Yellow", "#ffe066"), ("Green", "#69db7c"), ("Blue", "#74c0fc"),
+    ("Purple", "#b197fc"), ("Grey", "#adb5bd"),
+]
+HIGHLIGHTS = [
+    ("None", None), ("Yellow", "#7a6a00"), ("Green", "#2f6f3a"),
+    ("Red", "#7a2f2f"), ("Blue", "#2f4f7a"), ("Purple", "#5a3a7a"),
+]
+
+
+def _event_pos(e):
+    return e.position().toPoint() if hasattr(e, "position") else e.pos()
+
+
+# --------------------------------------------------------------------------- #
+# The editor
+# --------------------------------------------------------------------------- #
+class NotesEdit(QtWidgets.QTextEdit):
+    def __init__(self, parent=None):
+        super(NotesEdit, self).__init__(parent)
+        self.setAcceptRichText(True)
+        self.viewport().setMouseTracking(True)
+        self.document().setDocumentMargin(10)
+        self.setPlaceholderText("Write your notes here...")
+        size = self.font().pointSizeF()
+        self._base_size = size if size > 0 else 10.0
+
+    # ---- helpers ---------------------------------------------------------- #
+    def selected_blocks(self):
+        cur = self.textCursor()
+        doc = self.document()
+        first = doc.findBlock(cur.selectionStart())
+        last = doc.findBlock(cur.selectionEnd())
+        if (cur.hasSelection() and last.blockNumber() != first.blockNumber()
+                and cur.selectionEnd() == last.position()):
+            last = last.previous()
+        blocks, b = [], first
+        while b.isValid():
+            blocks.append(b)
+            if b.blockNumber() == last.blockNumber():
+                break
+            b = b.next()
+        return blocks
+
+    def merge_format(self, fmt):
+        self.mergeCurrentCharFormat(fmt)
+        self.setFocus()
+
+    # ---- inline formatting ------------------------------------------------ #
+    def toggle_format(self, kind):
+        cf = self.currentCharFormat()
+        fmt = QTextCharFormat()
+        if kind == "bold":
+            fmt.setFontWeight(NORMAL if cf.fontWeight() > NORMAL else BOLD)
+        elif kind == "italic":
+            fmt.setFontItalic(not cf.fontItalic())
+        elif kind == "underline":
+            fmt.setFontUnderline(not cf.fontUnderline())
+        elif kind == "strike":
+            fmt.setFontStrikeOut(not cf.fontStrikeOut())
+        self.merge_format(fmt)
+
+    def toggle_code(self):
+        cf = self.currentCharFormat()
+        fmt = QTextCharFormat()
+        if cf.fontFamily() == "Courier New":
+            fmt.setFontFamily(self.font().family())
+            fmt.setBackground(QtGui.QBrush(Qt.NoBrush))
+        else:
+            fmt.setFontFamily("Courier New")
+            fmt.setBackground(QtGui.QBrush(QtGui.QColor(60, 60, 60)))
+        self.merge_format(fmt)
+
+    def set_text_color(self, hex_color):
+        fmt = QTextCharFormat()
+        if hex_color:
+            fmt.setForeground(QtGui.QBrush(QtGui.QColor(hex_color)))
+        else:
+            fmt.setForeground(self.palette().text())
+        self.merge_format(fmt)
+
+    def set_highlight(self, hex_color):
+        fmt = QTextCharFormat()
+        if hex_color:
+            fmt.setBackground(QtGui.QBrush(QtGui.QColor(hex_color)))
+        else:
+            fmt.setBackground(QtGui.QBrush(Qt.NoBrush))
+        self.merge_format(fmt)
+
+    def clear_formatting(self):
+        cur = self.textCursor()
+        if cur.hasSelection():
+            cur.setCharFormat(QTextCharFormat())
+        self.setCurrentCharFormat(QTextCharFormat())
+        self.setFocus()
+
+    def set_heading(self, level):
+        size = HEADING_SIZES.get(level) or self._base_size
+        fmt = QTextCharFormat()
+        fmt.setFontPointSize(size)
+        fmt.setFontWeight(BOLD if level else NORMAL)
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        for b in self.selected_blocks():
+            bc = QTextCursor(b)
+            bc.movePosition(QTextCursor.StartOfBlock)
+            bc.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+            bc.mergeCharFormat(fmt)
+        cur.endEditBlock()
+        self.mergeCurrentCharFormat(fmt)
+        self.setFocus()
+
+    def insert_divider(self):
+        self.textCursor().insertHtml("<hr>")
+        self.setFocus()
+
+    # ---- lists ------------------------------------------------------------ #
+    def toggle_list(self, style):
+        blocks = self.selected_blocks()
+        first_list = blocks[0].textList()
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        if first_list is not None and first_list.format().style() == style:
+            for b in blocks:
+                lst = b.textList()
+                if lst is not None:
+                    lst.remove(b)
+                bc = QTextCursor(b)
+                bf = bc.blockFormat()
+                bf.setIndent(0)
+                bc.setBlockFormat(bf)
+        else:
+            fmt = QTextListFormat()
+            fmt.setStyle(style)
+            fmt.setIndent(first_list.format().indent() if first_list else 1)
+            new_list = QTextCursor(blocks[0]).createList(fmt)
+            for b in blocks[1:]:
+                new_list.add(b)
+        cur.endEditBlock()
+        self.setFocus()
+
+    def _find_sibling_list(self, block, indent, style):
+        p = block.previous()
+        while p.isValid():
+            pl = p.textList()
+            if pl is None:
+                return None
+            ind = pl.format().indent()
+            if ind < indent:
+                return None
+            if ind == indent and pl.format().style() == style:
+                return pl
+            p = p.previous()
+        return None
+
+    def change_indent(self, delta):
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        for b in self.selected_blocks():
+            bc = QTextCursor(b)
+            lst = b.textList()
+            if lst is not None:
+                fmt = lst.format()
+                new_indent = fmt.indent() + delta
+                if new_indent < 1:
+                    lst.remove(b)
+                    bf = bc.blockFormat()
+                    bf.setIndent(0)
+                    bc.setBlockFormat(bf)
+                else:
+                    nf = QTextListFormat(fmt)
+                    nf.setIndent(new_indent)
+                    sibling = self._find_sibling_list(b, new_indent, nf.style())
+                    if sibling is not None:
+                        sibling.add(b)
+                    else:
+                        bc.createList(nf)
+            else:
+                bf = bc.blockFormat()
+                bf.setIndent(max(0, bf.indent() + delta))
+                bc.setBlockFormat(bf)
+        cur.endEditBlock()
+
+    # ---- to-do lines ------------------------------------------------------ #
+    def toggle_todo(self):
+        blocks = self.selected_blocks()
+        all_todo = all(b.text()[:1] in BOXES for b in blocks)
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        for b in blocks:
+            if all_todo:
+                self._strip_box(b)
+            elif b.text()[:1] not in BOXES:
+                lst = b.textList()
+                if lst is not None:
+                    lst.remove(b)
+                QTextCursor(b).insertText(BOX_OFF + " ", QTextCharFormat())
+        cur.endEditBlock()
+        self.setFocus()
+
+    def _strip_box(self, block):
+        text = block.text()
+        was_done = text[:1] == BOX_ON
+        n = 2 if text[1:2] == " " else 1
+        c = QTextCursor(block)
+        c.setPosition(block.position() + n, QTextCursor.KeepAnchor)
+        c.removeSelectedText()
+        if was_done:
+            r = QTextCursor(block)
+            r.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+            f = QTextCharFormat()
+            f.setFontStrikeOut(False)
+            f.setForeground(self.palette().text())
+            r.mergeCharFormat(f)
+
+    def toggle_box(self, block):
+        text = block.text()
+        if text[:1] not in BOXES:
+            return
+        done = text[0] == BOX_OFF          # unchecked -> becoming checked
+        c = QTextCursor(block)
+        c.beginEditBlock()
+        c.setPosition(block.position() + 1, QTextCursor.KeepAnchor)
+        c.insertText(BOX_ON if done else BOX_OFF, QTextCharFormat())
+        rest = QTextCursor(block)
+        rest.setPosition(block.position() + 1)
+        rest.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        f = QTextCharFormat()
+        f.setFontStrikeOut(done)
+        if done:
+            f.setForeground(QtGui.QBrush(QtGui.QColor(*DONE_COLOR)))
+        else:
+            f.setForeground(self.palette().text())
+        rest.mergeCharFormat(f)
+        c.endEditBlock()
+
+    def toggle_current_box(self):
+        self.toggle_box(self.textCursor().block())
+
+    def _box_at(self, pos):
+        block = self.cursorForPosition(pos).block()
+        if block.text()[:1] not in BOXES:
+            return None
+        c0 = QTextCursor(block)
+        c1 = QTextCursor(block)
+        c1.setPosition(block.position() + 1)
+        r0, r1 = self.cursorRect(c0), self.cursorRect(c1)
+        if (r0.top() <= pos.y() <= r0.bottom()
+                and r0.left() - 3 <= pos.x() <= r1.left() + 3):
+            return block
+        return None
+
+    # ---- events ----------------------------------------------------------- #
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            block = self._box_at(_event_pos(e))
+            if block is not None:
+                self.toggle_box(block)
+                return
+        super(NotesEdit, self).mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        over = self._box_at(_event_pos(e)) is not None
+        self.viewport().setCursor(Qt.PointingHandCursor if over else Qt.IBeamCursor)
+        super(NotesEdit, self).mouseMoveEvent(e)
+
+    def keyPressEvent(self, e):
+        key, mods = e.key(), e.modifiers()
+        cur = self.textCursor()
+        block = cur.block()
+        text = block.text()
+        is_todo = text[:1] in BOXES
+
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            if mods & Qt.ControlModifier:
+                return                     # handled by the Ctrl+Return shortcut
+            if is_todo and not (mods & Qt.ShiftModifier) and not cur.hasSelection():
+                if text[1:].strip() == "":            # empty to-do -> leave the list
+                    cur.beginEditBlock()
+                    self._strip_box(block)
+                    cur.endEditBlock()
+                    return
+                if cur.positionInBlock() >= 2:        # continue the to-do list
+                    cur.beginEditBlock()
+                    cur.insertBlock()
+                    cur.insertText(BOX_OFF + " ", QTextCharFormat())
+                    cur.endEditBlock()
+                    self.setTextCursor(cur)
+                    return
+
+        elif key == Qt.Key_Backspace and is_todo and not cur.hasSelection():
+            pos = cur.positionInBlock()
+            if pos == 1 or (pos == 2 and text[1:2] == " "):
+                cur.beginEditBlock()
+                self._strip_box(block)
+                cur.endEditBlock()
+                return
+
+        elif key == Qt.Key_Tab and not (mods & Qt.ControlModifier):
+            self.change_indent(1)
+            return
+        elif key == Qt.Key_Backtab:
+            self.change_indent(-1)
+            return
+
+        super(NotesEdit, self).keyPressEvent(e)
+
+
+# --------------------------------------------------------------------------- #
+# The panel (toolbar + editor + persistence)
+# --------------------------------------------------------------------------- #
+class NotesPanel(QtWidgets.QWidget):
+    SHOW_EXTRAS = True
+
+    def __init__(self, parent=None):
+        super(NotesPanel, self).__init__(parent)
+        self._loading = False
+
+        self.edit = NotesEdit(self)
+        self.toolbar = QtWidgets.QToolBar(self)
+        self.toolbar.setMovable(False)
+        self._build_toolbar()
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.edit)
+
+        self._shortcuts = []
+        self._build_shortcuts()
+
+        # debounced autosave into the .hip
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(400)
+        self._timer.timeout.connect(self.save)
+        self.edit.textChanged.connect(self._on_text_changed)
+        self.edit.currentCharFormatChanged.connect(self._sync_buttons)
+
+        # reload when a hip file is opened / cleared, flush before saving
+        self._cb = self._on_hip_event
+        hou.hipFile.addEventCallback(self._cb)
+        cb = self._cb
+        self.destroyed.connect(lambda *_: self._remove_cb(cb))
+
+        self.load()
+
+    # ---- toolbar ---------------------------------------------------------- #
+    def _btn(self, text, tip, slot, checkable=False, style=None):
+        b = QtWidgets.QToolButton()
+        b.setText(text)
+        b.setToolTip(tip)
+        b.setCheckable(checkable)
+        b.setFocusPolicy(Qt.NoFocus)
+        if style:
+            f = QtGui.QFont(b.font())
+            f.setBold("b" in style)
+            f.setItalic("i" in style)
+            f.setUnderline("u" in style)
+            f.setStrikeOut("s" in style)
+            b.setFont(f)
+        b.clicked.connect(lambda *_: slot())
+        self.toolbar.addWidget(b)
+        return b
+
+    def _menu_btn(self, label, tip, entries, slot):
+        b = QtWidgets.QToolButton()
+        b.setText(label + " \u25BE")
+        b.setToolTip(tip)
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        menu = QtWidgets.QMenu(b)
+        for name, hex_color in entries:
+            act = menu.addAction(name)
+            if hex_color:
+                pm = QtGui.QPixmap(14, 14)
+                pm.fill(QtGui.QColor(hex_color))
+                act.setIcon(QtGui.QIcon(pm))
+            act.triggered.connect(lambda checked=False, h=hex_color: slot(h))
+        b.setMenu(menu)
+        self.toolbar.addWidget(b)
+        return b
+
+    def _build_toolbar(self):
+        e = self.edit
+        self.heading = QtWidgets.QComboBox()
+        self.heading.addItems(["Normal", "Heading 1", "Heading 2", "Heading 3"])
+        self.heading.setFocusPolicy(Qt.NoFocus)
+        self.heading.setToolTip("Paragraph style")
+        self.heading.activated.connect(e.set_heading)
+        self.toolbar.addWidget(self.heading)
+        self.toolbar.addSeparator()
+
+        self.b_bold = self._btn("B", "Bold (Ctrl+B)", lambda: e.toggle_format("bold"), True, "b")
+        self.b_ital = self._btn("I", "Italic (Ctrl+I)", lambda: e.toggle_format("italic"), True, "i")
+        self.b_under = self._btn("U", "Underline (Ctrl+U)", lambda: e.toggle_format("underline"), True, "u")
+        self.b_strike = self._btn("S", "Strikethrough (Ctrl+Shift+X)", lambda: e.toggle_format("strike"), True, "s")
+        self.toolbar.addSeparator()
+
+        self._btn("\u2022 List", "Bullet list (Ctrl+Shift+8)",
+                  lambda: e.toggle_list(QTextListFormat.ListDisc))
+        self._btn("1. List", "Numbered list (Ctrl+Shift+7)",
+                  lambda: e.toggle_list(QTextListFormat.ListDecimal))
+        self._btn("\u2610 To-do", "To-do list (Ctrl+Shift+T). Click a box to tick it.",
+                  e.toggle_todo)
+        self.toolbar.addSeparator()
+
+        if self.SHOW_EXTRAS:
+            self._menu_btn("Color", "Text colour", TEXT_COLORS, e.set_text_color)
+            self._menu_btn("Highlight", "Highlight colour", HIGHLIGHTS, e.set_highlight)
+            self._btn("</>", "Inline code", e.toggle_code)
+        self._btn("\u2015", "Insert divider line", e.insert_divider)
+        self._btn("Clear", "Clear formatting of selection", e.clear_formatting)
+
+    def _build_shortcuts(self):
+        e = self.edit
+        table = [
+            ("Ctrl+B", lambda: e.toggle_format("bold")),
+            ("Ctrl+I", lambda: e.toggle_format("italic")),
+            ("Ctrl+U", lambda: e.toggle_format("underline")),
+            ("Ctrl+Shift+X", lambda: e.toggle_format("strike")),
+            ("Ctrl+Shift+8", lambda: e.toggle_list(QTextListFormat.ListDisc)),
+            ("Ctrl+Shift+7", lambda: e.toggle_list(QTextListFormat.ListDecimal)),
+            ("Ctrl+Shift+T", e.toggle_todo),
+            ("Ctrl+Return", e.toggle_current_box),
+            ("Ctrl+Enter", e.toggle_current_box),
+        ]
+        for seq, fn in table:
+            sc = QShortcut(QtGui.QKeySequence(seq), e)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(fn)
+            self._shortcuts.append(sc)
+
+    def _sync_buttons(self, fmt):
+        self.b_bold.setChecked(fmt.fontWeight() > NORMAL)
+        self.b_ital.setChecked(fmt.fontItalic())
+        self.b_under.setChecked(fmt.fontUnderline())
+        self.b_strike.setChecked(fmt.fontStrikeOut())
+        size = fmt.fontPointSize()
+        idx = 0
+        if size >= 21:
+            idx = 1
+        elif size >= 16:
+            idx = 2
+        elif size >= 13.5:
+            idx = 3
+        self.heading.blockSignals(True)
+        self.heading.setCurrentIndex(idx)
+        self.heading.blockSignals(False)
+
+    # ---- persistence (stored in the .hip) --------------------------------- #
+    def _on_text_changed(self):
+        if not self._loading:
+            self._timer.start()
+
+    def load(self):
+        html = None
+        try:
+            html = hou.node("/").userData(STORAGE_KEY)
+        except Exception:
+            pass
+        self._loading = True
+        try:
+            if html:
+                self.edit.setHtml(html)
+            else:
+                self.edit.clear()
+        finally:
+            self._loading = False
+
+    def save(self):
+        try:
+            html = self.edit.toHtml()
+            root = hou.node("/")
+            if root.userData(STORAGE_KEY) == html:
+                return
+            with hou.undos.disabler():
+                root.setUserData(STORAGE_KEY, html)
+        except Exception as ex:
+            print("Custom Notes: could not save notes ->", ex)
+
+    def _on_hip_event(self, event_type):
+        try:
+            if event_type in (hou.hipFileEventType.AfterLoad,
+                              hou.hipFileEventType.AfterClear):
+                self.load()
+            elif event_type == hou.hipFileEventType.BeforeSave:
+                self._timer.stop()
+                self.save()
+        except RuntimeError:               # panel was deleted
+            self._remove_cb(self._cb)
+
+    @staticmethod
+    def _remove_cb(cb):
+        try:
+            hou.hipFile.removeEventCallback(cb)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Rich text  ->  plain text that a Houdini sticky note can display
+# --------------------------------------------------------------------------- #
+_BOLD = (0x1D400, 0x1D41A, 0x1D7CE)         # mathematical bold
+_ITAL = (0x1D434, 0x1D44E, None)            # mathematical italic
+_BOLD_ITAL = (0x1D468, 0x1D482, 0x1D7CE)    # mathematical bold italic
+_NO_MARK = "\u2028\n"
+
+
+def _math_style(s, bold, italic):
+    if not (bold or italic):
+        return s
+    up, lo, dg = _BOLD_ITAL if (bold and italic) else (_BOLD if bold else _ITAL)
+    out = []
+    for ch in s:
+        if "A" <= ch <= "Z":
+            out.append(chr(up + ord(ch) - 65))
+        elif "a" <= ch <= "z":
+            if italic and not bold and ch == "h":
+                out.append("\u210E")        # italic h lives elsewhere in Unicode
+            else:
+                out.append(chr(lo + ord(ch) - 97))
+        elif "0" <= ch <= "9" and dg is not None:
+            out.append(chr(dg + ord(ch) - 48))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _combine(s, mark):
+    return "".join(ch + mark if not (ch.isspace() or ch in _NO_MARK) else ch for ch in s)
+
+
+def _apply_style(run, key, use_unicode):
+    bold, ital, under, strike = key
+    if not (bold or ital or under or strike):
+        return run
+    if use_unicode:
+        s = _math_style(run, bold, ital)
+        if under:
+            s = _combine(s, "\u0332")
+        if strike:
+            s = _combine(s, "\u0336")
+        return s
+    core = run.strip()
+    if not core:
+        return run
+    pre = run[:len(run) - len(run.lstrip())]
+    post = run[len(run.rstrip()):]
+    if bold:
+        core = "*" + core + "*"
+    if ital:
+        core = "_" + core + "_"
+    if strike:
+        core = "~" + core + "~"
+    return pre + core + post
+
+
+def _styled_runs(cur, block, use_unicode):
+    text = block.text()
+    base = block.position()
+    out, run, key = [], "", None
+    for i, ch in enumerate(text):
+        cur.setPosition(base + i + 1)
+        f = cur.charFormat()
+        k = (f.fontWeight() > NORMAL, f.fontItalic(), f.fontUnderline(), f.fontStrikeOut())
+        if k != key:
+            if run:
+                out.append(_apply_style(run, key, use_unicode))
+            run, key = "", k
+        run += ch
+    if run:
+        out.append(_apply_style(run, key, use_unicode))
+    return "".join(out).replace("\u2028", "\n")
+
+
+def _block_prefix(block):
+    lst = block.textList()
+    if lst is not None:
+        fmt = lst.format()
+        ind = max(1, fmt.indent())
+        if fmt.style() == QTextListFormat.ListDecimal:
+            mark = "%d." % (lst.itemNumber(block) + 1)
+        else:
+            mark = "\u2022" if ind == 1 else "\u25E6"
+        return "  " * (ind - 1) + mark + " "
+    return "  " * block.blockFormat().indent()
+
+
+def doc_to_plain(doc, use_unicode=True):
+    """Convert a QTextDocument into sticky-note-friendly plain text."""
+    rule_prop = getattr(QtGui.QTextFormat, "BlockTrailingHorizontalRulerWidth", None)
+    cur = QTextCursor(doc)
+    lines = []
+    block = doc.begin()
+    while block.isValid():
+        body = _styled_runs(cur, block, use_unicode)
+        is_rule = rule_prop is not None and block.blockFormat().hasProperty(rule_prop)
+        if is_rule:
+            if body.strip():
+                lines.append(_block_prefix(block) + body)
+            lines.append("\u2500" * 24)
+        else:
+            lines.append(_block_prefix(block) + body)
+        block = block.next()
+    return "\n".join(lines).rstrip()
+
+
+# --------------------------------------------------------------------------- #
+# Editor window bound to one sticky note
+# --------------------------------------------------------------------------- #
+def _registry():
+    reg = getattr(hou, "_rich_note_windows", None)
+    if reg is None:
+        reg = {}
+        setattr(hou, "_rich_note_windows", reg)
+    return reg
+
+
+class StickyEditor(NotesPanel):
+    SHOW_EXTRAS = False
+
+    def __init__(self, note, parent=None):
+        super(StickyEditor, self).__init__(parent)
+        self._note = note
+        self._sid = note.sessionId()
+        self._key = "custom_note:" + note.name()
+        self._holder = note.parent()
+        self._unicode = True
+
+        self.setWindowFlags(Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowTitle("Rich Note - " + note.name())
+        self.resize(460, 440)
+
+        self.cb_unicode = QtWidgets.QCheckBox("Unicode styling")
+        self.cb_unicode.setChecked(True)
+        self.cb_unicode.setFocusPolicy(Qt.NoFocus)
+        self.cb_unicode.setToolTip(
+            "On: bold/italic/underline/strike become Unicode look-alike characters.\n"
+            "Off: they become *bold*, _italic_ and ~strike~ markers.\n"
+            "Turn off if your Houdini font shows empty boxes.")
+        self.cb_unicode.toggled.connect(self._on_mode)
+        self.toolbar.addSeparator()
+        self.toolbar.addWidget(self.cb_unicode)
+
+        hint = QtWidgets.QLabel(
+            "Sticky notes only hold plain text, so styling is written into the note "
+            "as Unicode characters. Text size and colour are set on the note itself "
+            "(right-click the note).")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: grey;")
+        self.layout().addWidget(hint)
+
+        self.load()
+
+    # ---- storage: the note's plain text + the rich source on the parent ---- #
+    def load(self):
+        if not hasattr(self, "_note"):
+            return
+        try:
+            text = self._note.text()
+            stored = self._holder.userData(self._key)
+        except Exception:
+            return
+        self._loading = True
+        try:
+            loaded = False
+            if stored:
+                self.edit.setHtml(stored)
+                for mode in (True, False):
+                    if doc_to_plain(self.edit.document(), mode).rstrip() == text.rstrip():
+                        self._unicode = mode
+                        self.cb_unicode.blockSignals(True)
+                        self.cb_unicode.setChecked(mode)
+                        self.cb_unicode.blockSignals(False)
+                        loaded = True
+                        break
+            if not loaded:                       # note was edited by hand, or is new
+                self.edit.setPlainText(text)
+        finally:
+            self._loading = False
+
+    def save(self):
+        try:
+            text = doc_to_plain(self.edit.document(), self._unicode)
+            with hou.undos.disabler():
+                self._note.setText(text)
+                self._holder.setUserData(self._key, self.edit.toHtml())
+        except hou.ObjectWasDeleted:
+            self.close()
+        except Exception as ex:
+            print("Rich Note: could not update note ->", ex)
+
+    def _on_mode(self, state):
+        self._unicode = bool(state)
+        self.save()
+
+    def _on_hip_event(self, event_type):
+        pass                                     # window is tied to one note
+
+    def closeEvent(self, e):
+        self._timer.stop()
+        self.save()
+        _registry().pop(self._sid, None)
+        super(StickyEditor, self).closeEvent(e)
+
+
+# --------------------------------------------------------------------------- #
+# Entry point (shelf tool)
+# --------------------------------------------------------------------------- #
+def _network_editor():
+    pane = hou.ui.paneTabUnderCursor()
+    if pane is not None and pane.type() == hou.paneTabType.NetworkEditor:
+        return pane
+    return hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+
+
+def edit_sticky_note():
+    editor = _network_editor()
+    if editor is None:
+        hou.ui.displayMessage("Open a Network Editor pane first.")
+        return
+    net = editor.pwd()
+
+    selected = [n for n in net.stickyNotes() if n.isSelected()]
+    if selected:
+        note = selected[0]
+    else:                                        # nothing selected -> new note
+        with hou.undos.group("Create rich note"):
+            note = net.createStickyNote()
+            try:
+                c = editor.visibleBounds().center()
+            except Exception:
+                c = hou.Vector2(0, 0)
+            note.setSize(hou.Vector2(5, 4))
+            note.setPosition(hou.Vector2(c.x() - 2.5, c.y() - 2))
+            note.setSelected(True, clear_all_selected=True)
+
+    reg = _registry()
+    win = reg.get(note.sessionId())
+    if win is not None:
+        try:
+            win.show()
+            win.raise_()
+            win.activateWindow()
+            return
+        except RuntimeError:
+            reg.pop(note.sessionId(), None)
+
+    win = StickyEditor(note, hou.qt.mainWindow())
+    reg[note.sessionId()] = win
+    win.show()
+
+
+edit_sticky_note()]]></script>
   </tool>
 </shelfDocument>

@@ -45,5 +45,6 @@
     <separatorItem/>
     <separatorItem/>
     <interfaceItem name="MIndMap"/>
+    <interfaceItem name="AX Notes"/>
   </interfacesMenu>
 </pythonPanelDocument>

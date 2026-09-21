@@ -25,6 +25,16 @@ if pane:
         ]]></scriptCode>
       </scriptItem>
 
+      <scriptItem id="h.axnotes">
+        <label>AX Notes</label>
+        <scriptCode><![CDATA[
+import hou
+pane = hou.ui.curDesktop().createFloatingPaneTab(hou.paneTabType.PythonPanel, (300,300), (520,640), "ax_notes")
+if pane:
+    pane.floatingPanel().setName("AX Notes")
+        ]]></scriptCode>
+      </scriptItem>
+
     </subMenu>
   </menuBar>
 </mainMenu>
