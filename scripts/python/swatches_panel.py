@@ -1,16 +1,31 @@
-import os
-import struct
-import hou
-import json
-import re
-import math
+"""ASE Swatch Viewer panel for Houdini.
+
+Performance notes
+-----------------
+The swatch grid is ONE custom virtualized widget (SwatchGridView) instead of
+3 QWidgets (plus several stylesheets) per swatch. Only the visible cells are
+painted, so loading, scrolling, resizing and changing the grid size no longer
+depend on how many swatches a file contains.
+"""
 import colorsys
+import json
+import os
+import re
+import struct
+import time
+from collections import OrderedDict
+
+import hou
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 
 # --- GLOBAL CONSTANTS ---
 RAMP_PARM_NAMES = ("ramp", "colorramp", "gradient", "vramp", "NT_TEX_GRADIENT", "rampcolordefault", "octane_gradient")
 COLOR_PARM_NAMES = ("color", "singlevalue", "base_color", "NT_TEX_RGB")
+
+_NAME_STRIP_RE = re.compile(r'[^\w\s-]')
+_WHITESPACE_RE = re.compile(r'\s+')
+
 
 def cmyk_to_rgb(c, m, y, k):
     """Converts CMYK color values to RGB."""
@@ -19,16 +34,101 @@ def cmyk_to_rgb(c, m, y, k):
     b = 1.0 - min(1.0, y * (1 - k) + k)
     return (r, g, b)
 
+
 def sanitize_name(name):
     """Sanitize swatch names for Houdini node names"""
-    sanitized = re.sub(r'[^\w\s-]', '', name)
-    sanitized = re.sub(r'\s+', '_', sanitized)
+    sanitized = _NAME_STRIP_RE.sub('', name)
+    sanitized = _WHITESPACE_RE.sub('_', sanitized)
     sanitized = sanitized.strip('_')
     if sanitized and not (sanitized[0].isalpha() or sanitized[0] == '_'):
         sanitized = 'swatch_' + sanitized
     if not sanitized:
         sanitized = 'unnamed_swatch'
     return sanitized
+
+
+_ICON_CACHE = {}
+
+
+def get_icon(name):
+    """hou.qt.Icon() hits the icon system every call; cache the result."""
+    icon = _ICON_CACHE.get(name)
+    if icon is None:
+        icon = _ICON_CACHE[name] = hou.qt.Icon(name)
+    return icon
+
+
+def sort_colors_by_hue(swatches):
+    """Sorts swatches based on their hue value using standard colorsys."""
+    return sorted(swatches, key=lambda s: colorsys.rgb_to_hsv(*s.rgb)[0])
+
+
+def make_ramp(colors):
+    num = len(colors)
+    positions = [i / max(1, num - 1) for i in range(num)]
+    return hou.Ramp([hou.rampBasis.Linear] * num, positions, [tuple(c) for c in colors])
+
+
+def find_ramp_parm(node):
+    for name in RAMP_PARM_NAMES:
+        parm = node.parm(name)
+        if parm and isinstance(parm.parmTemplate(), hou.RampParmTemplate):
+            return parm
+    return None
+
+
+def find_network_editor():
+    pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+    if pane:
+        return pane
+    return next((p for p in hou.ui.paneTabs() if isinstance(p, hou.NetworkEditor)), None)
+
+
+# --- ASE parsing -------------------------------------------------------------
+_U16 = struct.Struct(">H")
+_BLOCK_HDR = struct.Struct(">HI")
+_RGB = struct.Struct(">fff")
+_CMYK = struct.Struct(">ffff")
+
+
+def read_ase(path):
+    """Parse an ASE file. Returns (list of (name, (r, g, b)), error_message_or_None).
+
+    Uses precompiled structs + unpack_from (no per-field slicing/copying).
+    Swatches read before an error are still returned.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except IOError as e:
+        return [], f"Error reading file: {e}"
+
+    if data[:4] != b"ASEF":
+        return [], "Invalid ASE file header."
+
+    swatches = []
+    append = swatches.append
+    pos, end = 12, len(data)
+    try:
+        while pos + 6 <= end:
+            block_type, block_len = _BLOCK_HDR.unpack_from(data, pos)
+            pos += 6
+            block_end = pos + block_len
+            if block_type == 0x0001:  # color entry
+                name_len = _U16.unpack_from(data, pos)[0]
+                name_start = pos + 2
+                name = data[name_start:name_start + max(0, name_len - 1) * 2].decode("utf_16_be")
+                model_pos = name_start + name_len * 2
+                model = data[model_pos:model_pos + 4]
+                values_pos = model_pos + 4
+                if model == b"RGB ":
+                    append((name, _RGB.unpack_from(data, values_pos)))
+                elif model == b"CMYK":
+                    append((name, cmyk_to_rgb(*_CMYK.unpack_from(data, values_pos))))
+            pos = block_end
+    except (struct.error, UnicodeDecodeError) as e:
+        return swatches, f"Error parsing ASE block: {e}"
+    return swatches, None
 
 class ConfigManager:
     """Manages loading and saving of the JSON configuration file."""
@@ -88,495 +188,549 @@ class FolderTree(QtWidgets.QTreeWidget):
                 return
         super().keyPressEvent(event)
 
-class SelectableLabel(QtWidgets.QLabel):
-    """A base class for shared swatch/gradient selection and drag-and-drop logic."""
-    selected_labels = set()
-    last_clicked = None
+# --- Data items (plain Python objects - no widgets) ---------------------------
+def _to_qcolor(rgb):
+    r, g, b = (max(0, min(255, int(c * 255))) for c in rgb[:3])
+    return QtGui.QColor(r, g, b)
+
+
+class SwatchItem:
+    __slots__ = ("name", "rgb", "color")
+
+    def __init__(self, name, rgb):
+        self.name = name
+        self.rgb = rgb
+        self.color = _to_qcolor(rgb)
+
+
+class GradientItem:
+    __slots__ = ("name", "colors", "stops")
+
+    def __init__(self, name, colors):
+        self.name = name
+        self.colors = [tuple(c) for c in colors]
+        num = len(self.colors)
+        self.stops = [(i / max(1, num - 1), _to_qcolor(c)) for i, c in enumerate(self.colors)]
+
+
+class SwatchGridView(QtWidgets.QAbstractScrollArea):
+    """Virtualized swatch grid (replaces 3 widgets + stylesheets per swatch).
+
+    * Cells have a FIXED size - they are never stretched.
+    * Column count = ceil(viewport width / cell width), like the original panel: when a whole
+      swatch doesn't fit, the last column is partly visible and reachable with the horizontal
+      scrollbar, so there is no empty strip on the right.
+    * Only the visible cells are painted, so cost is independent of the number of swatches.
+    """
+    drag_released = QtCore.Signal(int)                     # row dragged out of the view and released
+    context_requested = QtCore.Signal(QtCore.QPoint, int)  # global pos, row (-1 = background)
+    item_double_clicked = QtCore.Signal(int)
+    delete_pressed = QtCore.Signal()
+    node_dropped = QtCore.Signal(object)                   # hou.Node dropped onto the view
+
+    SELECTED_COLOR = QtGui.QColor("#33AADD")
+    BORDER_COLOR = QtGui.QColor(0, 0, 0)
+    PAD = 4      # space around the swatch box
+    GAP = 4      # box -> name
+    BOTTOM = 10  # space under the name
+
+    def __init__(self, ramp_checker, parent=None):
+        super().__init__(parent)
+        self._ramp_checker = ramp_checker
+        self.items = []
+        self._selected = set()
+        self._anchor = -1                 # last plainly-clicked row (shift-click range start)
+        self._swatch_size = 100
+        self._cell_w, self._cell_h = 108, 130
+        self._cols = 1
+        self._press_row = -1
+        self._press_pos = QtCore.QPoint()
+        self._moved = False
+        self._defer_select_row = -1       # pressed an already-selected item: decide on release
+        self._hover_row = -1
+
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.verticalScrollBar().setSingleStep(40)
+        self.horizontalScrollBar().setSingleStep(40)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.viewport().setMouseTracking(True)
+        self._bg_ref = QtWidgets.QWidget(self.viewport())   # never shown; only used to read the panel color
+        self._bg_ref.hide()
+
+    # ---- data ------------------------------------------------------------
+    def set_items(self, items):
+        self.items = items
+        self._selected = set()
+        self._anchor = -1
+        self._hover_row = -1
+        self.viewport().setToolTip("")
+        self.horizontalScrollBar().setValue(0)
+        self.verticalScrollBar().setValue(0)
+        self._update_layout()
+
+    def item_at(self, row):
+        return self.items[row] if 0 <= row < len(self.items) else None
+
+    def selected_items(self):
+        """Selected items in grid order."""
+        return [self.items[r] for r in sorted(self._selected) if r < len(self.items)]
+
+    def clear_selection(self):
+        self._anchor = -1
+        self._set_selection(set())
+
+    def _set_selection(self, rows):
+        if rows != self._selected:
+            self._selected = rows
+            self.viewport().update()
+
+    # ---- geometry ----------------------------------------------------------
+    def set_swatch_size(self, size):
+        self._swatch_size = size
+        self._cell_w = size + 2 * self.PAD
+        self._cell_h = self.PAD + size + self.GAP + self.fontMetrics().height() + self.BOTTOM
+        self._update_layout()
+
+    @property
+    def cell_size(self):
+        return QtCore.QSize(self._cell_w, self._cell_h)
+
+    def _update_layout(self):
+        vw, vh = self.viewport().width(), self.viewport().height()
+        self._cols = max(1, -(-vw // self._cell_w))               # ceil: allow a partly visible last column
+        rows = -(-len(self.items) // self._cols)
+        hbar, vbar = self.horizontalScrollBar(), self.verticalScrollBar()
+        hbar.setRange(0, max(0, self._cols * self._cell_w - vw))
+        hbar.setPageStep(vw)
+        vbar.setRange(0, max(0, rows * self._cell_h - vh))
+        vbar.setPageStep(vh)
+        self.viewport().update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_layout()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.set_swatch_size(self._swatch_size)   # fonts are final once shown
+
+    def visual_rect(self, row):
+        r, c = divmod(row, self._cols)
+        return QtCore.QRect(c * self._cell_w - self.horizontalScrollBar().value(),
+                            r * self._cell_h - self.verticalScrollBar().value(),
+                            self._cell_w, self._cell_h)
+
+    def cell_at(self, pos):
+        """Row of the whole cell (swatch + name + padding) under pos, or -1."""
+        x = pos.x() + self.horizontalScrollBar().value()
+        y = pos.y() + self.verticalScrollBar().value()
+        if x < 0 or y < 0:
+            return -1
+        col, row = x // self._cell_w, y // self._cell_h
+        if col >= self._cols:
+            return -1
+        idx = row * self._cols + col
+        return idx if idx < len(self.items) else -1
+
+    def row_at(self, pos):
+        """Row whose swatch square is under pos, or -1. The gaps and name text count as
+        background (like the original panel), so clicking them clears the selection."""
+        idx = self.cell_at(pos)
+        if idx < 0:
+            return -1
+        lx = (pos.x() + self.horizontalScrollBar().value()) % self._cell_w
+        ly = (pos.y() + self.verticalScrollBar().value()) % self._cell_h
+        lo, hi = self.PAD, self.PAD + self._swatch_size
+        return idx if lo <= lx < hi and lo <= ly < hi else -1
+
+    # ---- painting ------------------------------------------------------------
+    def _background_color(self):
+        """Houdini's stylesheet gives scroll-area viewports a lighter background. The original grid sat
+        on a plain container QWidget, so take the color a plain (hidden) QWidget gets from the same
+        stylesheet - that's the normal dark panel color."""
+        ref = self._bg_ref
+        ref.ensurePolished()
+        return ref.palette().color(QtGui.QPalette.ColorRole.Window)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self.viewport())
+        rect = event.rect()
+        painter.fillRect(rect, self._background_color())
+        cw, ch = self._cell_w, self._cell_h
+        ox, oy = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
+        first_row, last_row = max(0, (rect.top() + oy) // ch), (rect.bottom() + oy) // ch
+        first_col, last_col = max(0, (rect.left() + ox) // cw), min(self._cols - 1, (rect.right() + ox) // cw)
+
+        fm = self.fontMetrics()
+        painter.setFont(self.font())
+        painter.setPen(self.palette().color(QtGui.QPalette.ColorRole.Text))
+        n = len(self.items)
+        for r in range(first_row, last_row + 1):
+            base = r * self._cols
+            if base >= n:
+                break
+            for c in range(first_col, last_col + 1):
+                i = base + c
+                if i >= n:
+                    break
+                cell = QtCore.QRect(c * cw - ox, r * ch - oy, cw, ch)
+                self._paint_item(painter, fm, self.items[i], cell, i in self._selected)
+        painter.end()
+
+    @staticmethod
+    def _draw_border(painter, r, w, color):
+        painter.fillRect(r.x(), r.y(), r.width(), w, color)
+        painter.fillRect(r.x(), r.bottom() - w + 1, r.width(), w, color)
+        painter.fillRect(r.x(), r.y() + w, w, r.height() - 2 * w, color)
+        painter.fillRect(r.right() - w + 1, r.y() + w, w, r.height() - 2 * w, color)
+
+    def _paint_item(self, painter, fm, item, cell, selected):
+        size = self._swatch_size
+        box = QtCore.QRect(cell.x() + self.PAD, cell.y() + self.PAD, size, size)
+        if isinstance(item, SwatchItem):
+            painter.fillRect(box, item.color)
+        else:
+            grad = QtGui.QLinearGradient(box.left(), 0, box.right() + 1, 0)
+            for pos, color in item.stops:
+                grad.setColorAt(pos, color)
+            painter.fillRect(box, QtGui.QBrush(grad))
+
+        if selected:
+            self._draw_border(painter, box, 3, self.SELECTED_COLOR)
+        else:
+            self._draw_border(painter, box, 1, self.BORDER_COLOR)
+
+        text_rect = QtCore.QRect(cell.x(), box.bottom() + 1 + self.GAP, cell.width(), fm.height())
+        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                         fm.elidedText(item.name, Qt.TextElideMode.ElideRight, size))
+
+    # ---- mouse / keyboard -------------------------------------------------------
+    def mousePressEvent(self, event):
+        self.setFocus()
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.position().toPoint()
+        row = self.row_at(pos)
+        self._press_row, self._press_pos, self._moved = row, pos, False
+        self._defer_select_row = -1
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+        if row < 0:
+            if not ctrl and not shift:
+                self.clear_selection()
+        elif ctrl and shift:
+            pass
+        elif shift:
+            if self._anchor >= 0:
+                lo, hi = sorted((self._anchor, row))
+                self._set_selection(set(range(lo, hi + 1)))
+            else:
+                self._anchor = row
+                self._set_selection({row})
+        elif ctrl:
+            rows = set(self._selected)
+            rows.symmetric_difference_update({row})
+            self._set_selection(rows)
+            if row in rows:
+                self._anchor = row
+        elif row in self._selected and len(self._selected) > 1:
+            self._defer_select_row = row        # may be the start of a multi-swatch drag
+        else:
+            self._anchor = row
+            self._set_selection({row})
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if self._press_row >= 0 and event.buttons() & Qt.MouseButton.LeftButton:
+            if (pos - self._press_pos).manhattanLength() > 5:
+                self._moved = True
+                self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        cell = self.cell_at(pos)
+        if cell != self._hover_row:
+            self._hover_row = cell
+            item = self.item_at(cell)
+            if isinstance(item, SwatchItem):
+                self.viewport().setToolTip(f"{item.name}\nRGB: {item.rgb}")
+            else:
+                self.viewport().setToolTip(item.name if item else "")
+        self.viewport().setCursor(Qt.CursorShape.OpenHandCursor if self.row_at(pos) >= 0 else Qt.CursorShape.ArrowCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        row, moved, deferred = self._press_row, self._moved, self._defer_select_row
+        self._press_row, self._moved, self._defer_select_row = -1, False, -1
+        if row < 0:
+            return
+        self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+        if moved:
+            self.drag_released.emit(row)
+        elif deferred == row:
+            self._anchor = row
+            self._set_selection({row})
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            row = self.row_at(event.position().toPoint())
+            if row >= 0:
+                self.item_double_clicked.emit(row)
+
+    def contextMenuEvent(self, event):
+        row = self.row_at(event.pos())
+        if row >= 0 and row not in self._selected:
+            self._anchor = row
+            self._set_selection({row})
+        self.context_requested.emit(event.globalPos(), row)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.clear_selection()
+        elif event.key() == Qt.Key.Key_Delete:
+            self.delete_pressed.emit()
+        else:
+            super().keyPressEvent(event)
+
+    # ---- dropping Houdini nodes (to save their ramp as a gradient) ------------------
+    def _dragged_ramp_node(self, event):
+        mime = event.mimeData()
+        if not mime.hasText():
+            return None
+        node = hou.node(mime.text())
+        return node if node and self._ramp_checker(node) else None
+
+    def dragEnterEvent(self, event):
+        if self._dragged_ramp_node(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._dragged_ramp_node(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        node = self._dragged_ramp_node(event)
+        if node:
+            self.node_dropped.emit(node)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+class NetworkOps:
+    """Houdini-side actions: create nodes / ramps from swatches and gradients."""
 
     KARMA_CONTEXTS = ('materialbuilder', 'materiallibrary', 'karmamaterialbuilder', 'subnet')
     OCTANE_CONTEXTS = ('octane_vopnet', 'octane_solaris_material_builder')
     REDSHIFT_CONTEXTS = ('redshift_vopnet', 'rs_usd_material_builder')
     MATNET_CONTEXTS = ('matnet',)
 
-    def __init__(self, name, viewer, size=100, parent=None):
-        super().__init__(parent)
-        self.name = name
-        self.viewer = viewer
-        self.setFixedSize(size, size)
-        self.setToolTip(f"{self.name}")
-        self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
-        self._drag_active = False
-        self._has_moved = False
-        self._selected = False
+    # kind -> (node type, (r, g, b) parm names) for plain color-constant nodes
+    COLOR_NODE_SPECS = {
+        'sop': ("color", ("colorr", "colorg", "colorb")),
+        'octane': ("NT_TEX_RGB", ("A_VALUEr", "A_VALUEg", "A_VALUEb")),
+        'redshift': ("redshift::RSColorConstant", ("colorr", "colorg", "colorb")),
+    }
+    # kind -> (node type, ramp parm name)
+    GRADIENT_SPECS = {
+        'sop': ("color", "ramp"),
+        'karma': ("kma_rampconst", "vramp"),
+        'octane': ("NT_TEX_GRADIENT", "octane_gradient"),
+        'redshift': ("redshift::RSRamp", "ramp"),
+        'matnet': ("rampparm", "rampcolordefault"),
+    }
 
-    def set_selected(self, selected):
-        raise NotImplementedError("Subclasses must implement set_selected")
+    def __init__(self, log):
+        self.log = log
 
-    def handle_network_drop(self, pane, pos):
-        raise NotImplementedError("Subclasses must implement handle_network_drop")
-
-    def mousePressEvent(self, event):
-        if event.button() != QtCore.Qt.MouseButton.LeftButton:
-            return
-
-        self._drag_active = True
-        self._has_moved = False
-        self._start_pos = event.pos()
-
-        modifiers = QtWidgets.QApplication.keyboardModifiers()
-
-        if modifiers == (QtCore.Qt.KeyboardModifier.ShiftModifier | QtCore.Qt.KeyboardModifier.ControlModifier):
-            pass 
-        elif modifiers == QtCore.Qt.KeyboardModifier.ShiftModifier:
-            if SelectableLabel.last_clicked and SelectableLabel.last_clicked in self.viewer.swatch_widgets:
-                start_index = self.viewer.swatch_widgets.index(SelectableLabel.last_clicked)
-                end_index = self.viewer.swatch_widgets.index(self)
-                start, end = min(start_index, end_index), max(start_index, end_index)
-                if not (modifiers & QtCore.Qt.KeyboardModifier.ControlModifier):
-                    for label in list(SelectableLabel.selected_labels):
-                        label.set_selected(False)
-                    SelectableLabel.selected_labels.clear()
-                for i in range(start, end + 1):
-                    widget = self.viewer.swatch_widgets[i]
-                    widget.set_selected(True)
-                    SelectableLabel.selected_labels.add(widget)
-        elif modifiers == QtCore.Qt.KeyboardModifier.ControlModifier:
-            self.set_selected(not self._selected)
-            if self._selected:
-                SelectableLabel.selected_labels.add(self)
-                SelectableLabel.last_clicked = self
-            else:
-                SelectableLabel.selected_labels.discard(self)
-        else:
-            for label in list(SelectableLabel.selected_labels):
-                label.set_selected(False)
-            SelectableLabel.selected_labels.clear()
-            self.set_selected(True)
-            SelectableLabel.selected_labels.add(self)
-            SelectableLabel.last_clicked = self
-
-    def mouseMoveEvent(self, event):
-        if self._drag_active and (event.pos() - self._start_pos).manhattanLength() > 5:
-            self._has_moved = True
-            self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
-
-    def mouseReleaseEvent(self, event):
-        self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
-        if not self._has_moved:
-            self._drag_active = False
-            return
-
-        self._drag_active = False
-        pane = hou.ui.paneTabUnderCursor()
-        if not isinstance(pane, hou.NetworkEditor): return
-        self.handle_network_drop(pane, pane.cursorPosition())
-
-    def contextMenuEvent(self, event):
-        self.viewer.show_context_menu(event.globalPos(), self)
-
-    def create_swatches_in_geo(self):
-        pane = next((p for p in hou.ui.paneTabs() if isinstance(p, hou.NetworkEditor)), None)
-        if not pane:
-            hou.ui.displayMessage("No active Network Editor found.")
-            return
-        try:
-            self.handle_network_drop(pane, pane.visibleBounds().center())
-        except Exception as e:
-            hou.ui.displayMessage(f"Error during node creation: {e}")
-
-class GradientLabel(SelectableLabel):
-    """A custom QLabel to display a saved Gradient ramp."""
-    def __init__(self, name, colors, viewer, size=100, parent=None):
-        super().__init__(name, viewer, size, parent)
-        self.colors = colors
-        
-        stops = []
-        for i, rgb in enumerate(colors):
-            pos = i / max(1, len(colors) - 1)
-            r, g, b = [int(c * 255) for c in rgb]
-            stops.append(f"stop:{pos} rgb({r},{g},{b})")
-        
-        grad_css = f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {', '.join(stops)});"
-        self.setStyleSheet(f"{grad_css} border: 1px solid black;")
-
-    def set_selected(self, selected):
-        self._selected = selected
-        border = "3px solid #33AADD" if self._selected else "1px solid black"
-        current_style = self.styleSheet()
-        base_style = current_style.split('border:')[0]
-        self.setStyleSheet(f"{base_style} border: {border};")
-
-    def delete_gradient(self):
-        def find_and_remove(data_dict, key_to_delete):
-            if key_to_delete in data_dict:
-                del data_dict[key_to_delete]
-                return True
-            for key, value in data_dict.items():
-                if isinstance(value, dict) and find_and_remove(value, key_to_delete):
-                    return True
-            return False
-        return find_and_remove(self.viewer.saved_gradients, self.name)
-
-    def apply_to_node(self):
-        selected_nodes = hou.selectedNodes()
-        if not selected_nodes:
-            hou.ui.displayMessage("No node selected in Houdini.")
-            return
-            
-        target_node = selected_nodes[0]
-        target_parm = None
-        
-        for name in RAMP_PARM_NAMES:
-            parm = target_node.parm(name)
-            if parm and isinstance(parm.parmTemplate(), hou.RampParmTemplate):
-                target_parm = parm
-                break
-        
-        if not target_parm:
-            hou.ui.displayMessage(f"No suitable ramp parameter found on '{target_node.name()}'.")
-            return
-
-        num = len(self.colors)
-        positions = [i / max(1, num - 1) for i in range(num)]
-        safe_colors = [tuple(c) for c in self.colors]
-        ramp = hou.Ramp([hou.rampBasis.Linear] * num, positions, safe_colors)
-        with hou.undos.group("Apply Saved Gradient"):
-            target_parm.set(ramp)
-        self.viewer.log(f"Set gradient on '{target_node.path()}.{target_parm.name()}'.")
-
-    def handle_network_drop(self, pane, pos):
-        context = pane.pwd()
-        selected_items = list(SelectableLabel.selected_labels or {self})
-        selected_gradients = [item for item in selected_items if isinstance(item, GradientLabel)]
-        
-        created_nodes = []
-        try:
-            context_type = context.type().name()
-            category = context.childTypeCategory().name()
-
-            if category == 'Sop':
-                created_nodes = self._create_sop_gradient(context, selected_gradients, pos)
-            elif context_type in self.KARMA_CONTEXTS:
-                created_nodes = self._create_karma_gradient(context, selected_gradients, pos)
-            elif context_type in self.OCTANE_CONTEXTS:
-                created_nodes = self._create_octane_gradient(context, selected_gradients, pos)
-            elif context_type in self.REDSHIFT_CONTEXTS:
-                created_nodes = self._create_redshift_gradient(context, selected_gradients, pos)
-            elif context_type in self.MATNET_CONTEXTS or category == 'Vop':
-                created_nodes = self._create_matnet_gradient(context, selected_gradients, pos)
-            else:
-                hou.ui.displayMessage(f"Unsupported network context for gradient: {context_type}")
-
-            if created_nodes:
-                created_nodes[-1].setSelected(True, clear_all_selected=True)
-                if context.childTypeCategory().name() == 'Sop':
-                    pane.setCurrentNode(created_nodes[-1])
-        except Exception as e:
-            hou.ui.displayMessage(f"Error creating gradient: {e}")
-
-    def _create_gradient(self, context, gradients, pos, node_type, parm_name):
-        colors = gradients[0].colors
-        gradient_name = self.name if len(colors) > 1 else sanitize_name(self.name)
-        node = context.createNode(node_type)
-        node.setName(gradient_name, unique_name=True)
-        node.setPosition(pos)
-        num = len(colors)
-        positions = [i / max(1, num - 1) for i in range(num)]
-        safe_colors = [tuple(c) for c in colors]
-        ramp = hou.Ramp([hou.rampBasis.Linear] * num, positions, safe_colors)
-        node.parm(parm_name).set(ramp)
-        return [node]
-
-    def _create_sop_gradient(self, context, gradients, pos):
-        node = self._create_gradient(context, gradients, pos, "color", "ramp")
-        node[0].parm("colortype").set(3)
-        return node
-    def _create_karma_gradient(self, context, gradients, pos):
-        return self._create_gradient(context, gradients, pos, "kma_rampconst", "vramp")
-    def _create_octane_gradient(self, context, gradients, pos):
-        return self._create_gradient(context, gradients, pos, "NT_TEX_GRADIENT", "octane_gradient")
-    def _create_redshift_gradient(self, context, gradients, pos):
-        return self._create_gradient(context, gradients, pos, "redshift::RSRamp", "ramp")
-    def _create_matnet_gradient(self, context, gradients, pos):
-        return self._create_gradient(context, gradients, pos, "rampparm", "rampcolordefault")
-
-class SwatchLabel(SelectableLabel):
-    """A custom QLabel to display a color swatch."""
-    def __init__(self, name, rgb, viewer, size=100, parent=None):
-            super().__init__(name, viewer, size, parent)
-            self.rgb = rgb
-            r, g, b = [int(c * 255) for c in rgb]
-            self.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid black;")
-            self.setToolTip(f"{self.name}\nRGB: {self.rgb}")
-            self._button = None
-
-    def set_selected(self, selected):
-        self._selected = selected
-        border = "3px solid #33AADD" if self._selected else "1px solid black"
-        r, g, b = [int(c * 255) for c in self.rgb]
-        self.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: {border};")
-
-    def mousePressEvent(self, event):
-        super().mousePressEvent(event)
-        self._button = event.button()
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
-            if not pane:
-                hou.ui.displayMessage("No active Network Editor found.")
-                return
-
-            context = pane.pwd()
-            pos = pane.visibleBounds().center()
-            try:
-                self.handle_network_drop(pane, pos, from_context_menu='nodes')
-            except Exception as e:
-                hou.ui.displayMessage(f"Error creating node: {e}")
+    def context_kind(self, context):
+        context_type = context.type().name()
+        category = context.childTypeCategory().name()
+        if category == 'Sop':
+            return 'sop'
+        if context_type in self.KARMA_CONTEXTS:
+            return 'karma'
+        if context_type in self.OCTANE_CONTEXTS:
+            return 'octane'
+        if context_type in self.REDSHIFT_CONTEXTS:
+            return 'redshift'
+        if context_type in self.MATNET_CONTEXTS or category == 'Vop':
+            return 'matnet'
+        if category == 'Object':
+            return 'object'
+        return None
 
     @staticmethod
-    def sort_colors_by_hue(swatches):
-        """Sorts swatches based on their hue value using standard colorsys."""
-        return sorted(swatches, key=lambda s: colorsys.rgb_to_hsv(*s.rgb)[0])
+    def _select_created(pane, context, created):
+        if created:
+            created[-1].setSelected(True, clear_all_selected=True)
+            if context.childTypeCategory().name() == 'Sop':
+                pane.setCurrentNode(created[-1])
 
-    def handle_network_drop(self, pane, pos, from_context_menu=None, context_override=None):
-        if context_override:
-            context, pos = context_override
-        else:
-            context, pos = pane.pwd(), pos if isinstance(pos, hou.Vector2) else pane.cursorPosition()
-
-        if from_context_menu:
-            swatches_to_create = list(SelectableLabel.selected_labels or {self})
-        else:
-            if self._button == QtCore.Qt.MouseButton.MiddleButton:
-                if self in SelectableLabel.selected_labels:
-                    swatches_to_create = list(SelectableLabel.selected_labels)
-                else:
-                    swatches_to_create = [self]
-            else:
-                swatches_to_create = list(SelectableLabel.selected_labels or {self})
-        
-        if not swatches_to_create: return []
-
-        created_nodes = []
+    # ---- swatches -> nodes -------------------------------------------------
+    def create_swatches(self, pane, pos, swatches):
+        if not swatches:
+            return
+        context = pane.pwd()
+        if not isinstance(pos, hou.Vector2):
+            pos = pane.cursorPosition()
         try:
-            context_type = context.type().name()
-            category = context.childTypeCategory().name()
-
-            if category == 'Sop':
-                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_sop_nodes, self._create_sop_gradient)
-            elif context_type in self.KARMA_CONTEXTS:
-                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_karma_nodes, self._create_karma_gradient)
-            elif context_type in self.OCTANE_CONTEXTS:
-                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_octane_nodes, self._create_octane_gradient)
-            elif context_type in self.REDSHIFT_CONTEXTS:
-                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_redshift_nodes, self._create_redshift_gradient)
-            elif context_type in self.MATNET_CONTEXTS or category == 'Vop':
-                created_nodes = self._handle_node_or_gradient_creation(context, swatches_to_create, pos, self._create_matnet_nodes, self._create_matnet_gradient)
-            elif category == 'Object':
-                created_nodes = self._create_object_nodes(context, swatches_to_create, pos)
+            kind = self.context_kind(context)
+            if kind is None:
+                hou.ui.displayMessage(f"Unsupported network context for drag & drop: {context.type().name()}")
+                return
+            if kind == 'object':
+                created = self._create_object_nodes(context, swatches, pos)
             else:
-                hou.ui.displayMessage(f"Unsupported network context for drag & drop: {context_type}")
-
-            if created_nodes:
-                created_nodes[-1].setSelected(True, clear_all_selected=True)
-                if context.childTypeCategory().name() == 'Sop' and not context_override:
-                    pane.setCurrentNode(created_nodes[-1])
+                created = self._nodes_or_gradient(context, kind, swatches, pos)
+            self._select_created(pane, context, created)
         except Exception as e:
             hou.ui.displayMessage(f"Error creating node(s): {e}")
-        return created_nodes
 
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-
-    def _handle_node_or_gradient_creation(self, context, selected, pos, node_creation_func, gradient_creation_func):
-        if len(selected) > 1:
+    def _nodes_or_gradient(self, context, kind, swatches, pos):
+        if len(swatches) > 1:
             choice = hou.ui.displayMessage("Create individual nodes or a gradient?", buttons=["Nodes", "Gradient", "Cancel"], default_choice=0, close_choice=2)
-            if choice == 0: return node_creation_func(context, selected, pos)
-            elif choice == 1:
+            if choice == 1:
                 sort_choice = hou.ui.displayMessage("Sort swatches by hue?", buttons=["Yes", "No", "Cancel"], default_choice=0, close_choice=2)
-                if sort_choice == 2: return []
-                swatches_to_use = self.sort_colors_by_hue(selected) if sort_choice == 0 else selected
-                return gradient_creation_func(context, swatches_to_use, pos)
-            else: return []
-        else:
-            return node_creation_func(context, selected, pos)
+                if sort_choice == 2:
+                    return []
+                use = sort_colors_by_hue(swatches) if sort_choice == 0 else swatches
+                return self._create_gradient_node(context, kind, [s.rgb for s in use], pos, "swatch_gradient")
+            if choice != 0:
+                return []
+        return self._create_color_nodes(context, kind, swatches, pos)
 
-    def _create_nodes(self, context, selected, pos, node_type, parm_names):
-        created = []
+    def _create_color_nodes(self, context, kind, swatches, pos):
         spacing = hou.Vector2(0, -1.0)
-        for i, swatch in enumerate(selected):
-            node = context.createNode(node_type)
-            node.setName(sanitize_name(swatch.name), unique_name=True)
-            for j, parm in enumerate(parm_names):
-                node.parm(parm).set(swatch.rgb[j])
+        created = []
+        for i, swatch in enumerate(swatches):
+            node = self._make_color_node(context, kind, swatch)
             node.setPosition(pos + spacing * i)
             created.append(node)
+        if kind == 'sop':
+            for a, b in zip(created[:-1], created[1:]):
+                b.setNextInput(a)
         return created
 
-    def _create_sop_nodes(self, context, selected, pos):
-        nodes = self._create_nodes(context, selected, pos, "color", ("colorr", "colorg", "colorb"))
-        for a, b in zip(nodes[:-1], nodes[1:]):
-            b.setNextInput(a)
-        return nodes
-    def _create_karma_nodes(self, context, selected, pos):
-        created = []
-        spacing = hou.Vector2(0, -1.0)
-        for i, swatch in enumerate(selected):
+    def _make_color_node(self, context, kind, swatch):
+        name = sanitize_name(swatch.name)
+        if kind == 'karma':
             node = context.createNode("mtlxconstant")
-            node.setName(sanitize_name(swatch.name), unique_name=True)
+            node.setName(name, unique_name=True)
             node.parm("signature").set("color3")
-            node.parm("value_color3r").set(swatch.rgb[0])
-            node.parm("value_color3g").set(swatch.rgb[1])
-            node.parm("value_color3b").set(swatch.rgb[2])
-            node.setPosition(pos + spacing * i)
-            created.append(node)
-        return created
-    def _create_octane_nodes(self, context, selected, pos):
-        return self._create_nodes(context, selected, pos, "NT_TEX_RGB", ("A_VALUEr", "A_VALUEg", "A_VALUEb"))
-    def _create_redshift_nodes(self, context, selected, pos):
-        return self._create_nodes(context, selected, pos, "redshift::RSColorConstant", ("colorr", "colorg", "colorb"))
-    def _create_matnet_nodes(self, context, selected, pos):
-        created = []
-        spacing = hou.Vector2(0, -1.0)
-        for i, swatch in enumerate(selected):
+            parm_names = ("value_color3r", "value_color3g", "value_color3b")
+        elif kind == 'matnet':
             node = context.createNode("constant")
-            node.setName(sanitize_name(swatch.name), unique_name=True)
+            node.setName(name, unique_name=True)
             node.parm("consttype").set("color")
-            node.parm("colordefr").set(swatch.rgb[0])
-            node.parm("colordefg").set(swatch.rgb[1])
-            node.parm("colordefb").set(swatch.rgb[2])
-            node.setPosition(pos + spacing * i)
-            created.append(node)
-        return created
-    def _create_object_nodes(self, context, selected, pos):
+            parm_names = ("colordefr", "colordefg", "colordefb")
+        else:
+            node_type, parm_names = self.COLOR_NODE_SPECS[kind]
+            node = context.createNode(node_type)
+            node.setName(name, unique_name=True)
+        for parm_name, value in zip(parm_names, swatch.rgb):
+            node.parm(parm_name).set(value)
+        return node
+
+    def _create_object_nodes(self, context, swatches, pos):
         created = []
         spacing = hou.Vector2(0, -1.0)
-        for i, swatch in enumerate(selected):
+        for i, swatch in enumerate(swatches):
             geo = context.createNode("geo", sanitize_name(swatch.name))
-            if file_node := geo.node("file1"): file_node.destroy()
+            if file_node := geo.node("file1"):
+                file_node.destroy()
             color = geo.createNode("color", sanitize_name(swatch.name))
             color.parmTuple("color").set(swatch.rgb)
-            color.moveToGoodPosition(); color.setDisplayFlag(True); color.setRenderFlag(True)
+            color.moveToGoodPosition()
+            color.setDisplayFlag(True)
+            color.setRenderFlag(True)
             geo.setPosition(pos + spacing * i)
             created.append(geo)
         return created
 
-    def _create_gradient(self, context, selected, pos, node_type, parm_name):
+    # ---- gradients -> nodes ------------------------------------------------
+    def _create_gradient_node(self, context, kind, colors, pos, name):
+        node_type, parm_name = self.GRADIENT_SPECS[kind]
         node = context.createNode(node_type)
-        node.setName("swatch_gradient", unique_name=True)
+        node.setName(name, unique_name=True)
         node.setPosition(pos)
-        num = len(selected)
-        positions = [i / max(1, num - 1) for i in range(num)]
-        colors = [s.rgb for s in selected]
-        ramp = hou.Ramp([hou.rampBasis.Linear] * num, positions, colors)
-        node.parm(parm_name).set(ramp)
+        node.parm(parm_name).set(make_ramp(colors))
+        if kind == 'sop':
+            node.parm("colortype").set(3)
         return [node]
 
-    def _create_sop_gradient(self, context, selected, pos):
-        node = self._create_gradient(context, selected, pos, "color", "ramp")
-        node[0].parm("colortype").set(3)
-        return node
-    def _create_karma_gradient(self, context, selected, pos):
-        return self._create_gradient(context, selected, pos, "kma_rampconst", "vramp")
-    def _create_octane_gradient(self, context, selected, pos):
-        return self._create_gradient(context, selected, pos, "NT_TEX_GRADIENT", "octane_gradient")
-    def _create_redshift_gradient(self, context, selected, pos):
-        return self._create_gradient(context, selected, pos, "redshift::RSRamp", "ramp")
-    def _create_matnet_gradient(self, context, selected, pos):
-        return self._create_gradient(context, selected, pos, "rampparm", "rampcolordefault")
+    def create_gradient(self, pane, pos, gradient):
+        context = pane.pwd()
+        try:
+            kind = self.context_kind(context)
+            if kind is None or kind == 'object':
+                hou.ui.displayMessage(f"Unsupported network context for gradient: {context.type().name()}")
+                return
+            created = self._create_gradient_node(context, kind, gradient.colors, pos, sanitize_name(gradient.name))
+            self._select_created(pane, context, created)
+        except Exception as e:
+            hou.ui.displayMessage(f"Error creating gradient: {e}")
 
-    def create_color_in_selected_node(self):
-        selected_swatches = list(SelectableLabel.selected_labels or {self})
-        if not selected_swatches: return
+    def apply_gradient_to_selected_node(self, gradient):
+        selected_nodes = hou.selectedNodes()
+        if not selected_nodes:
+            hou.ui.displayMessage("No node selected in Houdini.")
+            return
+        target_node = selected_nodes[0]
+        target_parm = find_ramp_parm(target_node)
+        if not target_parm:
+            hou.ui.displayMessage(f"No suitable ramp parameter found on '{target_node.name()}'.")
+            return
+        with hou.undos.group("Apply Saved Gradient"):
+            target_parm.set(make_ramp(gradient.colors))
+        self.log(f"Set gradient on '{target_node.path()}.{target_parm.name()}'.")
 
+    # ---- write into the currently selected node ---------------------------
+    def set_color_in_selected_node(self, swatches):
+        if not swatches:
+            return
         selected_nodes = hou.selectedNodes()
         if not selected_nodes:
             hou.ui.displayMessage("No node selected in Houdini.", title="Selection Error")
             return
-        
-        target_node = selected_nodes[0]
-
+        node = selected_nodes[0]
         with hou.undos.group("Set Color from Swatch Panel"):
-            if len(selected_swatches) > 1:
-                self.create_gradient_in_node(target_node, selected_swatches)
-            elif len(selected_swatches) == 1:
-                self.create_single_color_in_node(target_node, selected_swatches[0])
+            if len(swatches) > 1:
+                self._set_gradient_on_node(node, swatches)
+            else:
+                self._set_single_color_on_node(node, swatches[0])
 
-    def create_gradient_in_node(self, node, swatches):
-        target_parm = None
-        for name in RAMP_PARM_NAMES:
-            parm = node.parm(name)
-            if parm and isinstance(parm.parmTemplate(), hou.RampParmTemplate):
-                target_parm = parm
-                break
-        
+    def _set_gradient_on_node(self, node, swatches):
+        target_parm = find_ramp_parm(node)
         if not target_parm:
             hou.ui.displayMessage(f"No suitable ramp parameter found on '{node.name()}'.", title="Parameter Not Found")
             return
-
         sort_choice = hou.ui.displayMessage("Sort swatches by hue for the gradient?", buttons=["Yes", "No", "Cancel"], default_choice=0, close_choice=2)
-        if sort_choice == 2: return
-        swatches_to_use = self.sort_colors_by_hue(swatches) if sort_choice == 0 else swatches
+        if sort_choice == 2:
+            return
+        use = sort_colors_by_hue(swatches) if sort_choice == 0 else swatches
+        target_parm.set(make_ramp([s.rgb for s in use]))
+        self.log(f"Set gradient on '{node.path()}.{target_parm.name()}'.")
 
-        num = len(swatches_to_use)
-        positions = [i / max(1, num - 1) for i in range(num)]
-        colors = [s.rgb for s in swatches_to_use]
-        ramp = hou.Ramp([hou.rampBasis.Linear] * num, positions, colors)
-        target_parm.set(ramp)
-        self.viewer.log(f"Set gradient on '{node.path()}.{target_parm.name()}'.")
-
-    def create_single_color_in_node(self, node, swatch):
+    def _set_single_color_on_node(self, node, swatch):
         for parm_name in COLOR_PARM_NAMES:
             parm = node.parmTuple(parm_name)
             if parm and parm.parmTemplate().numComponents() == 3:
                 try:
-                    node.parmTuple(parm_name).set(swatch.rgb)
-                    self.viewer.log(f"Set color on '{node.path()}.{parm_name}'.")
-                    return 
+                    parm.set(swatch.rgb)
+                    self.log(f"Set color on '{node.path()}.{parm_name}'.")
+                    return
                 except hou.OperationFailed:
-                    continue 
+                    continue
         hou.ui.displayMessage(f"No suitable color parameter found on '{node.name()}'.", title="Parameter Not Found")
 
-class GridContainer(QtWidgets.QWidget):
-    """A QWidget subclass to specifically handle mouse events for the grid background."""
-    node_dropped = QtCore.Signal(hou.Node)
-
-    def __init__(self, viewer, parent=None):
-        super().__init__(parent)
-        self.viewer = viewer
-        self.setAcceptDrops(True)
-
-    def mousePressEvent(self, event):
-        self.viewer.handle_background_click(event)
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasText():
-            node_path = event.mimeData().text()
-            node = hou.node(node_path)
-            if node and self.viewer.get_ramp_parm_from_node(node):
-                event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasText():
-            node_path = event.mimeData().text()
-            node = hou.node(node_path)
-            if node and self.viewer.get_ramp_parm_from_node(node):
-                event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event):
-        if event.mimeData().hasText():
-            node_path = event.mimeData().text()
-            node = hou.node(node_path)
-            if node and self.viewer.get_ramp_parm_from_node(node):
-                self.node_dropped.emit(node)
-                event.acceptProposedAction()
-                return
-        event.ignore()
 
 class SwatchViewer(QtWidgets.QWidget):
     """The main widget for the ASE Swatch Viewer."""
@@ -594,16 +748,12 @@ class SwatchViewer(QtWidgets.QWidget):
         self.saved_gradients = config.get("saved_gradients", {})
 
         self.swatches = []
-        self.swatch_widgets = []
         self.current_swatch_size = 100
         self.size_buttons = {}
         self.current_view_mode = 'swatches' 
         self.current_gradient_dict = {}
-        
-        self._resize_timer = QtCore.QTimer(self)
-        self._resize_timer.setSingleShot(True)
-        self._resize_timer.timeout.connect(self._delayed_relayout)
-
+        self.ops = NetworkOps(self.log)
+        self._ase_cache = OrderedDict()   # path -> ((mtime_ns, size), [SwatchItem])
         self._init_ui()
         self.populate_folder_tree()
         self.populate_path_dropdown()
@@ -676,9 +826,9 @@ class SwatchViewer(QtWidgets.QWidget):
         self.btn_large = QtWidgets.QPushButton()
         
         self.size_buttons = {50: self.btn_small, 100: self.btn_med, 150: self.btn_large}
-        self.btn_small.setIcon(hou.qt.Icon("BUTTONS_grid_small"))
-        self.btn_med.setIcon(hou.qt.Icon("BUTTONS_grid_medium"))
-        self.btn_large.setIcon(hou.qt.Icon("BUTTONS_grid_large"))
+        self.btn_small.setIcon(get_icon("BUTTONS_grid_small"))
+        self.btn_med.setIcon(get_icon("BUTTONS_grid_medium"))
+        self.btn_large.setIcon(get_icon("BUTTONS_grid_large"))
 
         self.btn_small.setToolTip("small grid size")
         self.btn_med.setToolTip("medium grid size")
@@ -701,24 +851,12 @@ class SwatchViewer(QtWidgets.QWidget):
         self.folder_tree.folder_dropped.connect(self.add_custom_folder)
         self.folder_tree.delete_requested.connect(self.handle_tree_delete)
 
-        self.scroll_area = QtWidgets.QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        
-        self.container = GridContainer(self)
-        self.grid = QtWidgets.QGridLayout(self.container)
-        self.grid.setContentsMargins(10, 10, 10, 10)
-        self.grid.setSpacing(6)
-        self.grid.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
-        
-        self.scroll_area.setWidget(self.container)
-        self.container.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
-        self.container.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        
+        self.view = SwatchGridView(self.get_ramp_parm_from_node)
+
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.splitter.addWidget(self.folder_tree)
-        self.splitter.addWidget(self.scroll_area)
-        self.splitter.setSizes([200, 600]) 
+        self.splitter.addWidget(self.view)
+        self.splitter.setSizes([200, 600])
         self.folder_tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         lib_layout.addWidget(self.splitter, 1)
 
@@ -757,8 +895,11 @@ class SwatchViewer(QtWidgets.QWidget):
         self.set_grid_size(self.current_swatch_size, force_update=True)
         
         self.btn_clear_console.clicked.connect(self.console.clear)
-        self.container.customContextMenuRequested.connect(lambda pos: self.show_context_menu(self.container.mapToGlobal(pos)))
-        self.container.node_dropped.connect(self.save_ramp_from_node)
+        self.view.context_requested.connect(self.show_context_menu)
+        self.view.drag_released.connect(self.on_drag_released)
+        self.view.item_double_clicked.connect(self.on_item_double_clicked)
+        self.view.delete_pressed.connect(self.delete_selected_gradients)
+        self.view.node_dropped.connect(self.save_ramp_from_node)
         self.folder_tree.customContextMenuRequested.connect(self.show_folder_tree_context_menu)
 
     def select_item_by_path(self, path):
@@ -777,11 +918,7 @@ class SwatchViewer(QtWidgets.QWidget):
         self.folder_tree.setCurrentItem(current_item)
 
     def get_ramp_parm_from_node(self, node):
-        for name in RAMP_PARM_NAMES:
-            parm = node.parm(name)
-            if parm and isinstance(parm.parmTemplate(), hou.RampParmTemplate):
-                return parm
-        return None
+        return find_ramp_parm(node)
 
     def save_ramp_from_node(self, node):
         parm = self.get_ramp_parm_from_node(node)
@@ -830,69 +967,90 @@ class SwatchViewer(QtWidgets.QWidget):
                 return
             iterator += 1
 
-    def handle_background_click(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            if SelectableLabel.selected_labels:
-                for label in list(SelectableLabel.selected_labels):
-                    label.set_selected(False)
-                SelectableLabel.selected_labels.clear()
-                SelectableLabel.last_clicked = None
-                self.log("Selection cleared.")
+    # ---- selection / actions ------------------------------------------------
+    def selected_items(self):
+        """Selected items in model (display) order."""
+        return self.view.selected_items()
 
-    def show_context_menu(self, global_pos, clicked_swatch=None):
+    def _item_at_row(self, row):
+        return self.view.item_at(row)
+
+    def _create_in_pane(self, pane, pos, primary):
+        if isinstance(primary, GradientItem):
+            self.ops.create_gradient(pane, pos, primary)
+        else:
+            selected = [i for i in self.selected_items() if isinstance(i, SwatchItem)]
+            self.ops.create_swatches(pane, pos, selected or [primary])
+
+    def create_in_network(self, item):
+        pane = find_network_editor()
+        if not pane:
+            hou.ui.displayMessage("No active Network Editor found.")
+            return
+        self._create_in_pane(pane, pane.visibleBounds().center(), item)
+
+    def on_drag_released(self, row):
+        pane = hou.ui.paneTabUnderCursor()
+        if not isinstance(pane, hou.NetworkEditor):
+            return
+        item = self._item_at_row(row)
+        if item is not None:
+            self._create_in_pane(pane, pane.cursorPosition(), item)
+
+    def on_item_double_clicked(self, row):
+        item = self._item_at_row(row)
+        if isinstance(item, SwatchItem):
+            self.create_in_network(item)
+
+    def show_context_menu(self, global_pos, row=-1):
+        selected = self.selected_items()
+        active = self._item_at_row(row) or (selected[0] if selected else None)
+        if active is None:
+            return
+
         menu = QtWidgets.QMenu(self)
+        menu.addAction("Create Node(s) in Network...", lambda: self.create_in_network(active))
+        menu.addSeparator()
 
-        active_swatch = clicked_swatch
-        if not active_swatch:
-            if SelectableLabel.selected_labels:
-                active_swatch = next(iter(SelectableLabel.selected_labels))
-            elif self.swatch_widgets and isinstance(self.swatch_widgets[0], SwatchLabel):
-                active_swatch = self.swatch_widgets[0]
+        if isinstance(active, SwatchItem):
+            menu.addAction("Create Color in Selected Node",
+                           lambda: self.ops.set_color_in_selected_node(
+                               [i for i in self.selected_items() if isinstance(i, SwatchItem)] or [active]))
+        else:
+            menu.addAction("Apply to Selected Node", lambda: self.ops.apply_gradient_to_selected_node(active))
 
-        if active_swatch:
-            menu.addAction("Create Node(s) in Network...", active_swatch.create_swatches_in_geo)
+        selected_gradients = [i for i in selected if isinstance(i, GradientItem)]
+        if isinstance(active, GradientItem) or selected_gradients:
             menu.addSeparator()
-
-            if isinstance(active_swatch, SwatchLabel):
-                menu.addAction("Create Color in Selected Node", active_swatch.create_color_in_selected_node)
-            elif isinstance(active_swatch, GradientLabel):
-                menu.addAction("Apply to Selected Node", active_swatch.apply_to_node)
-
-            selected_gradients = [label for label in SelectableLabel.selected_labels if isinstance(label, GradientLabel)]
-            if isinstance(active_swatch, GradientLabel) or selected_gradients:
-                menu.addSeparator()
-                num_to_delete = len(selected_gradients)
-                if num_to_delete > 1:
-                    del_action = menu.addAction(f"Delete {num_to_delete} Gradients")
-                else:
-                    del_action = menu.addAction("Delete Gradient")
-                del_action.triggered.connect(self.delete_selected_gradients)
-                
-            menu.exec(global_pos)
+            num_to_delete = len(selected_gradients)
+            menu.addAction(f"Delete {num_to_delete} Gradients" if num_to_delete > 1 else "Delete Gradient",
+                           self.delete_selected_gradients)
+        menu.exec(global_pos)
 
     def delete_selected_gradients(self):
-        selected_gradients = [label for label in SelectableLabel.selected_labels if isinstance(label, GradientLabel)]
+        selected_gradients = [i for i in self.selected_items() if isinstance(i, GradientItem)]
         if not selected_gradients:
             return
 
         deleted_count = 0
-        for grad_label in selected_gradients:
-            if grad_label.delete_gradient():
+        for grad in selected_gradients:
+            # current_gradient_dict is the live nested dict inside saved_gradients
+            if self.current_gradient_dict.pop(grad.name, None) is not None:
                 deleted_count += 1
-        
+
         if deleted_count > 0:
             self.save_config_state()
             self.log(f"Deleted {deleted_count} gradient(s).")
             self.populate_grid()
 
     def save_selected_as_gradient(self):
-        selected = list(SelectableLabel.selected_labels)
+        selected = [i for i in self.selected_items() if isinstance(i, SwatchItem)]
         if len(selected) < 2: return
 
         choice = hou.ui.displayMessage("Sort swatches by hue?", buttons=["Yes", "No", "Cancel"], default_choice=0, close_choice=2)
         if choice == 2: return
         if choice == 0:
-            selected = SwatchLabel.sort_colors_by_hue(selected)
+            selected = sort_colors_by_hue(selected)
 
         name_tuple = hou.ui.readInput("Enter name for new gradient:", buttons=("OK", "Cancel"), title="Save Gradient")
         if name_tuple[0] == 1 or not name_tuple[1].strip(): return
@@ -944,9 +1102,9 @@ class SwatchViewer(QtWidgets.QWidget):
         grad_root_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "GRADIENTS_VIRTUAL_PATH")
         grad_root_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, "virtual_folder")
         try:
-            grad_root_item.setIcon(0, hou.qt.Icon("VOP_ramp"))
+            grad_root_item.setIcon(0, get_icon("VOP_ramp"))
         except hou.OperationFailed:
-            grad_root_item.setIcon(0, hou.qt.Icon("SOP_color"))
+            grad_root_item.setIcon(0, get_icon("SOP_color"))
 
         def build_gradient_tree(parent_item, gradients_dict):
             for name, value in sorted(gradients_dict.items()):
@@ -960,7 +1118,7 @@ class SwatchViewer(QtWidgets.QWidget):
             default_item = QtWidgets.QTreeWidgetItem(self.folder_tree, ["Default Library"])
             default_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, self.default_path)
             default_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, "folder")
-            default_item.setIcon(0, hou.qt.Icon("BUTTONS_folder"))
+            default_item.setIcon(0, get_icon("BUTTONS_folder"))
             default_item.setExpanded(True)
             self._build_tree_recursive(self.default_path, default_item)
 
@@ -972,44 +1130,48 @@ class SwatchViewer(QtWidgets.QWidget):
                     item = QtWidgets.QTreeWidgetItem(custom_root, [os.path.basename(folder)])
                     item.setData(0, QtCore.Qt.ItemDataRole.UserRole, folder)
                     item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, "folder")
-                    item.setIcon(0, hou.qt.Icon("BUTTONS_folder"))
+                    item.setIcon(0, get_icon("BUTTONS_folder"))
                     self._build_tree_recursive(folder, item)
 
     def _add_gradient_folder_item(self, parent_item, name):
         folder_item = QtWidgets.QTreeWidgetItem(parent_item, [name])
         folder_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, name)
         folder_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, "gradient_folder")
-        folder_item.setIcon(0, hou.qt.Icon("BUTTONS_folder"))
+        folder_item.setIcon(0, get_icon("BUTTONS_folder"))
         return folder_item
 
     def _build_tree_recursive(self, path, parent_item):
+        # scandir: DirEntry.is_dir() reuses the directory listing (no extra stat per entry)
         try:
-            items = sorted(os.listdir(path))
-            folders = []
-            ase_files = []
-            
-            for item in items:
-                full_path = os.path.join(path, item)
-                if os.path.isdir(full_path):
-                    folders.append((item, full_path))
-                elif item.lower().endswith(".ase"):
-                    ase_files.append((item, full_path))
-            
-            for item_name, full_path in folders:
-                tree_item = QtWidgets.QTreeWidgetItem(parent_item, [item_name])
-                tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, full_path)
-                tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, "folder")
-                tree_item.setIcon(0, hou.qt.Icon("BUTTONS_folder"))
-                self._build_tree_recursive(full_path, tree_item)
-                
-            for item_name, full_path in ase_files:
-                tree_item = QtWidgets.QTreeWidgetItem(parent_item, [item_name])
-                tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, full_path)
-                tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, "file")
-                tree_item.setIcon(0, hou.qt.Icon("SOP_color")) 
-                
+            with os.scandir(path) as it:
+                entries = sorted(it, key=lambda e: e.name)
         except OSError:
-            pass
+            return
+
+        folders, ase_files = [], []
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    folders.append(entry)
+                elif entry.name.lower().endswith(".ase"):
+                    ase_files.append(entry)
+            except OSError:
+                continue
+
+        folder_icon = get_icon("BUTTONS_folder")
+        for entry in folders:
+            tree_item = QtWidgets.QTreeWidgetItem(parent_item, [entry.name])
+            tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, entry.path)
+            tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, "folder")
+            tree_item.setIcon(0, folder_icon)
+            self._build_tree_recursive(entry.path, tree_item)
+
+        file_icon = get_icon("SOP_color")
+        for entry in ase_files:
+            tree_item = QtWidgets.QTreeWidgetItem(parent_item, [entry.name])
+            tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, entry.path)
+            tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, "file")
+            tree_item.setIcon(0, file_icon)
 
     def on_tree_selection(self):
         selected = self.folder_tree.selectedItems()
@@ -1106,19 +1268,7 @@ class SwatchViewer(QtWidgets.QWidget):
         for s, btn in self.size_buttons.items():
             btn.setChecked(s == size)
             btn.setStyleSheet("background-color: #444444;" if s != size else "background-color: none;")
-        self.populate_grid()
-
-    def clear_grid(self):
-            SelectableLabel.selected_labels.clear()
-            SelectableLabel.last_clicked = None
-            self.swatch_widgets = []
-            
-            while self.grid.count():
-                if item := self.grid.takeAt(0):
-                    if widget := item.widget():
-                        widget.hide()
-                        widget.setParent(None)
-                        widget.deleteLater()
+        self.apply_grid_size()
 
     def on_path_edit_finished(self):
         new_path = self.path_dropdown.currentText().strip()
@@ -1132,9 +1282,11 @@ class SwatchViewer(QtWidgets.QWidget):
     def load_selected_ase(self, filepath):
         if os.path.exists(filepath):
             self.log(f"Loading ASE file: {filepath}")
+            start = time.perf_counter()
             self.swatches = self.parse_ase(filepath)
             self.populate_grid()
-            self.log(f"Loaded {len(self.swatches)} swatches.")
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            self.log(f"Loaded {len(self.swatches)} swatches in {elapsed_ms:.0f} ms.")
 
     def populate_path_dropdown(self):
             self.path_dropdown.blockSignals(True)
@@ -1160,112 +1312,50 @@ class SwatchViewer(QtWidgets.QWidget):
                 
             self.path_dropdown.blockSignals(False)
 
+    def apply_grid_size(self):
+        """Resize the cells. Only changes the layout metrics - nothing is rebuilt."""
+        self.view.set_swatch_size(self.current_swatch_size)
+
     def populate_grid(self):
-        self.clear_grid()
-        item_width = self.current_swatch_size + 10 
-        viewport_width = self.scroll_area.viewport().width()
-        
-        max_cols = max(1, math.ceil(viewport_width / max(1, item_width)))
-
+        """Hand the current items to the model. No widgets are created."""
         if self.current_view_mode == 'swatches':
-            if not self.swatches: return
-            for i, (name, rgb) in enumerate(self.swatches):
-                row, col = divmod(i, max_cols)
-                swatch = SwatchLabel(name, rgb, self, size=self.current_swatch_size)
-                self.swatch_widgets.append(swatch)
-
-                name_label = QtWidgets.QLabel(name)
-                name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-                name_label.setToolTip(name)
-                name_label.setFixedWidth(self.current_swatch_size)
-                name_label.setStyleSheet("text-overflow: ellipsis; white-space: nowrap; overflow: hidden;")
-
-                wrapper = QtWidgets.QWidget()
-                vbox = QtWidgets.QVBoxLayout(wrapper)
-                vbox.setContentsMargins(0, 0, 0, 0)
-                vbox.setSpacing(4)
-                vbox.addWidget(swatch, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
-                vbox.addWidget(name_label, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
-                wrapper.setContentsMargins(0, 0, 0, 10) 
-                self.grid.addWidget(wrapper, row, col)
-                
-        elif self.current_view_mode == 'gradients':
-            items_to_display = []
-            for name, value in self.current_gradient_dict.items():
-                if isinstance(value, list):
-                    items_to_display.append((name, value))
-
-            for i, (name, colors) in enumerate(items_to_display):
-                row, col = divmod(i, max_cols)
-                grad_widget = GradientLabel(name, colors, self, size=self.current_swatch_size)
-                self.swatch_widgets.append(grad_widget)
-
-                name_label = QtWidgets.QLabel(name)
-                name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-                name_label.setToolTip(name)
-                name_label.setFixedWidth(self.current_swatch_size)
-                name_label.setStyleSheet("text-overflow: ellipsis; white-space: nowrap; overflow: hidden;")
-
-                wrapper = QtWidgets.QWidget()
-                vbox = QtWidgets.QVBoxLayout(wrapper)
-                vbox.setContentsMargins(0, 0, 0, 0)
-                vbox.setSpacing(4)
-                vbox.addWidget(grad_widget, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
-                vbox.addWidget(name_label, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
-                wrapper.setContentsMargins(0, 0, 0, 10) 
-                self.grid.addWidget(wrapper, row, col)
-
-        self.grid.setRowStretch(self.grid.rowCount(), 1)
+            items = self.swatches
+        else:
+            items = [GradientItem(name, value)
+                     for name, value in self.current_gradient_dict.items()
+                     if isinstance(value, list)]
+        self.view.set_items(items)   # also clears the selection
 
     def keyPressEvent(self, event):
-            if event.key() == Qt.Key.Key_Escape:
-                for label in list(SelectableLabel.selected_labels):
-                    label.set_selected(False)
-                SelectableLabel.selected_labels.clear()
-                SelectableLabel.last_clicked = None
-            elif event.key() == Qt.Key.Key_Delete:
-                self.delete_selected_gradients()
-            else:
-                super().keyPressEvent(event)
-                
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._resize_timer.start(100)
-
-    def _delayed_relayout(self):
-        self.populate_grid()
+        if event.key() == Qt.Key.Key_Escape:
+            self.view.clear_selection()
+        elif event.key() == Qt.Key.Key_Delete:
+            self.delete_selected_gradients()
+        else:
+            super().keyPressEvent(event)
 
     def parse_ase(self, path):
+        """Parse an ASE file into SwatchItems. Results are cached per (mtime, size)."""
         try:
-            with open(path, "rb") as f: data = f.read()
-        except IOError as e:
-            self.log(f"Error reading file: {e}"); return []
+            st = os.stat(path)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
 
-        if data[0:4] != b"ASEF":
-            self.log("Invalid ASE file header."); return []
+        cached = self._ase_cache.get(path)
+        if cached is not None and stamp is not None and cached[0] == stamp:
+            self._ase_cache.move_to_end(path)
+            return cached[1]
 
-        swatches, pos = [], 12
-        try:
-            while pos < len(data):
-                block_type = struct.unpack(">H", data[pos:pos+2])[0]; pos += 2
-                block_len = struct.unpack(">I", data[pos:pos+4])[0]; pos += 4
-                block_end = pos + block_len
+        raw, error = read_ase(path)
+        if error:
+            self.log(error)
+        swatches = [SwatchItem(name, rgb) for name, rgb in raw]
 
-                if block_type == 0xc001: pos = block_end; continue
-                if block_type == 0x0001:
-                    name_len = struct.unpack(">H", data[pos:pos+2])[0]; pos += 2
-                    name = data[pos:pos + (name_len - 1) * 2].decode('utf_16_be'); pos += name_len * 2
-                    model = data[pos:pos+4].decode("ascii").strip(); pos += 4
-
-                    if model == "RGB":
-                        r,g,b = [struct.unpack(">f", data[pos+i*4:pos+(i+1)*4])[0] for i in range(3)]
-                        swatches.append((name, (r, g, b)))
-                    elif model == "CMYK":
-                        c,m,y,k = [struct.unpack(">f", data[pos+i*4:pos+(i+1)*4])[0] for i in range(4)]
-                        swatches.append((name, cmyk_to_rgb(c, m, y, k)))
-                pos = block_end
-        except (struct.error, IndexError, UnicodeDecodeError) as e:
-            self.log(f"Error parsing ASE block: {e}")
+        if stamp is not None and not error:
+            self._ase_cache[path] = (stamp, swatches)
+            while len(self._ase_cache) > 32:
+                self._ase_cache.popitem(last=False)
         return swatches
 
 def onCreateInterface():
