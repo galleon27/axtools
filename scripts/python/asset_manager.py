@@ -10,7 +10,6 @@ and presents a UI to view and relink their file paths, natively inheriting Houdi
 import hou
 import os
 import re
-import functools
 from PySide6 import QtWidgets, QtCore, QtGui
 
 # ---------------------------------------------------------------------------
@@ -33,6 +32,8 @@ NODE_PARAM_MAP = {
     # MaterialX / MTLX (inside Material networks)
     "mtlximage":        ["file"],
     "mtlxtiledimage":   ["file"],
+    "octane::NT_TEX_FLOATIMAGE":["A_FILENAME"],
+    "octane::NT_TEX_IMAGE":["A_FILENAME"],
 
     # COPs / texture nodes
     "file::2.0":        ["filename"],
@@ -229,17 +230,26 @@ def _make_entry(node, parm, raw, resolved):
     else:
         exists = os.path.exists(expanded) if expanded else False
         
+    node_name = node.name()
+    node_type = node.type().name()
+    parm_name = parm.name()
+
+    # Precompute the lowercase search blob once, at scan time, instead of
+    # rebuilding it (join + lower over 5 strings) on every filter keystroke.
+    search_blob = " ".join([node_name, node_type, parm_name, raw, resolved]).lower()
+
     return {
-        "node":      node,
-        "node_path": node.path(),
-        "node_name": node.name(),
-        "node_type": node.type().name(),
-        "parm":      parm,
-        "parm_name": parm.name(),
-        "raw":       raw,
-        "resolved":  resolved,
-        "expanded":  expanded,
-        "exists":    exists,
+        "node":         node,
+        "node_path":    node.path(),
+        "node_name":    node_name,
+        "node_type":    node_type,
+        "parm":         parm,
+        "parm_name":    parm_name,
+        "raw":          raw,
+        "resolved":     resolved,
+        "expanded":     expanded,
+        "exists":       exists,
+        "_search_blob": search_blob,
     }
 
 # ---------------------------------------------------------------------------
@@ -388,6 +398,92 @@ class PathDelegate(QtWidgets.QStyledItemDelegate):
             option.palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor(WARN_YEL))
 
 
+class ActionsDelegate(QtWidgets.QStyledItemDelegate):
+    """
+    Paints the 'Browse' / reveal-folder buttons for the Actions column instead
+    of instantiating a real QWidget + QHBoxLayout + 2x QPushButton per row.
+
+    Building real widget trees for every row on every table repopulation
+    (i.e. every filter keystroke) is by far the most expensive part of the
+    old implementation. A delegate paints buttons directly with the style
+    engine and handles clicks itself, so repopulating the table no longer
+    constructs any widgets at all for this column.
+    """
+    BROWSE_WIDTH = 62
+    REVEAL_WIDTH = 28
+    SPACING = 4
+    MARGIN = 4
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self._window = window
+        self._pressed = None  # (row, "browse"|"reveal")
+
+    def _rects(self, option):
+        rect = option.rect.adjusted(self.MARGIN, 3, -self.MARGIN, -3)
+        browse_rect = QtCore.QRect(rect.x(), rect.y(), self.BROWSE_WIDTH, rect.height())
+        reveal_rect = QtCore.QRect(browse_rect.right() + self.SPACING, rect.y(),
+                                    self.REVEAL_WIDTH, rect.height())
+        return browse_rect, reveal_rect
+
+    def paint(self, painter, option, index):
+        style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
+
+        # Draw the row background/selection state first, with no text.
+        base_opt = QtWidgets.QStyleOptionViewItem(option)
+        base_opt.text = ""
+        style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, base_opt, painter, option.widget)
+
+        row = index.row()
+        browse_rect, reveal_rect = self._rects(option)
+
+        for rect, label, key in ((browse_rect, "Browse", "browse"), (reveal_rect, "\U0001F4C2", "reveal")):
+            btn_opt = QtWidgets.QStyleOptionButton()
+            btn_opt.rect = rect
+            btn_opt.text = label
+            btn_opt.state = QtWidgets.QStyle.StateFlag.State_Enabled
+            btn_opt.state |= (
+                QtWidgets.QStyle.StateFlag.State_Sunken
+                if self._pressed == (row, key)
+                else QtWidgets.QStyle.StateFlag.State_Raised
+            )
+            style.drawControl(QtWidgets.QStyle.ControlElement.CE_PushButton, btn_opt, painter, option.widget)
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() not in (QtCore.QEvent.Type.MouseButtonPress, QtCore.QEvent.Type.MouseButtonRelease):
+            return False
+
+        row = index.row()
+        browse_rect, reveal_rect = self._rects(option)
+        pos = event.pos()
+        view = option.widget
+
+        if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+            if browse_rect.contains(pos):
+                self._pressed = (row, "browse")
+            elif reveal_rect.contains(pos):
+                self._pressed = (row, "reveal")
+            else:
+                self._pressed = None
+            if view and self._pressed:
+                view.viewport().update(option.rect)
+            return bool(self._pressed)
+
+        # MouseButtonRelease
+        pressed, self._pressed = self._pressed, None
+        if view:
+            view.viewport().update(option.rect)
+        if not pressed or pressed[0] != row:
+            return False
+        if pressed[1] == "browse" and browse_rect.contains(pos):
+            self._window._browse_single(row)
+            return True
+        if pressed[1] == "reveal" and reveal_rect.contains(pos):
+            self._window._reveal_in_explorer(row)
+            return True
+        return False
+
+
 class AssetManagerWindow(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -414,6 +510,16 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self._sel_timer.timeout.connect(self._sync_houdini_selection)
         self._sel_timer.start()
 
+        # Debounce the text search: typing fires this on every keystroke, but
+        # we only want to actually re-filter + repaint once typing pauses.
+        self._search_timer = QtCore.QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(self._apply_filter)
+
+    def _on_search_text_changed(self, _text):
+        self._search_timer.start()
+
     def _build_ui(self):
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
@@ -434,7 +540,7 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self.search_box = QtWidgets.QLineEdit()
         self.search_box.setPlaceholderText("Filter by node name, type, or path …")
         self.search_box.setFixedWidth(320)
-        self.search_box.textChanged.connect(self._apply_filter)
+        self.search_box.textChanged.connect(self._on_search_text_changed)
         h_lay.addWidget(self.search_box)
 
         h_lay.addSpacing(8)
@@ -582,6 +688,7 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self.table.setShowGrid(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setItemDelegateForColumn(COL_PATH, PathDelegate(self.table))
+        self.table.setItemDelegateForColumn(COL_ACTIONS, ActionsDelegate(self, self.table))
         self.table.doubleClicked.connect(self._on_double_click)
         self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
@@ -689,69 +796,65 @@ class AssetManagerWindow(QtWidgets.QWidget):
                     if not is_solo:
                         continue
 
-                if text:
-                    blob = " ".join([
-                        e["node_name"], e["node_type"],
-                        e["parm_name"], e["raw"], e["resolved"]
-                    ]).lower()
-                    if text not in blob:
-                        continue
+                if text and text not in e["_search_blob"]:
+                    continue
                 self._filtered.append(e)
 
             self._populate_table()
 
     def _populate_table(self):
         v_scroll = self.table.verticalScrollBar().value()
-        self.table.setRowCount(0)
-        
-        # Get theme accent color
-        accent_color = self.palette().color(QtGui.QPalette.ColorRole.Highlight)
 
-        for row_idx, e in enumerate(self._filtered):
-            self.table.insertRow(row_idx)
+        # Freeze repaint/layout while we rebuild: setUpdatesEnabled(False)
+        # avoids a repaint per row, and blockSignals avoids selection-changed
+        # storms while rows are cleared/recreated.
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            # A single setRowCount (+ clearContents) is far cheaper than
+            # setRowCount(0) followed by N insertRow() calls, since insertRow
+            # triggers a model layout pass on every call.
+            self.table.clearContents()
+            self.table.setRowCount(len(self._filtered))
 
-            dot = QtWidgets.QTableWidgetItem("●" if e["exists"] else "●")
-            dot.setForeground(QtGui.QColor(OK_GREEN if e["exists"] else MISS_RED))
-            dot.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            dot.setToolTip("File found" if e["exists"] else "File NOT found")
-            self.table.setItem(row_idx, COL_STATUS, dot)
+            accent_color = self.palette().color(QtGui.QPalette.ColorRole.Highlight)
 
-            node_item = QtWidgets.QTableWidgetItem(e["node_path"])
-            node_item.setForeground(accent_color)
-            node_item.setToolTip("Double-click to select node in Houdini")
-            self.table.setItem(row_idx, COL_NODE, node_item)
+            for row_idx, e in enumerate(self._filtered):
+                dot = QtWidgets.QTableWidgetItem("●")
+                dot.setForeground(QtGui.QColor(OK_GREEN if e["exists"] else MISS_RED))
+                dot.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                dot.setToolTip("File found" if e["exists"] else "File NOT found")
+                self.table.setItem(row_idx, COL_STATUS, dot)
 
-            self.table.setItem(row_idx, COL_TYPE, QtWidgets.QTableWidgetItem(e["node_type"]))
+                node_item = QtWidgets.QTableWidgetItem(e["node_path"])
+                node_item.setForeground(accent_color)
+                node_item.setToolTip("Double-click to select node in Houdini")
+                self.table.setItem(row_idx, COL_NODE, node_item)
 
-            parm_item = QtWidgets.QTableWidgetItem(e["parm_name"])
-            self.table.setItem(row_idx, COL_PARM, parm_item)
+                self.table.setItem(row_idx, COL_TYPE, QtWidgets.QTableWidgetItem(e["node_type"]))
 
-            path_display = e["expanded"] if self._show_absolute else e["raw"]
-            path_item = QtWidgets.QTableWidgetItem(path_display)
-            path_item.setData(QtCore.Qt.ItemDataRole.UserRole, e["exists"])
-            path_item.setToolTip(e["raw"] if self._show_absolute else e["expanded"])
-            self.table.setItem(row_idx, COL_PATH, path_item)
+                parm_item = QtWidgets.QTableWidgetItem(e["parm_name"])
+                self.table.setItem(row_idx, COL_PARM, parm_item)
 
-            btn_widget = QtWidgets.QWidget()
-            btn_layout = QtWidgets.QHBoxLayout(btn_widget)
-            btn_layout.setContentsMargins(4, 2, 4, 2)
-            btn_layout.setSpacing(4)
+                path_display = e["expanded"] if self._show_absolute else e["raw"]
+                path_item = QtWidgets.QTableWidgetItem(path_display)
+                path_item.setData(QtCore.Qt.ItemDataRole.UserRole, e["exists"])
+                path_item.setToolTip(e["raw"] if self._show_absolute else e["expanded"])
+                self.table.setItem(row_idx, COL_PATH, path_item)
 
-            btn_browse = QtWidgets.QPushButton("Browse")
-            btn_browse.setFixedHeight(22)
-            btn_browse.setToolTip("Pick a new file for this parameter")
-            btn_browse.clicked.connect(functools.partial(self._browse_single, row_idx))
-            btn_layout.addWidget(btn_browse)
+                # No widget/layout/buttons here anymore — ActionsDelegate
+                # paints the "Browse" / reveal-folder buttons for this cell
+                # and handles their clicks. An empty item is enough to give
+                # the delegate an index and tooltip to draw against.
+                actions_item = QtWidgets.QTableWidgetItem()
+                actions_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+                actions_item.setToolTip("Browse: pick a new file · 📂: open containing folder")
+                self.table.setItem(row_idx, COL_ACTIONS, actions_item)
 
-            btn_reveal = QtWidgets.QPushButton("📂")
-            btn_reveal.setFixedWidth(28)
-            btn_reveal.setFixedHeight(22)
-            btn_reveal.setToolTip("Open folder in file explorer")
-            btn_reveal.clicked.connect(functools.partial(self._reveal_in_explorer, row_idx))
-            btn_layout.addWidget(btn_reveal)
-
-            self.table.setCellWidget(row_idx, COL_ACTIONS, btn_widget)
-            self.table.setRowHeight(row_idx, 30)
+                self.table.setRowHeight(row_idx, 30)
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
 
         self.table.verticalScrollBar().setValue(v_scroll)
 
@@ -815,7 +918,6 @@ class AssetManagerWindow(QtWidgets.QWidget):
             self._type_list.item(i).setCheckState(QtCore.Qt.CheckState.Unchecked)
         self._type_list.blockSignals(False)
         self._on_type_filter_changed()
-        self._populate_table()
 
     def _on_double_click(self, index):
         row = index.row()

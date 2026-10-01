@@ -77,7 +77,7 @@ class UnifiedMaterialBuilder:
             configs['opacity'].update({'color_space': 'Auto', 'input': 'opacity_color'})
             configs['normal'].update({'color_space': 'Raw', 'input': 'bump_input'})
             configs['displacement'].update({'color_space': 'Raw', 'input': 'Displacement'})
-            configs['emission'].update({'color_space': 'NAMED_COLOR_SPACE_SRGB', 'input': 'emission_color'})
+            configs['emission'].update({'color_space': 'auto', 'input': 'emission_color'})
             self.file_parm = 'tex0'
             self.cs_parm = 'tex0_colorSpace'
 
