@@ -9,6 +9,7 @@
     <memberTool name="Reveal in Explorer"/>
     <memberTool name="trace_psd_link_parameters"/>
     <memberTool name="convert_to_relative_path"/>
+    <memberTool name="pasteobjmerge"/>
   </toolshelf>
 
   <tool name="Reveal in Explorer" label="Reveal in Explorer" icon="custom_hda_icon">
