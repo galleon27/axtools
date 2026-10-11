@@ -8,17 +8,8 @@
   <interface name="ax_notes" label="AX Notes" icon="custom_hda_icon" showNetworkNavigationBar="false" help_url="">
     <script><![CDATA[import ax_notes
 
-def onCreateInterface():
+def createInterface():
     return ax_notes.NotesPanel()]]></script>
-    <includeInToolbarMenu menu_position="420" create_separator="false"/>
-    <help><![CDATA[]]></help>
-  </interface>
-  <interface name="ax_notes" label="AX Notes" icon="custom_hda_icon" showNetworkNavigationBar="false" help_url="">
-    <script><![CDATA[import ax_notes
-
-def onCreateInterface():
-    return ax_notes.NotesPanel()]]></script>
-    <includeInToolbarMenu menu_position="420" create_separator="false"/>
     <help><![CDATA[]]></help>
   </interface>
 </pythonPanelDocument>

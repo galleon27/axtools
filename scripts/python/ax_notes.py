@@ -6,6 +6,11 @@ Features
     * Bullet lists, numbered lists (Tab / Shift+Tab to nest)
     * Clickable to-do checkboxes (checked items get struck through + greyed)
     * Headings (H1 / H2 / H3), text colour, highlight, inline code, divider line
+    * "Sticky" button: mirrors the note into a network-editor sticky note as
+      Unicode text (underline/strike/code/lists/to-dos survive; bold, italic and headings become plain text;
+      colours don't) and keeps it updated live while you edit
+    * Edit / View mode toggle (view mode hides formatting, locks the text,
+      but to-do boxes can still be ticked)
     * Notes are stored INSIDE the .hip file (root node user data), autosaved
 
 Shortcuts (while the note has focus)
@@ -18,6 +23,8 @@ Shortcuts (while the note has focus)
 Install: see the bottom of this file, or use the generated custom_notes.pypanel.
 Works with PySide2 (Houdini 18.5 - 20.5) and PySide6 (Houdini 21+).
 """
+
+import json
 
 import hou
 
@@ -36,11 +43,32 @@ QTextCharFormat = QtGui.QTextCharFormat
 QTextListFormat = QtGui.QTextListFormat
 
 STORAGE_KEY = "custom_notes_html"      # user-data key on the root node (/)
+STICKY_KEY = "custom_notes_sticky"     # JSON [parent path, sticky name]
+MODE_KEY = "custom_notes_mode"         # "edit" or "view"
 BOX_OFF = "\u2610"                     # ☐
 BOX_ON = "\u2611"                      # ☑
 BOXES = (BOX_OFF, BOX_ON)
 DONE_COLOR = (130, 130, 130)
 CODE_BG = (60, 60, 60)                 # background that marks inline code
+
+# Houdini 22 look: rounded slate buttons, accent for the active one, green "add"
+PANEL_STYLE = """
+QPushButton, QToolButton {
+    background: #3f4656; color: #e4e6ea; border: 1px solid #4b5366;
+    border-radius: 5px; padding: 3px 10px;
+}
+QToolButton { padding: 2px 6px; }
+QPushButton:hover, QToolButton:hover { background: #4b5468; }
+QPushButton:pressed, QToolButton:pressed { background: #353b49; }
+QToolButton:checked { background: #5a6b94; border-color: #7388b8; color: #ffffff; }
+QPushButton#modeBtn:checked { background: #5a6b94; border-color: #7388b8; color: #ffffff; }
+QPushButton#addBtn { background: #3a5a3c; border-color: #4f7a52; color: #c9f0cb; }
+QPushButton#addBtn:hover { background: #46704a; }
+QPushButton#addBtn:pressed { background: #31502f; }
+QToolButton::menu-indicator { image: none; width: 0px; }
+"""
+
+DEFAULT_SIZE = (660, 660)              # default panel size (width, height)
 
 HEADING_SIZES = {0: None, 1: 22.0, 2: 17.0, 3: 14.0}
 
@@ -60,11 +88,108 @@ def _event_pos(e):
 
 
 # --------------------------------------------------------------------------- #
+# Rich text -> plain Unicode (sticky notes have no rich text support)
+# --------------------------------------------------------------------------- #
+def _math_table(upper, lower, digit=None, exceptions=None):
+    table = {}
+    for i in range(26):
+        table[chr(65 + i)] = chr(upper + i)
+        table[chr(97 + i)] = chr(lower + i)
+    if digit:
+        for i in range(10):
+            table[chr(48 + i)] = chr(digit + i)
+    table.update(exceptions or {})
+    return table
+
+
+_BOLD_MAP = _math_table(0x1D400, 0x1D41A, 0x1D7CE)
+_ITALIC_MAP = _math_table(0x1D434, 0x1D44E, None, {"h": "ℎ"})
+_BOLD_ITALIC_MAP = _math_table(0x1D468, 0x1D482)
+_MONO_MAP = _math_table(0x1D670, 0x1D68A, 0x1D7F6)
+
+UNDERLINE_MARK = "̲"
+STRIKE_MARK = "̶"
+DIVIDER_TEXT = "─" * 12
+
+
+def _style_char(ch, bold, italic, code, underline, strike):
+    if code:
+        out = _MONO_MAP.get(ch, ch)
+    elif bold and italic:
+        out = _BOLD_ITALIC_MAP.get(ch, ch)
+    elif bold:
+        out = _BOLD_MAP.get(ch, ch)
+    elif italic:
+        out = _ITALIC_MAP.get(ch, ch)
+    else:
+        out = ch
+    if not ch.isspace():
+        if underline:
+            out += UNDERLINE_MARK
+        if strike:
+            out += STRIKE_MARK
+    return out
+
+
+def _is_code_format(cf):
+    bg = cf.background()
+    if bg.style() != Qt.SolidPattern:
+        return False
+    c = bg.color()
+    return (c.red(), c.green(), c.blue()) == CODE_BG
+
+
+def _block_is_divider(block):
+    prop = getattr(QtGui.QTextFormat, "BlockTrailingHorizontalRulerWidth", None)
+    return prop is not None and block.blockFormat().hasProperty(prop)
+
+
+def _block_to_unicode(block):
+    text = block.text()
+    doc = block.document()
+    out = []
+    cur = QTextCursor(doc)
+    for i, ch in enumerate(text):
+        cur.setPosition(block.position() + i)
+        cur.setPosition(block.position() + i + 1, QTextCursor.KeepAnchor)
+        cf = cur.charFormat()
+        # bold / italic / headings don't render well in sticky notes -> plain text
+        out.append(_style_char(
+            ch, False, False,
+            _is_code_format(cf), cf.fontUnderline(), cf.fontStrikeOut()))
+    line = "".join(out)
+
+    lst = block.textList()
+    if lst is not None:
+        level = max(1, lst.format().indent())
+        if lst.format().style() == QTextListFormat.ListDecimal:
+            marker = "%d." % (lst.itemNumber(block) + 1)
+        else:
+            marker = "•"
+        line = "  " * (level - 1) + marker + " " + line
+    else:
+        line = "  " * max(0, block.blockFormat().indent()) + line
+    return line
+
+
+def rich_to_unicode(doc):
+    """Flatten a QTextDocument to plain text using Unicode lookalikes."""
+    lines = []
+    block = doc.begin()
+    while block.isValid():
+        lines.append(_block_to_unicode(block))
+        if _block_is_divider(block):
+            lines.append(DIVIDER_TEXT)
+        block = block.next()
+    return "\n".join(lines).rstrip()
+
+
+# --------------------------------------------------------------------------- #
 # The editor
 # --------------------------------------------------------------------------- #
 class NotesEdit(QtWidgets.QTextEdit):
     def __init__(self, parent=None):
-        super(NotesEdit, self).__init__(parent)
+        super().__init__(parent)
         self.setAcceptRichText(True)
         self.viewport().setMouseTracking(True)
         self.document().setDocumentMargin(10)
@@ -319,14 +444,17 @@ class NotesEdit(QtWidgets.QTextEdit):
             if block is not None:
                 self.toggle_box(block)
                 return
-        super(NotesEdit, self).mousePressEvent(e)
+        super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
         over = self._box_at(_event_pos(e)) is not None
         self.viewport().setCursor(Qt.PointingHandCursor if over else Qt.IBeamCursor)
-        super(NotesEdit, self).mouseMoveEvent(e)
+        super().mouseMoveEvent(e)
 
     def keyPressEvent(self, e):
+        if self.isReadOnly():              # view mode: no custom editing keys
+            super().keyPressEvent(e)
+            return
         key, mods = e.key(), e.modifiers()
         cur = self.textCursor()
         block = cur.block()
@@ -365,7 +493,7 @@ class NotesEdit(QtWidgets.QTextEdit):
             self.change_indent(-1)
             return
 
-        super(NotesEdit, self).keyPressEvent(e)
+        super().keyPressEvent(e)
 
 
 # --------------------------------------------------------------------------- #
@@ -373,17 +501,54 @@ class NotesEdit(QtWidgets.QTextEdit):
 # --------------------------------------------------------------------------- #
 class NotesPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
-        super(NotesPanel, self).__init__(parent)
+        super().__init__(parent)
         self._loading = False
+        self._edit_mode = True
+        self._sticky = None                # (parent path, sticky name)
+        self._fmt_actions = []             # toolbar items hidden in view mode
+        self._fmt_shortcuts = []           # shortcuts disabled in view mode
 
         self.edit = NotesEdit(self)
         self.toolbar = QtWidgets.QToolBar(self)
         self.toolbar.setMovable(False)
         self._build_toolbar()
+        self.resize(*DEFAULT_SIZE)
+        self.setStyleSheet(PANEL_STYLE)
+
+        # header row: [Edit][View] ............ [+ add_sticky]
+        header = QtWidgets.QHBoxLayout()
+        header.setSpacing(4)
+        self.b_edit = self._mode_btn("Edit", "Edit mode")
+        self.b_view = self._mode_btn("View", "View mode (read-only)")
+        group = QtWidgets.QButtonGroup(self)
+        group.setExclusive(True)
+        group.addButton(self.b_edit)
+        group.addButton(self.b_view)
+        self.b_edit.clicked.connect(lambda *_: self.set_edit_mode(True))
+        self.b_view.clicked.connect(lambda *_: self.set_edit_mode(False))
+        header.addWidget(self.b_edit)
+        header.addWidget(self.b_view)
+        header.addStretch(1)
+        self.b_sticky = QtWidgets.QPushButton("+ ADD STICKY")
+        self.b_sticky.setObjectName("addBtn")
+        self.b_sticky.setFocusPolicy(Qt.NoFocus)
+        self.b_sticky.setToolTip(
+            "Add this note as a sticky note in the network editor (kept in sync "
+            "while you edit; click again to refresh/re-create it)")
+        self.b_sticky.clicked.connect(lambda *_: self.add_sticky())
+        self.b_link = QtWidgets.QPushButton("LINK STICKY")
+        self.b_link.setFocusPolicy(Qt.NoFocus)
+        self.b_link.setToolTip(
+            "Link the sticky note selected in the network editor: its text is "
+            "loaded into this panel, and it then follows your edits")
+        self.b_link.clicked.connect(lambda *_: self.link_sticky())
+        header.addWidget(self.b_link)
+        header.addWidget(self.b_sticky)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
+        layout.addLayout(header)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.edit)
 
@@ -395,6 +560,11 @@ class NotesPanel(QtWidgets.QWidget):
         self._timer.setSingleShot(True)
         self._timer.setInterval(400)
         self._timer.timeout.connect(self.save)
+        # short debounce for the live sticky-note mirror
+        self._sticky_timer = QtCore.QTimer(self)
+        self._sticky_timer.setSingleShot(True)
+        self._sticky_timer.setInterval(150)
+        self._sticky_timer.timeout.connect(self._update_sticky)
         self.edit.textChanged.connect(self._on_text_changed)
         self.edit.currentCharFormatChanged.connect(self._sync_buttons)
 
@@ -406,8 +576,26 @@ class NotesPanel(QtWidgets.QWidget):
 
         self.load()
 
+    def sizeHint(self):
+        return QtCore.QSize(*DEFAULT_SIZE)
+
     # ---- toolbar ---------------------------------------------------------- #
-    def _btn(self, text, tip, slot, checkable=False, style=None):
+    def _add_fmt(self, widget):
+        """Add a formatting-only widget (hidden in view mode)."""
+        self._fmt_actions.append(self.toolbar.addWidget(widget))
+
+    def _add_fmt_separator(self):
+        self._fmt_actions.append(self.toolbar.addSeparator())
+
+    def _mode_btn(self, text, tip):
+        b = QtWidgets.QPushButton(text)
+        b.setObjectName("modeBtn")
+        b.setCheckable(True)
+        b.setToolTip(tip)
+        b.setFocusPolicy(Qt.NoFocus)
+        return b
+
+    def _btn(self, text, tip, slot, checkable=False, style=None, fmt=True):
         b = QtWidgets.QToolButton()
         b.setText(text)
         b.setToolTip(tip)
@@ -421,7 +609,10 @@ class NotesPanel(QtWidgets.QWidget):
             f.setStrikeOut("s" in style)
             b.setFont(f)
         b.clicked.connect(lambda *_: slot())
-        self.toolbar.addWidget(b)
+        if fmt:
+            self._add_fmt(b)
+        else:
+            self.toolbar.addWidget(b)
         return b
 
     def _menu_btn(self, label, tip, entries, slot):
@@ -439,7 +630,7 @@ class NotesPanel(QtWidgets.QWidget):
                 act.setIcon(QtGui.QIcon(pm))
             act.triggered.connect(lambda checked=False, h=hex_color: slot(h))
         b.setMenu(menu)
-        self.toolbar.addWidget(b)
+        self._add_fmt(b)
         return b
 
     def _build_toolbar(self):
@@ -449,14 +640,14 @@ class NotesPanel(QtWidgets.QWidget):
         self.heading.setFocusPolicy(Qt.NoFocus)
         self.heading.setToolTip("Paragraph style")
         self.heading.activated.connect(e.set_heading)
-        self.toolbar.addWidget(self.heading)
-        self.toolbar.addSeparator()
+        self._add_fmt(self.heading)
+        self._add_fmt_separator()
 
         self.b_bold = self._btn("B", "Bold (Ctrl+B)", lambda: e.toggle_format("bold"), True, "b")
         self.b_ital = self._btn("I", "Italic (Ctrl+I)", lambda: e.toggle_format("italic"), True, "i")
         self.b_under = self._btn("U", "Underline (Ctrl+U)", lambda: e.toggle_format("underline"), True, "u")
         self.b_strike = self._btn("S", "Strikethrough (Ctrl+Shift+X)", lambda: e.toggle_format("strike"), True, "s")
-        self.toolbar.addSeparator()
+        self._add_fmt_separator()
 
         self._btn("\u2022 List", "Bullet list (Ctrl+Shift+8)",
                   lambda: e.toggle_list(QTextListFormat.ListDisc))
@@ -464,7 +655,7 @@ class NotesPanel(QtWidgets.QWidget):
                   lambda: e.toggle_list(QTextListFormat.ListDecimal))
         self._btn("\u2610 To-do", "To-do list (Ctrl+Shift+T). Click a box to tick it.",
                   e.toggle_todo)
-        self.toolbar.addSeparator()
+        self._add_fmt_separator()
 
         self._menu_btn("Color", "Text colour", TEXT_COLORS, e.set_text_color)
         self._menu_btn("Highlight", "Highlight colour", HIGHLIGHTS, e.set_highlight)
@@ -490,6 +681,8 @@ class NotesPanel(QtWidgets.QWidget):
             sc.setContext(Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(fn)
             self._shortcuts.append(sc)
+            if "Return" not in seq and "Enter" not in seq:
+                self._fmt_shortcuts.append(sc)
 
     def _sync_buttons(self, fmt):
         self.b_bold.setChecked(fmt.fontWeight() > NORMAL)
@@ -512,13 +705,142 @@ class NotesPanel(QtWidgets.QWidget):
     def _on_text_changed(self):
         if not self._loading:
             self._timer.start()
+            if self._sticky:
+                self._sticky_timer.start()
+
+    # ---- view / edit mode ------------------------------------------------- #
+    def set_edit_mode(self, editing, persist=True):
+        self._edit_mode = editing
+        self.edit.setReadOnly(not editing)
+        for act in self._fmt_actions:
+            act.setVisible(editing)
+        for sc in self._fmt_shortcuts:
+            sc.setEnabled(editing)
+        self.toolbar.setVisible(editing)
+        self.b_edit.setChecked(editing)
+        self.b_view.setChecked(not editing)
+        if persist:
+            self._set_user_data(MODE_KEY, "edit" if editing else "view")
+
+    # ---- sticky note ------------------------------------------------------ #
+    @staticmethod
+    def _set_user_data(key, value):
+        try:
+            root = hou.node("/")
+            if root.userData(key) != value:
+                with hou.undos.disabler():
+                    root.setUserData(key, value)
+        except Exception as ex:
+            print("Custom Notes: could not store %s ->" % key, ex)
+
+    def _find_sticky(self):
+        if not self._sticky:
+            return None
+        try:
+            parent = hou.node(self._sticky[0])
+            return parent.findStickyNote(self._sticky[1]) if parent else None
+        except Exception:
+            return None
+
+    def _forget_sticky(self):
+        self._sticky = None
+        self._set_user_data(STICKY_KEY, "")
+
+    def add_sticky(self):
+        text = rich_to_unicode(self.edit.document())
+        note = self._find_sticky()
+        if note is not None:                       # already linked: just refresh
+            try:
+                with hou.undos.disabler():
+                    note.setText(text)
+                note.setSelected(True, clear_all_selected=True)
+                return
+            except Exception:
+                self._forget_sticky()
+        editor = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+        if editor is None:
+            hou.ui.setStatusMessage("Custom Notes: open a Network Editor first.",
+                                    severity=hou.severityType.Warning)
+            return
+        parent = editor.pwd()
+        try:
+            note = parent.createStickyNote()
+            size = hou.Vector2(5.0, 4.0)
+            note.setSize(size)
+            note.setPosition(editor.visibleBounds().center() - size * 0.5)
+            note.setText(text)
+            note.setSelected(True, clear_all_selected=True)
+        except Exception as ex:
+            hou.ui.setStatusMessage("Custom Notes: could not create sticky note (%s)" % ex,
+                                    severity=hou.severityType.Warning)
+            return
+        self._sticky = (parent.path(), note.name())
+        self._set_user_data(STICKY_KEY, json.dumps(self._sticky))
+
+    def link_sticky(self):
+        """Link the sticky note selected in the network editor to this panel."""
+        warn = hou.severityType.Warning
+        editor = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+        if editor is None:
+            hou.ui.setStatusMessage("Custom Notes: open a Network Editor first.",
+                                    severity=warn)
+            return
+        try:
+            parent = editor.pwd()
+            picked = [n for n in parent.stickyNotes() if n.isSelected()]
+        except Exception as ex:
+            hou.ui.setStatusMessage("Custom Notes: could not read the network (%s)" % ex,
+                                    severity=warn)
+            return
+        if len(picked) != 1:
+            hou.ui.setStatusMessage(
+                "Custom Notes: select exactly one sticky note in the network editor, "
+                "then click Link.", severity=warn)
+            return
+        note = picked[0]
+        if hou.ui.displayMessage(
+                "Link sticky note '%s'?\n\nThis panel's text will be replaced by the "
+                "sticky note's text, and the sticky note will then follow your edits."
+                % note.name(),
+                buttons=("Link", "Cancel"), default_choice=1, close_choice=1,
+                title="Link sticky note") != 0:
+            return
+        self._loading = True                       # don't echo the load back out
+        try:
+            self.edit.setPlainText(note.text())
+        finally:
+            self._loading = False
+        self._sticky = (parent.path(), note.name())
+        self._set_user_data(STICKY_KEY, json.dumps(self._sticky))
+        self.save()
+
+    def _update_sticky(self):
+        if not self._sticky:
+            return
+        note = self._find_sticky()
+        if note is None:                           # sticky was deleted
+            self._forget_sticky()
+            return
+        try:
+            text = rich_to_unicode(self.edit.document())
+            if note.text() != text:
+                with hou.undos.disabler():
+                    note.setText(text)
+        except Exception as ex:
+            print("Custom Notes: could not update sticky note ->", ex)
 
     def load(self):
         html = None
         try:
-            html = hou.node("/").userData(STORAGE_KEY)
+            root = hou.node("/")
+            html = root.userData(STORAGE_KEY)
+            link = root.userData(STICKY_KEY)
+            self._sticky = tuple(json.loads(link)) if link else None
+            mode = root.userData(MODE_KEY)
         except Exception:
-            pass
+            self._sticky = None
+            mode = None
+        self.set_edit_mode(mode != "view", persist=False)
         self._loading = True
         try:
             if html:

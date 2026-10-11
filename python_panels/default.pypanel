@@ -39,12 +39,12 @@
     <interfaceItem name="sidefx::node_info"/>
     <interfaceItem name="apexanimationlayersmanager"/>
     <interfaceItem name="apexselectionmanager"/>
-    <interfaceItem name="layout_asset_gallery"/>
+    <separatorItem/>
     <interfaceItem name="Image Preview"/>
     <interfaceItem name="swatches"/>
     <separatorItem/>
     <separatorItem/>
     <interfaceItem name="MIndMap"/>
-    <interfaceItem name="AX Notes"/>
+    <separatorItem/>
   </interfacesMenu>
 </pythonPanelDocument>
