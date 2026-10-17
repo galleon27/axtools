@@ -1,1 +1,6 @@
 otls/backup/*.hdalc
+
+__pycache__/
+*.pyc
+!scripts/python/nodeColor.pyc
+!scripts/python/split_sop.pyc
