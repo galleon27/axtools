@@ -21,7 +21,7 @@ from PySide6.QtCore import Qt
 
 # --- GLOBAL CONSTANTS ---
 RAMP_PARM_NAMES = ("ramp", "colorramp", "gradient", "vramp", "NT_TEX_GRADIENT", "rampcolordefault", "octane_gradient")
-COLOR_PARM_NAMES = ("color", "singlevalue", "base_color", "NT_TEX_RGB")
+COLOR_PARM_NAMES = ("color", "singlevalue", "base_color", "NT_TEX_RGB", "f1", "A_VALUE")
 
 _NAME_STRIP_RE = re.compile(r'[^\w\s-]')
 _WHITESPACE_RE = re.compile(r'\s+')
