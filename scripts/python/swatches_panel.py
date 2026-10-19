@@ -21,7 +21,7 @@ from PySide6.QtCore import Qt
 
 # --- GLOBAL CONSTANTS ---
 RAMP_PARM_NAMES = ("ramp", "colorramp", "gradient", "vramp", "NT_TEX_GRADIENT", "rampcolordefault", "octane_gradient")
-COLOR_PARM_NAMES = ("color", "singlevalue", "base_color", "NT_TEX_RGB", "f1", "A_VALUE")
+COLOR_PARM_NAMES = ("color", "singlevalue", "base_color", "NT_TEX_RGB", "f3", "A_VALUE")
 
 _NAME_STRIP_RE = re.compile(r'[^\w\s-]')
 _WHITESPACE_RE = re.compile(r'\s+')
@@ -75,6 +75,20 @@ def find_ramp_parm(node):
         if parm and isinstance(parm.parmTemplate(), hou.RampParmTemplate):
             return parm
     return None
+
+
+def find_color_parm(node):
+    for name in COLOR_PARM_NAMES:
+        parm = node.parmTuple(name)
+        if parm and len(parm) in (3, 4):
+            return parm
+    return None
+
+
+def is_swatch_value(value):
+    """Saved swatches are stored as a flat [r, g, b]; gradients as a list of [r, g, b] lists."""
+    return (isinstance(value, list) and len(value) == 3
+            and all(isinstance(v, (int, float)) for v in value))
 
 
 def find_network_editor():
@@ -234,9 +248,9 @@ class SwatchGridView(QtWidgets.QAbstractScrollArea):
     GAP = 4      # box -> name
     BOTTOM = 10  # space under the name
 
-    def __init__(self, ramp_checker, parent=None):
+    def __init__(self, node_checker, parent=None):
         super().__init__(parent)
-        self._ramp_checker = ramp_checker
+        self._node_checker = node_checker
         self.items = []
         self._selected = set()
         self._anchor = -1                 # last plainly-clicked row (shift-click range start)
@@ -495,28 +509,28 @@ class SwatchGridView(QtWidgets.QAbstractScrollArea):
         else:
             super().keyPressEvent(event)
 
-    # ---- dropping Houdini nodes (to save their ramp as a gradient) ------------------
-    def _dragged_ramp_node(self, event):
+    # ---- dropping Houdini nodes (to save their ramp / color) ------------------------
+    def _dragged_node(self, event):
         mime = event.mimeData()
         if not mime.hasText():
             return None
         node = hou.node(mime.text())
-        return node if node and self._ramp_checker(node) else None
+        return node if node and self._node_checker(node) else None
 
     def dragEnterEvent(self, event):
-        if self._dragged_ramp_node(event):
+        if self._dragged_node(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        if self._dragged_ramp_node(event):
+        if self._dragged_node(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event):
-        node = self._dragged_ramp_node(event)
+        node = self._dragged_node(event)
         if node:
             self.node_dropped.emit(node)
             event.acceptProposedAction()
@@ -851,7 +865,7 @@ class SwatchViewer(QtWidgets.QWidget):
         self.folder_tree.folder_dropped.connect(self.add_custom_folder)
         self.folder_tree.delete_requested.connect(self.handle_tree_delete)
 
-        self.view = SwatchGridView(self.get_ramp_parm_from_node)
+        self.view = SwatchGridView(self.can_save_from_node)
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.splitter.addWidget(self.folder_tree)
@@ -898,8 +912,8 @@ class SwatchViewer(QtWidgets.QWidget):
         self.view.context_requested.connect(self.show_context_menu)
         self.view.drag_released.connect(self.on_drag_released)
         self.view.item_double_clicked.connect(self.on_item_double_clicked)
-        self.view.delete_pressed.connect(self.delete_selected_gradients)
-        self.view.node_dropped.connect(self.save_ramp_from_node)
+        self.view.delete_pressed.connect(self.delete_selected_saved)
+        self.view.node_dropped.connect(self.save_from_node)
         self.folder_tree.customContextMenuRequested.connect(self.show_folder_tree_context_menu)
 
     def select_item_by_path(self, path):
@@ -917,45 +931,75 @@ class SwatchViewer(QtWidgets.QWidget):
             if not current_item: return
         self.folder_tree.setCurrentItem(current_item)
 
-    def get_ramp_parm_from_node(self, node):
-        return find_ramp_parm(node)
+    def can_save_from_node(self, node):
+        return bool(find_ramp_parm(node) or find_color_parm(node))
 
-    def save_ramp_from_node(self, node):
-        parm = self.get_ramp_parm_from_node(node)
-        if not parm:
-            self.log(f"No suitable ramp parameter found on dropped node: {node.path()}")
-            return
-
-        ramp = parm.eval()
-        if not isinstance(ramp, hou.Ramp) or not ramp.values():
-            self.log(f"Ramp '{parm.path()}' is empty or invalid.")
-            return
-
-        name_tuple = hou.ui.readInput("Enter name for new gradient:", buttons=("OK", "Cancel"), title="Save Gradient from Parm")
-        if name_tuple[0] == 1 or not name_tuple[1].strip(): return
-        name = name_tuple[1].strip()
-
-        colors = [tuple(c) for c in ramp.values()]
-        
+    def _target_saved_dict(self):
+        """The saved folder dict selected in the tree, or the 'Saved Gradients' root."""
         target_dict = self.saved_gradients
         selected_items = self.folder_tree.selectedItems()
         if selected_items:
             item = selected_items[0]
             item_type = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1)
-            if item_type == "gradient_folder" or item_type == "virtual_folder":
+            if item_type in ("gradient_folder", "virtual_folder"):
                 path_parts = []
                 temp_item = item
                 while temp_item and temp_item.text(0) != "Saved Gradients":
                     path_parts.insert(0, temp_item.text(0))
                     temp_item = temp_item.parent()
-                
                 for part in path_parts:
-                    target_dict = target_dict.get(part, {})
+                    target_dict = target_dict.setdefault(part, {})
+        return target_dict
 
-        target_dict[name] = colors
+    @staticmethod
+    def _unique_name(target_dict, name):
+        if name not in target_dict:
+            return name
+        i = 2
+        while f"{name} ({i})" in target_dict:
+            i += 1
+        return f"{name} ({i})"
+
+    def save_from_node(self, node):
+        ramp_parm = find_ramp_parm(node)
+        color_parm = find_color_parm(node)
+        # Color SOP has both: use the ramp only when it's in a ramp mode
+        colortype = node.parm("colortype")
+        if ramp_parm and color_parm and colortype and colortype.eval() == 0:
+            ramp_parm = None
+
+        if ramp_parm:
+            ramp = ramp_parm.eval()
+            if not isinstance(ramp, hou.Ramp) or not ramp.values():
+                self.log(f"Ramp '{ramp_parm.path()}' is empty or invalid.")
+                return
+            value = [list(c) for c in ramp.values()]
+            kind, source = "gradient", ramp_parm
+        elif color_parm:
+            value = list(color_parm.eval()[:3])
+            kind, source = "swatch", color_parm
+        else:
+            self.log(f"No suitable ramp or color parameter found on dropped node: {node.path()}")
+            return
+
+        name_tuple = hou.ui.readInput(f"Enter name for new {kind}:", buttons=("OK", "Cancel"),
+                                      title=f"Save {kind.capitalize()} from Parm", initial_contents=node.name())
+        if name_tuple[0] == 1 or not name_tuple[1].strip(): return
+        name = name_tuple[1].strip()
+
+        self._target_saved_dict()[name] = value
         self.save_config_state()
-        self.log(f"Saved gradient '{name}' from node '{node.path()}'")
+        self.log(f"Saved {kind} '{name}' from '{node.path()}/{source.name()}'")
         self.populate_grid()
+
+    def save_selected_swatches(self):
+        selected = [i for i in self.selected_items() if isinstance(i, SwatchItem)]
+        if not selected: return
+        target_dict = self._target_saved_dict()
+        for s in selected:
+            target_dict[self._unique_name(target_dict, s.name)] = list(s.rgb)
+        self.save_config_state()
+        self.log(f"Saved {len(selected)} swatch(es) to saved library.")
 
     def load_first_ase_file(self):
         iterator = QtWidgets.QTreeWidgetItemIterator(self.folder_tree)
@@ -1019,28 +1063,35 @@ class SwatchViewer(QtWidgets.QWidget):
         else:
             menu.addAction("Apply to Selected Node", lambda: self.ops.apply_gradient_to_selected_node(active))
 
-        selected_gradients = [i for i in selected if isinstance(i, GradientItem)]
-        if isinstance(active, GradientItem) or selected_gradients:
+        if self.current_view_mode == 'swatches':
+            selected_swatches = [i for i in selected if isinstance(i, SwatchItem)]
             menu.addSeparator()
-            num_to_delete = len(selected_gradients)
-            menu.addAction(f"Delete {num_to_delete} Gradients" if num_to_delete > 1 else "Delete Gradient",
-                           self.delete_selected_gradients)
+            menu.addAction("Save Swatch(es) to Saved Library", self.save_selected_swatches)
+            if len(selected_swatches) > 1:
+                menu.addAction("Save Selection as Gradient", self.save_selected_as_gradient)
+        else:
+            menu.addSeparator()
+            num_to_delete = len(selected) or 1
+            menu.addAction(f"Delete {num_to_delete} Items" if num_to_delete > 1 else "Delete Item",
+                           self.delete_selected_saved)
         menu.exec(global_pos)
 
-    def delete_selected_gradients(self):
-        selected_gradients = [i for i in self.selected_items() if isinstance(i, GradientItem)]
-        if not selected_gradients:
+    def delete_selected_saved(self):
+        if self.current_view_mode != 'gradients':
+            return
+        selected = self.selected_items()
+        if not selected:
             return
 
         deleted_count = 0
-        for grad in selected_gradients:
+        for item in selected:
             # current_gradient_dict is the live nested dict inside saved_gradients
-            if self.current_gradient_dict.pop(grad.name, None) is not None:
+            if self.current_gradient_dict.pop(item.name, None) is not None:
                 deleted_count += 1
 
         if deleted_count > 0:
             self.save_config_state()
-            self.log(f"Deleted {deleted_count} gradient(s).")
+            self.log(f"Deleted {deleted_count} item(s).")
             self.populate_grid()
 
     def save_selected_as_gradient(self):
@@ -1056,20 +1107,7 @@ class SwatchViewer(QtWidgets.QWidget):
         if name_tuple[0] == 1 or not name_tuple[1].strip(): return
         name = name_tuple[1].strip()
 
-        selected_path = None
-        if self.folder_tree.selectedItems():
-            selected_path = self.get_item_path(self.folder_tree.selectedItems()[0])
-
-        colors = [s.rgb for s in selected]
-        
-        target_dict = self.saved_gradients
-        if selected_path and selected_path[0] == "Saved Gradients":
-             current_level = self.saved_gradients
-             for part in selected_path[1:]:
-                 current_level = current_level.get(part, {})
-             target_dict = current_level
-
-        target_dict[name] = colors
+        self._target_saved_dict()[name] = [list(s.rgb) for s in selected]
         self.save_config_state()
         self.log(f"Saved custom gradient: '{name}'")
         self.populate_grid()
@@ -1321,7 +1359,7 @@ class SwatchViewer(QtWidgets.QWidget):
         if self.current_view_mode == 'swatches':
             items = self.swatches
         else:
-            items = [GradientItem(name, value)
+            items = [SwatchItem(name, tuple(value)) if is_swatch_value(value) else GradientItem(name, value)
                      for name, value in self.current_gradient_dict.items()
                      if isinstance(value, list)]
         self.view.set_items(items)   # also clears the selection
@@ -1330,7 +1368,7 @@ class SwatchViewer(QtWidgets.QWidget):
         if event.key() == Qt.Key.Key_Escape:
             self.view.clear_selection()
         elif event.key() == Qt.Key.Key_Delete:
-            self.delete_selected_gradients()
+            self.delete_selected_saved()
         else:
             super().keyPressEvent(event)
 
