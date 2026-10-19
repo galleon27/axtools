@@ -123,4 +123,33 @@ def convertToRelativePath():
 
 convertToRelativePath()]]></script>
   </tool>
+
+  <tool name="pasteobjmerge" label="Paste as object merge" icon="custom_hda_icon">
+    <script scriptType="python"><![CDATA[import hou
+
+desk = hou.ui.curDesktop()
+pane = desk.paneTabOfType(hou.paneTabType.NetworkEditor)
+
+if pane:
+    cursor_position = pane.cursorPosition()
+    parent_node = pane.pwd()
+    
+    copied_nodes = hou.ui.getTextFromClipboard().split()
+    objmerge_node = parent_node.createNode('object_merge')
+    
+    # for node in copied_nodes:
+    #     objmerge_node = parent_node.createNode('object_merge')
+    #     objmerge_node.setPosition(cursor_position)
+    #     objmerge_node.parm('objpath1').set(node)
+    
+    for i, node in enumerate(copied_nodes):
+        # objmerge_node = parent_node.createNode('object_merge')
+        objmerge_node.parm('numobj').set(len(copied_nodes))
+        objmerge_node.parm('objpath%d' % int(i+1)).set(node)
+        objmerge_node.setPosition(cursor_position)
+    
+
+    
+]]></script>
+  </tool>
 </shelfDocument>
