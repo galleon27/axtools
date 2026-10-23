@@ -33,7 +33,7 @@
     <separatorItem/>
     <separatorItem/>
     <separatorItem/>
-    <interfaceItem name="OctaneQt5IPRPane"/>
+    <separatorItem/>
     <separatorItem/>
     <interfaceItem name="log_viewer"/>
     <interfaceItem name="sidefx::node_info"/>
@@ -46,5 +46,6 @@
     <separatorItem/>
     <interfaceItem name="MIndMap"/>
     <separatorItem/>
+    <interfaceItem name="flow_ease"/>
   </interfacesMenu>
 </pythonPanelDocument>
