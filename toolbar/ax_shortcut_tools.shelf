@@ -133,23 +133,25 @@ pane = desk.paneTabOfType(hou.paneTabType.NetworkEditor)
 if pane:
     cursor_position = pane.cursorPosition()
     parent_node = pane.pwd()
-    
-    copied_nodes = hou.ui.getTextFromClipboard().split()
-    objmerge_node = parent_node.createNode('object_merge')
-    
-    # for node in copied_nodes:
-    #     objmerge_node = parent_node.createNode('object_merge')
-    #     objmerge_node.setPosition(cursor_position)
-    #     objmerge_node.parm('objpath1').set(node)
-    
-    for i, node in enumerate(copied_nodes):
-        # objmerge_node = parent_node.createNode('object_merge')
-        objmerge_node.parm('numobj').set(len(copied_nodes))
-        objmerge_node.parm('objpath%d' % int(i+1)).set(node)
-        objmerge_node.setPosition(cursor_position)
-    
 
-    
+    copied_nodes = hou.ui.getTextFromClipboard().split()
+
+    if copied_nodes:
+        # Copernicus networks use the 'Cop' category (legacy COPs are 'Cop2')
+        is_copernicus = parent_node.childTypeCategory().name() == 'Cop'
+
+        if is_copernicus:
+            for i, node in enumerate(copied_nodes):
+                fetch_node = parent_node.createNode('fetch')
+                fetch_node.parm('coppath').set(node)
+                # Stack the fetch nodes horizontally so they don't overlap
+                fetch_node.setPosition(cursor_position + hou.Vector2(i * 2.5, 0))
+        else:
+            objmerge_node = parent_node.createNode('object_merge')
+            objmerge_node.parm('numobj').set(len(copied_nodes))
+            for i, node in enumerate(copied_nodes):
+                objmerge_node.parm('objpath%d' % (i + 1)).set(node)
+            objmerge_node.setPosition(cursor_position)
 ]]></script>
   </tool>
 </shelfDocument>
