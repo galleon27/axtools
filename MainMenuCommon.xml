@@ -35,6 +35,16 @@ if pane:
         ]]></scriptCode>
       </scriptItem>
 
+      <scriptItem id="h.flowease">
+        <label>AX Flow Ease</label>
+        <scriptCode><![CDATA[
+import hou
+pane = hou.ui.curDesktop().createFloatingPaneTab(hou.paneTabType.PythonPanel, (300,300), (900,600), "flow_ease")
+if pane:
+    pane.floatingPanel().setName("AX Flow Ease")
+        ]]></scriptCode>
+      </scriptItem>
+
     </subMenu>
   </menuBar>
 </mainMenu>

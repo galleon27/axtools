@@ -6,11 +6,13 @@
  same interface or of the interfaces menu are not allowed
  in a single file. -->
   <interface name="asset_manager" label="Asset Manager" icon="custom_hda_icon" showNetworkNavigationBar="false" help_url="">
-    <script><![CDATA[from PySide6 import QtWidgets, QtCore
-import asset_manager # your saved module filename without .py
+    <script><![CDATA[import importlib
+import asset_manager
 
 def createInterface():
-    return asset_manager.AssetManagerWindow()]]></script>
+    importlib.reload(asset_manager)
+    return asset_manager.AssetManagerWindow()
+]]></script>
     <includeInToolbarMenu menu_position="418" create_separator="false"/>
     <help><![CDATA[]]></help>
   </interface>

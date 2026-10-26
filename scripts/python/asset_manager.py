@@ -12,6 +12,16 @@ import os
 import re
 from PySide6 import QtWidgets, QtCore, QtGui
 
+_ICON_CACHE = {}
+
+
+def get_icon(name):
+    """hou.qt.Icon() hits the icon system every call; cache the result."""
+    icon = _ICON_CACHE.get(name)
+    if icon is None:
+        icon = _ICON_CACHE[name] = hou.qt.Icon(name)
+    return icon
+
 # ---------------------------------------------------------------------------
 # Node type → parameter name(s) that hold a file path
 # ---------------------------------------------------------------------------
@@ -437,10 +447,14 @@ class ActionsDelegate(QtWidgets.QStyledItemDelegate):
         row = index.row()
         browse_rect, reveal_rect = self._rects(option)
 
-        for rect, label, key in ((browse_rect, "Browse", "browse"), (reveal_rect, "\U0001F4C2", "reveal")):
+        for rect, label, icon, key in ((browse_rect, "Browse", None, "browse"),
+                                       (reveal_rect, "", "BUTTONS_folder", "reveal")):
             btn_opt = QtWidgets.QStyleOptionButton()
             btn_opt.rect = rect
             btn_opt.text = label
+            if icon:
+                btn_opt.icon = get_icon(icon)
+                btn_opt.iconSize = QtCore.QSize(16, 16)
             btn_opt.state = QtWidgets.QStyle.StateFlag.State_Enabled
             btn_opt.state |= (
                 QtWidgets.QStyle.StateFlag.State_Sunken
@@ -490,8 +504,6 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self.setWindowTitle("Houdini Asset Manager")
         self.resize(1200, 650)
         
-        # Inject Houdini 22's Theme Stylesheet dynamically
-        self.setStyleSheet(hou.qt.styleSheet())
 
         self._entries = []
         self._filtered = []
@@ -528,14 +540,13 @@ class AssetManagerWindow(QtWidgets.QWidget):
         # ---- header toolbar ----
         header = QtWidgets.QWidget()
         header.setObjectName("header")
-        header.setFixedHeight(52)
         h_lay = QtWidgets.QHBoxLayout(header)
-        h_lay.setContentsMargins(12, 8, 12, 8)
+        h_lay.setContentsMargins(6, 4, 6, 4)
+        h_lay.setSpacing(4)
 
         title = QtWidgets.QLabel("Asset Manager")
         title.setStyleSheet("font-size:13px; font-weight:bold;")
         h_lay.addWidget(title)
-        h_lay.addSpacing(20)
 
         self.search_box = QtWidgets.QLineEdit()
         self.search_box.setPlaceholderText("Filter by node name, type, or path …")
@@ -543,22 +554,18 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self.search_box.textChanged.connect(self._on_search_text_changed)
         h_lay.addWidget(self.search_box)
 
-        h_lay.addSpacing(8)
-
         self.filter_combo = QtWidgets.QComboBox()
         self.filter_combo.addItems(["All nodes", "Missing only", "Found only"])
         self.filter_combo.currentIndexChanged.connect(self._apply_filter)
         h_lay.addWidget(self.filter_combo)
 
-        h_lay.addSpacing(8)
-
-        self.type_filter_btn = QtWidgets.QPushButton("Type: All")
+        self.type_filter_btn = QtWidgets.QPushButton(get_icon("BUTTONS_filter"), "Type: All")
         self.type_filter_btn.setToolTip("Filter by node type")
         self.type_filter_btn.setFixedWidth(130)
         self.type_filter_btn.clicked.connect(self._show_type_filter_popup)
         h_lay.addWidget(self.type_filter_btn)
 
-        self.btn_solo = QtWidgets.QPushButton("Solo")
+        self.btn_solo = QtWidgets.QPushButton(get_icon("BUTTONS_solo"), "Solo")
         self.btn_solo.setCheckable(True)
         self.btn_solo.setChecked(False)
         self.btn_solo.setToolTip("Show only paths inside the currently selected node(s)")
@@ -591,17 +598,17 @@ class AssetManagerWindow(QtWidgets.QWidget):
 
         h_lay.addStretch()
 
-        btn_refresh = QtWidgets.QPushButton("⟳  Refresh")
+        btn_refresh = QtWidgets.QPushButton(get_icon("BUTTONS_reload"), "Refresh")
         btn_refresh.setToolTip("Re-scan the scene graph")
         btn_refresh.clicked.connect(self.refresh)
         h_lay.addWidget(btn_refresh)
 
-        btn_relink_sel = QtWidgets.QPushButton("⤷  Relink Selected")
+        btn_relink_sel = QtWidgets.QPushButton(get_icon("BUTTONS_link"), "Relink Selected")
         btn_relink_sel.setToolTip("Pick a file for each selected row")
         btn_relink_sel.clicked.connect(self._relink_selected)
         h_lay.addWidget(btn_relink_sel)
 
-        btn_search_dir = QtWidgets.QPushButton("🔍  Search in Dir")
+        btn_search_dir = QtWidgets.QPushButton(get_icon("BUTTONS_search"), "Search in Dir")
         btn_search_dir.setToolTip("Search a directory tree and relink by filename")
         btn_search_dir.clicked.connect(self._search_in_directory)
         h_lay.addWidget(btn_search_dir)
@@ -629,8 +636,8 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self._fr_bar = QtWidgets.QWidget()
         self._fr_bar.setObjectName("fr_bar")
         fr_lay = QtWidgets.QHBoxLayout(self._fr_bar)
-        fr_lay.setContentsMargins(10, 6, 10, 6)
-        fr_lay.setSpacing(6)
+        fr_lay.setContentsMargins(6, 0, 6, 4)
+        fr_lay.setSpacing(4)
 
         fr_lay.addWidget(QtWidgets.QLabel("Find:"))
         self.find_edit = QtWidgets.QLineEdit()
@@ -639,7 +646,6 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self.find_edit.textChanged.connect(self._on_find_changed)
         fr_lay.addWidget(self.find_edit)
 
-        fr_lay.addSpacing(4)
         fr_lay.addWidget(QtWidgets.QLabel("Replace:"))
         self.replace_edit = QtWidgets.QLineEdit()
         self.replace_edit.setPlaceholderText("replacement string")
@@ -650,8 +656,6 @@ class AssetManagerWindow(QtWidgets.QWidget):
         self.match_case_cb = QtWidgets.QCheckBox("Case sensitive")
         self.match_case_cb.stateChanged.connect(self._on_find_changed)
         fr_lay.addWidget(self.match_case_cb)
-
-        fr_lay.addSpacing(8)
 
         self._match_label = QtWidgets.QLabel("")
         self._match_label.setStyleSheet("font-size:11px; min-width:80px;")
@@ -848,7 +852,7 @@ class AssetManagerWindow(QtWidgets.QWidget):
                 # the delegate an index and tooltip to draw against.
                 actions_item = QtWidgets.QTableWidgetItem()
                 actions_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-                actions_item.setToolTip("Browse: pick a new file · 📂: open containing folder")
+                actions_item.setToolTip("Browse: pick a new file · Folder: open containing folder")
                 self.table.setItem(row_idx, COL_ACTIONS, actions_item)
 
                 self.table.setRowHeight(row_idx, 30)
@@ -1342,7 +1346,6 @@ class SearchResultsDialog(QtWidgets.QDialog):
     def __init__(self, found, not_found, search_dir, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Search Results")
-        self.setStyleSheet(hou.qt.styleSheet())
         self.resize(780, 460)
         self._build_ui(found, not_found, search_dir)
 

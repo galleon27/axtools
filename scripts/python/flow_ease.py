@@ -1,0 +1,845 @@
+"""
+Flow Ease - cubic-bezier easing presets for Houdini keyframes.
+
+Select keyframes (or curve segments) in the Animation Editor, then pick a
+preset or shape the curve in the editor and press Apply. Every segment
+between consecutive selected keys on a channel gets the curve. If only one
+key is selected on a channel, only that key's own handles are eased (in
+handle from the curve's end, out handle from its start); neighbour keys are
+left alone. Keys selected in the timeline are used when nothing is selected
+in an Animation Editor.
+
+Curves use CSS-style cubic-bezier(x1, y1, x2, y2) on a normalised 0..1
+segment, the same notation Flow uses in After Effects.
+"""
+
+import json
+import math
+import os
+
+import hou
+
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+except ImportError:  # pragma: no cover - older Houdini builds
+    from PySide2 import QtCore, QtGui, QtWidgets
+
+
+# ---------------------------------------------------------------------------
+# Presets
+# ---------------------------------------------------------------------------
+
+# (category, name, (x1, y1, x2, y2)). Values from easings.net / CSS spec.
+BUILTIN_PRESETS = [
+    ("Basic", "Linear", (1.0 / 3, 1.0 / 3, 2.0 / 3, 2.0 / 3)),
+    ("Basic", "Ease", (0.25, 0.1, 0.25, 1.0)),
+    ("In", "Ease In", (0.42, 0.0, 1.0, 1.0)),
+    ("Out", "Ease Out", (0.0, 0.0, 0.58, 1.0)),
+    ("InOut", "Ease In Out", (0.42, 0.0, 0.58, 1.0)),
+
+    ("In", "Sine In", (0.12, 0.0, 0.39, 0.0)),
+    ("Out", "Sine Out", (0.61, 1.0, 0.88, 1.0)),
+    ("InOut", "Sine In Out", (0.37, 0.0, 0.63, 1.0)),
+
+    ("In", "Quad In", (0.11, 0.0, 0.5, 0.0)),
+    ("Out", "Quad Out", (0.5, 1.0, 0.89, 1.0)),
+    ("InOut", "Quad In Out", (0.45, 0.0, 0.55, 1.0)),
+
+    ("In", "Cubic In", (0.32, 0.0, 0.67, 0.0)),
+    ("Out", "Cubic Out", (0.33, 1.0, 0.68, 1.0)),
+    ("InOut", "Cubic In Out", (0.65, 0.0, 0.35, 1.0)),
+
+    ("In", "Quart In", (0.5, 0.0, 0.75, 0.0)),
+    ("Out", "Quart Out", (0.25, 1.0, 0.5, 1.0)),
+    ("InOut", "Quart In Out", (0.76, 0.0, 0.24, 1.0)),
+
+    ("In", "Quint In", (0.64, 0.0, 0.78, 0.0)),
+    ("Out", "Quint Out", (0.22, 1.0, 0.36, 1.0)),
+    ("InOut", "Quint In Out", (0.83, 0.0, 0.17, 1.0)),
+
+    ("In", "Expo In", (0.7, 0.0, 0.84, 0.0)),
+    ("Out", "Expo Out", (0.16, 1.0, 0.3, 1.0)),
+    ("InOut", "Expo In Out", (0.87, 0.0, 0.13, 1.0)),
+
+    ("In", "Circ In", (0.55, 0.0, 1.0, 0.45)),
+    ("Out", "Circ Out", (0.0, 0.55, 0.45, 1.0)),
+    ("InOut", "Circ In Out", (0.85, 0.0, 0.15, 1.0)),
+
+    ("In", "Back In", (0.36, 0.0, 0.66, -0.56)),
+    ("Out", "Back Out", (0.34, 1.56, 0.64, 1.0)),
+    ("InOut", "Back In Out", (0.68, -0.6, 0.32, 1.6)),
+
+    # Logistic 1 / (1 + e^(-10(t - 0.5))): mid slope 1 / (1 - x1) ~= 2.5.
+    ("InOut", "Sigmoid", (0.6, 0.0, 0.4, 1.0)),
+]
+
+CATEGORIES = ["All", "Basic", "In", "Out", "InOut", "Custom"]
+
+SIDE_BOTH = "Both"
+SIDE_START = "Start key only"
+SIDE_END = "End key only"
+
+# Keep handles off the exact segment ends: x == 0 or 1 means infinite slope.
+_X_EPS = 0.005
+_FRAME_TOL = 1e-4
+
+
+def _presets_path():
+    pref_dir = hou.text.expandString("$HOUDINI_USER_PREF_DIR")
+    return os.path.join(pref_dir, "flow_ease_presets.json")
+
+
+def load_user_presets():
+    """Return a list of (name, (x1, y1, x2, y2)) saved by the user."""
+    path = _presets_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [(item["name"], tuple(float(v) for v in item["bezier"]))
+                for item in data]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def save_user_presets(presets):
+    data = [{"name": name, "bezier": list(bez)} for name, bez in presets]
+    with open(_presets_path(), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Bezier <-> Houdini tangent conversion
+# ---------------------------------------------------------------------------
+#
+# Houdini's bezier() segment uses, per side, a slope (value/second) and an
+# accel, where accel is the 2D length of the tangent handle measured in
+# (seconds, value) space. So a handle with time extent w and slope s has
+# accel = w * sqrt(1 + s^2). (Verified against hython evaluation.)
+
+def clamp_bezier(bez):
+    x1, y1, x2, y2 = bez
+    x1 = min(max(x1, _X_EPS), 1.0 - _X_EPS)
+    x2 = min(max(x2, _X_EPS), 1.0 - _X_EPS)
+    return x1, y1, x2, y2
+
+
+def bezier_to_tangents(bez, dt, dv):
+    """Map a normalised cubic-bezier onto a segment of dt seconds / dv units.
+
+    Returns ((out_slope, out_accel), (in_slope, in_accel)) where "out" is the
+    start key's outgoing tangent and "in" is the end key's incoming tangent.
+    """
+    x1, y1, x2, y2 = clamp_bezier(bez)
+    w_out = x1 * dt
+    w_in = (1.0 - x2) * dt
+    s_out = (y1 * dv) / w_out
+    s_in = ((1.0 - y2) * dv) / w_in
+    a_out = w_out * math.sqrt(1.0 + s_out * s_out)
+    a_in = w_in * math.sqrt(1.0 + s_in * s_in)
+    return (s_out, a_out), (s_in, a_in)
+
+
+def tangents_to_bezier(out_tan, in_tan, dt, dv):
+    """Inverse of bezier_to_tangents. Returns (x1, y1, x2, y2)."""
+    s_out, a_out = out_tan
+    s_in, a_in = in_tan
+    w_out = a_out / math.sqrt(1.0 + s_out * s_out)
+    w_in = a_in / math.sqrt(1.0 + s_in * s_in)
+    x1 = w_out / dt
+    x2 = 1.0 - w_in / dt
+    if abs(dv) < 1e-12:
+        # Flat segment: the value axis carries no information.
+        y1, y2 = 0.0, 1.0
+    else:
+        y1 = s_out * w_out / dv
+        y2 = 1.0 - s_in * w_in / dv
+    return x1, y1, x2, y2
+
+
+def bezier_point(bez, s):
+    x1, y1, x2, y2 = bez
+    u = 1.0 - s
+    x = 3 * u * u * s * x1 + 3 * u * s * s * x2 + s ** 3
+    y = 3 * u * u * s * y1 + 3 * u * s * s * y2 + s ** 3
+    return x, y
+
+
+# ---------------------------------------------------------------------------
+# Keyframe access
+# ---------------------------------------------------------------------------
+
+def _out_tangent(key):
+    """(slope, accel) leaving the key, or None if the key doesn't store one."""
+    try:
+        return key.slope(), key.accel()
+    except hou.KeyframeValueNotSet:
+        return None
+
+
+def _in_tangent(key):
+    """(slope, accel) entering the key, or None if the key doesn't store one."""
+    try:
+        slope = key.slope() if key.isSlopeTied() else key.inSlope()
+        accel = key.accel() if key.isAccelTied() else key.inAccel()
+        return slope, accel
+    except hou.KeyframeValueNotSet:
+        return None
+
+
+def _in_value(key):
+    return key.value() if key.isValueTied() else key.inValue()
+
+
+# Keys made in the UI default to auto slope, which makes Houdini recompute the
+# tangents and ignore any slope/accel we set. Turn it off per side first.
+
+def _set_out(key, slope, accel):
+    key.setSlopeAuto(False)
+    key.setSlope(slope)
+    key.setAccel(accel)
+
+
+def _set_in(key, slope, accel):
+    key.setInSlopeAuto(False)
+    key.setInSlope(slope)
+    key.setInAccel(accel)
+
+
+def _animation_editors():
+    """All Animation Editor (channel editor) pane tabs, docked or floating."""
+    if not hou.isUIAvailable():
+        return []
+    tabs = list(hou.ui.paneTabs())
+    for panel in hou.ui.floatingPanels():
+        tabs.extend(panel.paneTabs())
+    editors, seen = [], set()
+    for tab in tabs:
+        if tab.type() != hou.paneTabType.ChannelEditor or tab.name() in seen:
+            continue
+        seen.add(tab.name())
+        editors.append(tab)
+    return editors
+
+
+def _editor_selection():
+    """Selected keys and segments from every Animation Editor.
+
+    Returns ({parm: set_of_key_frames}, {parm: set_of_(f0, f1)_segments}).
+    """
+    keys, segments = {}, {}
+    for editor in _animation_editors():
+        try:
+            graph = editor.graph()
+        except hou.Error:
+            continue
+
+        for parm, sel_keys in graph.selectedKeyframes().items():
+            keys.setdefault(parm, set()).update(round(k.frame(), 6) for k in sel_keys)
+
+        # Segments clicked directly on the curve (no keys selected).
+        try:
+            selection = graph.selection()
+        except hou.Error:
+            selection = ()
+        for sel in selection:
+            try:
+                parm = sel.parm() or hou.parm(sel.path())
+                flags = sel.segments()
+            except (hou.Error, AttributeError):
+                continue
+            if parm is None or not any(flags):
+                continue
+            frames = [k.frame() for k in sel.keyframes()]
+            for i, flag in enumerate(flags[:len(frames) - 1]):
+                if flag:
+                    segments.setdefault(parm, set()).add(
+                        (round(frames[i], 6), round(frames[i + 1], 6)))
+    return keys, segments
+
+
+def _selected_segments():
+    """Yield (parm, [(start_frame, end_frame), ...], single_key_frame).
+
+    single_key_frame is the frame of the only selected key on a channel with
+    no selected segments (spans is then empty), else None. Uses the Animation
+    Editor selection; falls back to keys selected in the timeline when
+    nothing is selected in an Animation Editor.
+    """
+    keys, segments = _editor_selection()
+    if not keys and not segments:
+        try:
+            keys = {parm: {round(k.frame(), 6) for k in sel_keys}
+                    for parm, sel_keys in hou.playbar.selectedKeyframes().items()}
+        except (AttributeError, hou.Error):
+            keys = {}
+
+    for parm in set(keys) | set(segments):
+        spans = set(segments.get(parm, ()))
+        frames = sorted(keys.get(parm, ()))
+        if len(frames) == 1 and not spans:
+            yield parm, [], frames[0]
+            continue
+        spans.update(zip(frames[:-1], frames[1:]))
+        if spans:
+            yield parm, sorted(spans), None
+
+
+def apply_easing_to_segments(segments, bez, side=SIDE_BOTH):
+    """Apply a bezier to explicit segments.
+
+    segments: iterable of (parm, [(start_frame, end_frame), ...]).
+    Returns (segments_done, list_of_error_strings).
+    """
+    done = 0
+    errors = []
+
+    for parm, spans in segments:
+        keys = {round(k.frame(), 6): k for k in parm.keyframes()}
+
+        def find(frame):
+            for f, k in keys.items():
+                if abs(f - frame) < _FRAME_TOL:
+                    return k
+            return None
+
+        touched = {}
+        for f0, f1 in spans:
+            k0 = touched.get(f0) or find(f0)
+            k1 = touched.get(f1) or find(f1)
+            if k0 is None or k1 is None:
+                continue
+            dt = k1.time() - k0.time()
+            if dt <= 0:
+                continue
+            dv = _in_value(k1) - k0.value()
+            (s_out, a_out), (s_in, a_in) = bezier_to_tangents(bez, dt, dv)
+
+            if side in (SIDE_BOTH, SIDE_START):
+                # Pin the incoming side first so a tied tangent doesn't
+                # drag the previous segment along with the new out tangent.
+                in_tan = _in_tangent(k0)
+                if in_tan is not None:
+                    _set_in(k0, *in_tan)
+                _set_out(k0, s_out, a_out)
+            k0.setExpression("bezier()", hou.exprLanguage.Hscript)
+
+            if side in (SIDE_BOTH, SIDE_END):
+                out_tan = _out_tangent(k1)
+                if out_tan is not None:
+                    _set_out(k1, *out_tan)
+                _set_in(k1, s_in, a_in)
+
+            touched[f0] = k0
+            touched[f1] = k1
+            done += 1
+
+        for key in touched.values():
+            try:
+                parm.setKeyframe(key)
+            except hou.Error as e:
+                errors.append("%s: %s" % (parm.path(), e.instanceMessage()))
+
+    return done, errors
+
+
+def apply_easing_to_key(parm, frame, bez, side=SIDE_BOTH):
+    """Ease only the handles of the key at frame; neighbour keys are kept.
+
+    The out handle takes the bezier's start handle over the key's outgoing
+    segment, the in handle takes its end handle over the incoming segment.
+    "Start key only" sets just the out handle, "End key only" just the in.
+    Returns True if anything was set.
+    """
+    keys = sorted(parm.keyframes(), key=lambda k: k.frame())
+    idx = next((i for i, k in enumerate(keys)
+                if abs(k.frame() - frame) < _FRAME_TOL), None)
+    if idx is None:
+        return False
+    key = keys[idx]
+    prev = keys[idx - 1] if idx > 0 else None
+    nxt = keys[idx + 1] if idx + 1 < len(keys) else None
+
+    # Pin both sides first so a tied tangent can't drag the other side.
+    in_tan, out_tan = _in_tangent(key), _out_tangent(key)
+    if in_tan is not None:
+        _set_in(key, *in_tan)
+    if out_tan is not None:
+        _set_out(key, *out_tan)
+
+    changed = False
+    if side in (SIDE_BOTH, SIDE_START) and nxt is not None:
+        dt = nxt.time() - key.time()
+        if dt > 0:
+            (s_out, a_out), _ = bezier_to_tangents(
+                bez, dt, _in_value(nxt) - key.value())
+            _set_out(key, s_out, a_out)
+            key.setExpression("bezier()", hou.exprLanguage.Hscript)
+            changed = True
+    if side in (SIDE_BOTH, SIDE_END) and prev is not None:
+        dt = key.time() - prev.time()
+        if dt > 0:
+            _, (s_in, a_in) = bezier_to_tangents(
+                bez, dt, _in_value(key) - prev.value())
+            _set_in(key, s_in, a_in)
+            if prev.expression() != "bezier()":
+                prev.setExpression("bezier()", hou.exprLanguage.Hscript)
+                parm.setKeyframe(prev)
+            changed = True
+
+    if changed:
+        parm.setKeyframe(key)
+    return changed
+
+
+def apply_easing(bez, side=SIDE_BOTH):
+    """Apply a bezier to the selected keyframes as one undo step.
+
+    Returns (segments_done, keys_done, list_of_error_strings).
+    """
+    selection = list(_selected_segments())
+    if not selection:
+        return 0, 0, ["Select keys or segments in the Animation Editor."]
+    spans = [(parm, s) for parm, s, single in selection if single is None]
+    singles = [(parm, single) for parm, _, single in selection
+               if single is not None]
+    keys_done = 0
+    errors = []
+    with hou.undos.group("Flow Ease"):
+        done, errors = apply_easing_to_segments(spans, bez, side)
+        for parm, frame in singles:
+            try:
+                keys_done += apply_easing_to_key(parm, frame, bez, side)
+            except hou.Error as e:
+                errors.append("%s: %s" % (parm.path(), e.instanceMessage()))
+    return done, keys_done, errors
+
+
+def read_easing_from_selection():
+    """Return the bezier of the first selected segment, or None.
+
+    For a single selected key, reads the segment leaving it (or entering it,
+    if it's the last key).
+    """
+    for parm, spans, single in _selected_segments():
+        keys = parm.keyframes()
+        if single is not None:
+            frames = sorted(k.frame() for k in keys)
+            later = [f for f in frames if f > single + _FRAME_TOL]
+            earlier = [f for f in frames if f < single - _FRAME_TOL]
+            if later:
+                spans = [(single, later[0])]
+            elif earlier:
+                spans = [(earlier[-1], single)]
+        for f0, f1 in spans:
+            k0 = next((k for k in keys if abs(k.frame() - f0) < _FRAME_TOL), None)
+            k1 = next((k for k in keys if abs(k.frame() - f1) < _FRAME_TOL), None)
+            if k0 is None or k1 is None:
+                continue
+            out_tan, in_tan = _out_tangent(k0), _in_tangent(k1)
+            if out_tan is None or in_tan is None:
+                continue
+            try:
+                return tangents_to_bezier(
+                    out_tan, in_tan,
+                    k1.time() - k0.time(), _in_value(k1) - k0.value())
+            except ZeroDivisionError:
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Drawing
+# ---------------------------------------------------------------------------
+
+def _curve_path(bez, to_screen, steps=64):
+    path = QtGui.QPainterPath()
+    path.moveTo(to_screen(0.0, 0.0))
+    for i in range(1, steps + 1):
+        x, y = bezier_point(bez, i / float(steps))
+        path.lineTo(to_screen(x, y))
+    return path
+
+
+def make_thumbnail(bez, size=56):
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtGui.QColor(38, 38, 38))
+    lo = min(0.0, bez[1], bez[3])
+    hi = max(1.0, bez[1], bez[3])
+    pad = 7
+
+    def to_screen(x, y):
+        sx = pad + x * (size - 2 * pad)
+        sy = size - pad - (y - lo) / (hi - lo) * (size - 2 * pad)
+        return QtCore.QPointF(sx, sy)
+
+    p = QtGui.QPainter(pixmap)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    p.setPen(QtGui.QPen(QtGui.QColor(70, 70, 70), 1))
+    p.drawLine(to_screen(0, 0), to_screen(1, 0))
+    p.drawLine(to_screen(0, 1), to_screen(1, 1))
+    p.setPen(QtGui.QPen(QtGui.QColor(255, 170, 60), 2))
+    p.drawPath(_curve_path(bez, to_screen, 32))
+    p.end()
+    return pixmap
+
+
+class CurveEditor(QtWidgets.QWidget):
+    """Draggable cubic-bezier editor."""
+
+    changed = QtCore.Signal(tuple)
+
+    HANDLE_R = 6
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._bez = (0.65, 0.0, 0.35, 1.0)
+        self._drag = None
+        self._lo, self._hi = -0.25, 1.25
+        self.setMinimumSize(180, 180)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+
+    def bezier(self):
+        return self._bez
+
+    def set_bezier(self, bez, emit=False):
+        self._bez = tuple(float(v) for v in bez)
+        if self._drag is None:
+            self._fit_range()
+        self.update()
+        if emit:
+            self.changed.emit(self._bez)
+
+    def _fit_range(self):
+        y1, y2 = self._bez[1], self._bez[3]
+        self._lo = min(-0.25, y1 - 0.15, y2 - 0.15)
+        self._hi = max(1.25, y1 + 0.15, y2 + 0.15)
+
+    def _frame(self):
+        m = 14
+        r = self.rect().adjusted(m, m, -m, -m)
+        # Keep the unit square roughly square.
+        span = self._hi - self._lo
+        w = min(r.width(), r.height() / span)
+        h = w * span
+        left = r.left() + (r.width() - w) / 2.0
+        top = r.top() + (r.height() - h) / 2.0
+        return QtCore.QRectF(left, top, w, h)
+
+    def _to_screen(self, x, y):
+        f = self._frame()
+        return QtCore.QPointF(f.left() + x * f.width(),
+                              f.bottom() - (y - self._lo) / (self._hi - self._lo) * f.height())
+
+    def _from_screen(self, pt):
+        f = self._frame()
+        x = (pt.x() - f.left()) / f.width()
+        y = self._lo + (f.bottom() - pt.y()) / f.height() * (self._hi - self._lo)
+        return x, y
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.fillRect(self.rect(), QtGui.QColor(32, 32, 32))
+
+        grid = QtGui.QPen(QtGui.QColor(55, 55, 55), 1)
+        p.setPen(grid)
+        for i in range(5):
+            t = i / 4.0
+            p.drawLine(self._to_screen(t, self._lo), self._to_screen(t, self._hi))
+            p.drawLine(self._to_screen(0, t), self._to_screen(1, t))
+        p.setPen(QtGui.QPen(QtGui.QColor(95, 95, 95), 1))
+        p.drawLine(self._to_screen(0, 0), self._to_screen(1, 0))
+        p.drawLine(self._to_screen(0, 1), self._to_screen(1, 1))
+
+        x1, y1, x2, y2 = self._bez
+        p0, p1 = self._to_screen(0, 0), self._to_screen(x1, y1)
+        p2, p3 = self._to_screen(x2, y2), self._to_screen(1, 1)
+
+        p.setPen(QtGui.QPen(QtGui.QColor(140, 140, 140), 1, QtCore.Qt.DashLine))
+        p.drawLine(p0, p1)
+        p.drawLine(p3, p2)
+
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 170, 60), 2.5))
+        p.drawPath(_curve_path(self._bez, self._to_screen))
+
+        p.setPen(QtCore.Qt.NoPen)
+        for pt, color in ((p1, QtGui.QColor(90, 180, 255)),
+                          (p2, QtGui.QColor(255, 110, 140))):
+            p.setBrush(color)
+            p.drawEllipse(pt, self.HANDLE_R, self.HANDLE_R)
+        p.setBrush(QtGui.QColor(220, 220, 220))
+        for pt in (p0, p3):
+            p.drawEllipse(pt, 3.5, 3.5)
+        p.end()
+
+    def _hit(self, pos):
+        x1, y1, x2, y2 = self._bez
+        best, best_d = None, (self.HANDLE_R + 6) ** 2
+        for idx, (x, y) in enumerate(((x1, y1), (x2, y2))):
+            sp = self._to_screen(x, y)
+            d = (sp.x() - pos.x()) ** 2 + (sp.y() - pos.y()) ** 2
+            if d < best_d:
+                best, best_d = idx, d
+        return best
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self._drag = self._hit(event.position())
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self._drag is None:
+            self.setCursor(QtCore.Qt.PointingHandCursor if self._hit(pos) is not None
+                           else QtCore.Qt.ArrowCursor)
+            return
+        x, y = self._from_screen(pos)
+        x = min(max(x, 0.0), 1.0)
+        y = min(max(y, self._lo), self._hi)
+        if event.modifiers() & QtCore.Qt.ShiftModifier:
+            x, y = round(x * 20) / 20.0, round(y * 20) / 20.0
+        b = list(self._bez)
+        b[self._drag * 2] = round(x, 3)
+        b[self._drag * 2 + 1] = round(y, 3)
+        self.set_bezier(b, emit=True)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag is not None:
+            self._drag = None
+            self._fit_range()
+            self.update()
+
+
+# ---------------------------------------------------------------------------
+# Panel
+# ---------------------------------------------------------------------------
+
+_ROLE_BEZ = QtCore.Qt.UserRole
+_ROLE_CUSTOM = QtCore.Qt.UserRole + 1
+
+
+class FlowPanel(QtWidgets.QWidget):
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._user_presets = load_user_presets()
+
+        self.editor = CurveEditor()
+        self.editor.changed.connect(self._on_editor_changed)
+
+        self.spins = []
+        spin_row = QtWidgets.QHBoxLayout()
+        for label in ("x1", "y1", "x2", "y2"):
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setDecimals(3)
+            spin.setSingleStep(0.01)
+            if label.startswith("x"):
+                spin.setRange(0.0, 1.0)
+            else:
+                spin.setRange(-3.0, 4.0)
+            spin.valueChanged.connect(self._on_spin_changed)
+            spin_row.addWidget(QtWidgets.QLabel(label))
+            spin_row.addWidget(spin, 1)
+            self.spins.append(spin)
+
+        self.category = QtWidgets.QComboBox()
+        self.category.addItems(CATEGORIES)
+        self.category.currentTextChanged.connect(self._populate)
+
+        self.apply_on_click = QtWidgets.QCheckBox("Apply on click")
+        self.apply_on_click.setChecked(True)
+        self.apply_on_click.setToolTip(
+            "Apply a preset to the selected keys as soon as it's clicked.\n"
+            "Off: click loads the preset, double-click applies.")
+
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.addWidget(QtWidgets.QLabel("Presets"))
+        filter_row.addWidget(self.category, 1)
+        filter_row.addWidget(self.apply_on_click)
+
+        self.preset_list = QtWidgets.QListWidget()
+        self.preset_list.setViewMode(QtWidgets.QListView.IconMode)
+        self.preset_list.setIconSize(QtCore.QSize(56, 56))
+        self.preset_list.setGridSize(QtCore.QSize(84, 86))
+        self.preset_list.setResizeMode(QtWidgets.QListView.Adjust)
+        self.preset_list.setMovement(QtWidgets.QListView.Static)
+        self.preset_list.setWordWrap(True)
+        self.preset_list.setMinimumHeight(120)
+        self.preset_list.itemClicked.connect(self._on_preset_clicked)
+        self.preset_list.itemDoubleClicked.connect(self._on_preset_double_clicked)
+
+        self.side = QtWidgets.QComboBox()
+        self.side.addItems([SIDE_BOTH, SIDE_START, SIDE_END])
+        self.side.setToolTip("Which side of each segment to ease.\n"
+                             "Start key only = only the outgoing handle of the first key.\n"
+                             "End key only = only the incoming handle of the second key.\n"
+                             "With a single key selected: Start = its out handle, "
+                             "End = its in handle.")
+
+        apply_btn = QtWidgets.QPushButton("Apply")
+        apply_btn.setMinimumHeight(30)
+        apply_btn.clicked.connect(self._apply_current)
+        read_btn = QtWidgets.QPushButton("Read Keys")
+        read_btn.setToolTip("Load the curve of the first selected segment into the editor.")
+        read_btn.clicked.connect(self._read_selection)
+        save_btn = QtWidgets.QPushButton("Save Preset")
+        save_btn.clicked.connect(self._save_preset)
+        self.delete_btn = QtWidgets.QPushButton("Delete Preset")
+        self.delete_btn.clicked.connect(self._delete_preset)
+
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.addWidget(QtWidgets.QLabel("Ease"))
+        action_row.addWidget(self.side)
+        action_row.addWidget(apply_btn, 1)
+
+        preset_row = QtWidgets.QHBoxLayout()
+        preset_row.addWidget(read_btn)
+        preset_row.addWidget(save_btn)
+        preset_row.addWidget(self.delete_btn)
+
+        self.status = QtWidgets.QLabel("")
+        self.status.setStyleSheet("color: #999;")
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        top = QtWidgets.QWidget()
+        top_layout = QtWidgets.QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.addWidget(self.editor, 1)
+        top_layout.addLayout(spin_row)
+        bottom = QtWidgets.QWidget()
+        bottom_layout = QtWidgets.QVBoxLayout(bottom)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.addLayout(filter_row)
+        bottom_layout.addWidget(self.preset_list, 1)
+        splitter.addWidget(top)
+        splitter.addWidget(bottom)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(splitter, 1)
+        layout.addLayout(action_row)
+        layout.addLayout(preset_row)
+        layout.addWidget(self.status)
+
+        self._sync_spins(self.editor.bezier())
+        self._populate()
+
+    # -- presets ------------------------------------------------------------
+
+    def _populate(self, *_):
+        cat = self.category.currentText()
+        self.preset_list.clear()
+        entries = []
+        if cat != "Custom":
+            entries += [(n, b, False) for c, n, b in BUILTIN_PRESETS
+                        if cat == "All" or c == cat]
+        if cat in ("All", "Custom"):
+            entries += [(n, b, True) for n, b in self._user_presets]
+        for name, bez, custom in entries:
+            item = QtWidgets.QListWidgetItem(QtGui.QIcon(make_thumbnail(bez)), name)
+            item.setData(_ROLE_BEZ, bez)
+            item.setData(_ROLE_CUSTOM, custom)
+            item.setToolTip("%s\ncubic-bezier(%s)" % (name, ", ".join("%g" % v for v in bez)))
+            self.preset_list.addItem(item)
+
+    def _on_preset_clicked(self, item):
+        self._load(item.data(_ROLE_BEZ))
+        if self.apply_on_click.isChecked():
+            self._apply_current(label=item.text())
+
+    def _on_preset_double_clicked(self, item):
+        if not self.apply_on_click.isChecked():
+            self._apply_current(label=item.text())
+
+    def _save_preset(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save Preset", "Preset name:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        bez = tuple(round(v, 4) for v in self.editor.bezier())
+        self._user_presets = [(n, b) for n, b in self._user_presets if n != name]
+        self._user_presets.append((name, bez))
+        try:
+            save_user_presets(self._user_presets)
+        except OSError as e:
+            self._set_status("Could not save presets: %s" % e, error=True)
+            return
+        self._populate()
+        self._set_status("Saved preset '%s'." % name)
+
+    def _delete_preset(self):
+        item = self.preset_list.currentItem()
+        if item is None or not item.data(_ROLE_CUSTOM):
+            self._set_status("Select a custom preset to delete.", error=True)
+            return
+        name = item.text()
+        self._user_presets = [(n, b) for n, b in self._user_presets if n != name]
+        try:
+            save_user_presets(self._user_presets)
+        except OSError as e:
+            self._set_status("Could not save presets: %s" % e, error=True)
+            return
+        self._populate()
+        self._set_status("Deleted preset '%s'." % name)
+
+    # -- editor <-> spins ---------------------------------------------------
+
+    def _load(self, bez):
+        self.editor.set_bezier(bez)
+        self._sync_spins(bez)
+
+    def _sync_spins(self, bez):
+        for spin, v in zip(self.spins, bez):
+            spin.blockSignals(True)
+            spin.setValue(v)
+            spin.blockSignals(False)
+
+    def _on_editor_changed(self, bez):
+        self._sync_spins(bez)
+
+    def _on_spin_changed(self, *_):
+        self.editor.set_bezier(tuple(s.value() for s in self.spins))
+
+    # -- actions ------------------------------------------------------------
+
+    def _apply_current(self, *_, label=None):
+        bez = self.editor.bezier()
+        try:
+            done, keys_done, errors = apply_easing(bez, self.side.currentText())
+        except hou.Error as e:
+            self._set_status(e.instanceMessage(), error=True)
+            return
+        if errors and not done and not keys_done:
+            self._set_status(errors[0], error=True)
+            return
+        parts = []
+        if done or not keys_done:
+            parts.append("%d segment%s" % (done, "" if done == 1 else "s"))
+        if keys_done:
+            parts.append("%d key%s" % (keys_done, "" if keys_done == 1 else "s"))
+        msg = "Applied %s to %s." % (label or "curve", " and ".join(parts))
+        if errors:
+            msg += " %d error(s): %s" % (len(errors), errors[0])
+        self._set_status(msg, error=bool(errors))
+
+    def _read_selection(self):
+        bez = read_easing_from_selection()
+        if bez is None:
+            self._set_status("Select at least one keyframe segment.", error=True)
+            return
+        x1, y1, x2, y2 = bez
+        bez = (min(max(x1, 0.0), 1.0), y1, min(max(x2, 0.0), 1.0), y2)
+        self._load(tuple(round(v, 4) for v in bez))
+        self._set_status("Read curve from keys.")
+
+    def _set_status(self, text, error=False):
+        self.status.setStyleSheet("color: %s;" % ("#e87d6a" if error else "#999"))
+        self.status.setText(text)
+
+
+def onCreateInterface():
+    return FlowPanel()
