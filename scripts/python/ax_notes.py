@@ -108,11 +108,11 @@ _BOLD_ITALIC_MAP = _math_table(0x1D468, 0x1D482)
 _MONO_MAP = _math_table(0x1D670, 0x1D68A, 0x1D7F6)
 
 UNDERLINE_MARK = "̲"
-STRIKE_MARK = "̶"
+STRIKE_WRAP = "~~"                     # sticky font has no combining stroke glyph
 DIVIDER_TEXT = "─" * 12
 
 
-def _style_char(ch, bold, italic, code, underline, strike):
+def _style_char(ch, bold, italic, code, underline):
     if code:
         out = _MONO_MAP.get(ch, ch)
     elif bold and italic:
@@ -123,11 +123,8 @@ def _style_char(ch, bold, italic, code, underline, strike):
         out = _ITALIC_MAP.get(ch, ch)
     else:
         out = ch
-    if not ch.isspace():
-        if underline:
-            out += UNDERLINE_MARK
-        if strike:
-            out += STRIKE_MARK
+    if underline and not ch.isspace():
+        out += UNDERLINE_MARK
     return out
 
 
@@ -144,19 +141,34 @@ def _block_is_divider(block):
     return prop is not None and block.blockFormat().hasProperty(prop)
 
 
+def _wrap_strike(run):
+    """~~run~~, keeping leading/trailing spaces outside the markers."""
+    core = run.strip()
+    if not core:
+        return run
+    start = run.index(core[0])
+    end = start + len(core)
+    return run[:start] + STRIKE_WRAP + core + STRIKE_WRAP + run[end:]
+
+
 def _block_to_unicode(block):
     text = block.text()
     doc = block.document()
     out = []
+    run, run_struck = [], False
     cur = QTextCursor(doc)
     for i, ch in enumerate(text):
         cur.setPosition(block.position() + i)
         cur.setPosition(block.position() + i + 1, QTextCursor.KeepAnchor)
         cf = cur.charFormat()
+        struck = cf.fontStrikeOut()
+        if struck != run_struck:
+            out.append(_wrap_strike("".join(run)) if run_struck else "".join(run))
+            run, run_struck = [], struck
         # bold / italic / headings don't render well in sticky notes -> plain text
-        out.append(_style_char(
-            ch, False, False,
-            _is_code_format(cf), cf.fontUnderline(), cf.fontStrikeOut()))
+        run.append(_style_char(
+            ch, False, False, _is_code_format(cf), cf.fontUnderline()))
+    out.append(_wrap_strike("".join(run)) if run_struck else "".join(run))
     line = "".join(out)
 
     lst = block.textList()
