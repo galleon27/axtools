@@ -9,6 +9,9 @@ Features
     * "Sticky" button: mirrors the note into a network-editor sticky note as
       Unicode text (underline/strike/code/lists/to-dos survive; bold, italic and headings become plain text;
       colours don't) and keeps it updated live while you edit
+    * "Link sticky" (or opening the panel with one sticky selected) reads a
+      sticky's text back into rich text and keeps it in sync
+    * Footer shows when the note was last edited
     * Edit / View mode toggle (view mode hides formatting, locks the text,
       but to-do boxes can still be ticked)
     * Notes are stored INSIDE the .hip file (root node user data), autosaved
@@ -25,6 +28,8 @@ Works with PySide2 (Houdini 18.5 - 20.5) and PySide6 (Houdini 21+).
 """
 
 import json
+import re
+import time
 
 import hou
 
@@ -45,6 +50,8 @@ QTextListFormat = QtGui.QTextListFormat
 STORAGE_KEY = "custom_notes_html"      # user-data key on the root node (/)
 STICKY_KEY = "custom_notes_sticky"     # JSON [parent path, sticky name]
 MODE_KEY = "custom_notes_mode"         # "edit" or "view"
+EDITED_KEY = "custom_notes_edited"     # epoch seconds of the last edit
+PLACEHOLDER = "Write your notes here..."
 BOX_OFF = "\u2610"                     # ☐
 BOX_ON = "\u2611"                      # ☑
 BOXES = (BOX_OFF, BOX_ON)
@@ -110,6 +117,16 @@ _MONO_MAP = _math_table(0x1D670, 0x1D68A, 0x1D7F6)
 UNDERLINE_MARK = "̲"
 STRIKE_WRAP = "~~"                     # sticky font has no combining stroke glyph
 DIVIDER_TEXT = "─" * 12
+
+# lookalike char -> (plain char, bold, italic, code), for reading sticky text back
+_UNSTYLE = {}
+for _map, _flags in ((_BOLD_MAP, (True, False, False)),
+                     (_ITALIC_MAP, (False, True, False)),
+                     (_BOLD_ITALIC_MAP, (True, True, False)),
+                     (_MONO_MAP, (False, False, True))):
+    for _k, _v in _map.items():
+        _UNSTYLE[_v] = (_k,) + _flags
+_LIST_RE = re.compile(r"( *)(?:(•)|(\d+)\.) (.*)$")
 
 
 def _style_char(ch, bold, italic, code, underline):
@@ -205,7 +222,8 @@ class NotesEdit(QtWidgets.QTextEdit):
         self.setAcceptRichText(True)
         self.viewport().setMouseTracking(True)
         self.document().setDocumentMargin(10)
-        self.setPlaceholderText("Write your notes here...")
+        self.document().contentsChanged.connect(self._update_placeholder)
+        self._update_placeholder()
         size = self.font().pointSizeF()
         self._base_size = size if size > 0 else 10.0
         self._base_family = self.font().family()
@@ -235,6 +253,109 @@ class NotesEdit(QtWidgets.QTextEdit):
     def merge_format(self, fmt):
         self.mergeCurrentCharFormat(fmt)
         self.setFocus()
+
+    def _update_placeholder(self):
+        # Qt only checks for "no text", so an empty bullet would still show it
+        doc = self.document()
+        first = doc.firstBlock()
+        empty = (doc.isEmpty() and doc.blockCount() == 1 and first.textList() is None
+                 and first.blockFormat().indent() == 0)
+        text = PLACEHOLDER if empty else ""
+        if self.placeholderText() != text:
+            self.setPlaceholderText(text)
+            self.viewport().update()
+
+    # ---- loading sticky-note text ----------------------------------------- #
+    def _unicode_format(self, bold, italic, code, underline, struck, done):
+        f = QTextCharFormat()
+        if bold:
+            f.setFontWeight(BOLD)
+        if italic:
+            f.setFontItalic(True)
+        if underline:
+            f.setFontUnderline(True)
+        if struck:
+            f.setFontStrikeOut(True)
+        if done:
+            f.setForeground(QtGui.QBrush(QtGui.QColor(*DONE_COLOR)))
+        if code:
+            f.setFontFamily(self._code_family)
+            f.setBackground(QtGui.QBrush(QtGui.QColor(*CODE_BG)))
+        return f
+
+    def _insert_unicode_line(self, cur, body):
+        done = False
+        if body[:1] in BOXES:
+            done = body[0] == BOX_ON
+            cur.insertText(body[0], QTextCharFormat())
+            body = body[1:]
+        if body.count(STRIKE_WRAP) % 2 == 0:
+            segments = body.split(STRIKE_WRAP)
+        else:                              # unbalanced markers: keep them as text
+            segments = [body]
+        for i, seg in enumerate(segments):
+            struck = done or i % 2 == 1
+            run, run_key, j = [], None, 0
+            while j < len(seg):
+                ch = seg[j]
+                j += 1
+                underline = False
+                while j < len(seg) and seg[j] == UNDERLINE_MARK:
+                    underline = True
+                    j += 1
+                plain, bold, italic, code = _UNSTYLE.get(ch, (ch, False, False, False))
+                key = (bold, italic, code, underline)
+                if key != run_key and run:
+                    cur.insertText("".join(run), self._unicode_format(*run_key + (struck, done)))
+                    run = []
+                run_key = key
+                run.append(plain)
+            if run:
+                cur.insertText("".join(run), self._unicode_format(*run_key + (struck, done)))
+
+    def set_unicode(self, text):
+        """Rebuild rich text from sticky-note text (inverse of rich_to_unicode)."""
+        self.clear()
+        cur = QTextCursor(self.document())
+        cur.beginEditBlock()
+        ruler = getattr(QtGui.QTextFormat, "BlockTrailingHorizontalRulerWidth", None)
+        lists = {}                         # indent -> list still open at that level
+        first = True
+        for line in text.split("\n"):
+            if line == DIVIDER_TEXT and not first and ruler is not None:
+                bf = cur.blockFormat()
+                bf.setProperty(ruler, QtGui.QTextLength(QtGui.QTextLength.PercentageLength, 100))
+                cur.setBlockFormat(bf)
+                continue
+            if not first:
+                cur.insertBlock(QtGui.QTextBlockFormat(), QTextCharFormat())
+            first = False
+            m = _LIST_RE.match(line)
+            if m:
+                indent = len(m.group(1)) // 2 + 1
+                style = QTextListFormat.ListDisc if m.group(2) else QTextListFormat.ListDecimal
+                for k in [k for k in lists if k > indent]:
+                    del lists[k]
+                lst = lists.get(indent)
+                if lst is not None and lst.format().style() == style:
+                    lst.add(cur.block())
+                else:
+                    fmt = QTextListFormat()
+                    fmt.setStyle(style)
+                    fmt.setIndent(indent)
+                    lists[indent] = cur.createList(fmt)
+                body = m.group(4)
+            else:
+                lists.clear()
+                body = line.lstrip(" ")
+                indent = (len(line) - len(body)) // 2
+                if indent:
+                    bf = cur.blockFormat()
+                    bf.setIndent(indent)
+                    cur.setBlockFormat(bf)
+            self._insert_unicode_line(cur, body)
+        cur.endEditBlock()
+        self.setCurrentCharFormat(QTextCharFormat())
 
     # ---- inline formatting ------------------------------------------------ #
     def toggle_format(self, kind):
@@ -329,6 +450,11 @@ class NotesEdit(QtWidgets.QTextEdit):
                 bf.setIndent(0)
                 bc.setBlockFormat(bf)
         else:
+            for b in blocks:                   # a to-do becomes a plain list item
+                if b.text()[:1] in BOXES:
+                    self._strip_box(b)
+                else:                          # don't draw the marker struck/grey
+                    QTextCursor(b).setBlockCharFormat(QTextCharFormat())
             fmt = QTextListFormat()
             fmt.setStyle(style)
             fmt.setIndent(first_list.format().indent() if first_list else 1)
@@ -411,6 +537,10 @@ class NotesEdit(QtWidgets.QTextEdit):
             f.setFontStrikeOut(False)
             f.setForeground(self.palette().text())
             r.mergeCharFormat(f)
+        # the block format is what an empty line types with / lists draw with
+        QTextCursor(block).setBlockCharFormat(QTextCharFormat())
+        if block.length() <= 1 and self.textCursor().block() == block:
+            self.setCurrentCharFormat(QTextCharFormat())
 
     def toggle_box(self, block):
         text = block.text()
@@ -484,10 +614,11 @@ class NotesEdit(QtWidgets.QTextEdit):
                     return
                 if cur.positionInBlock() >= 2:        # continue the to-do list
                     cur.beginEditBlock()
-                    cur.insertBlock()
+                    cur.insertBlock(cur.blockFormat(), QTextCharFormat())
                     cur.insertText(BOX_OFF + " ", QTextCharFormat())
                     cur.endEditBlock()
                     self.setTextCursor(cur)
+                    self.setCurrentCharFormat(QTextCharFormat())
                     return
 
         elif key == Qt.Key_Backspace and is_todo and not cur.hasSelection():
@@ -557,12 +688,19 @@ class NotesPanel(QtWidgets.QWidget):
         header.addWidget(self.b_link)
         header.addWidget(self.b_sticky)
 
+        # footer row: last edit time
+        self._edited = None
+        self.footer = QtWidgets.QLabel()
+        self.footer.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.footer.setStyleSheet("color: #8a909c; font-size: 11px; padding: 0 4px;")
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
         layout.addLayout(header)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.edit)
+        layout.addWidget(self.footer)
 
         self._shortcuts = []
         self._build_shortcuts()
@@ -716,9 +854,18 @@ class NotesPanel(QtWidgets.QWidget):
     # ---- persistence (stored in the .hip) --------------------------------- #
     def _on_text_changed(self):
         if not self._loading:
+            self._edited = time.time()
+            self._update_footer()
             self._timer.start()
             if self._sticky:
                 self._sticky_timer.start()
+
+    def _update_footer(self):
+        if self._edited:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(self._edited))
+        else:
+            stamp = "—"
+        self.footer.setText("Last edited: " + stamp)
 
     # ---- view / edit mode ------------------------------------------------- #
     def set_edit_mode(self, editing, persist=True):
@@ -789,28 +936,44 @@ class NotesPanel(QtWidgets.QWidget):
         self._sticky = (parent.path(), note.name())
         self._set_user_data(STICKY_KEY, json.dumps(self._sticky))
 
-    def link_sticky(self):
-        """Link the sticky note selected in the network editor to this panel."""
-        warn = hou.severityType.Warning
+    @staticmethod
+    def _selected_stickies():
+        """(parent, [selected sticky notes]) of the network editor, or an error string."""
         editor = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
         if editor is None:
-            hou.ui.setStatusMessage("Custom Notes: open a Network Editor first.",
-                                    severity=warn)
-            return
+            return "Custom Notes: open a Network Editor first."
         try:
             parent = editor.pwd()
-            picked = [n for n in parent.stickyNotes() if n.isSelected()]
+            return parent, [n for n in parent.stickyNotes() if n.isSelected()]
         except Exception as ex:
-            hou.ui.setStatusMessage("Custom Notes: could not read the network (%s)" % ex,
-                                    severity=warn)
+            return "Custom Notes: could not read the network (%s)" % ex
+
+    def link_sticky(self, auto=False):
+        """Link the sticky note selected in the network editor to this panel.
+
+        auto: called when the panel opens - stay quiet unless exactly one sticky
+        is selected, and only ask before replacing text that would be lost.
+        """
+        warn = hou.severityType.Warning
+        found = self._selected_stickies()
+        if isinstance(found, str):
+            if not auto:
+                hou.ui.setStatusMessage(found, severity=warn)
             return
+        parent, picked = found
         if len(picked) != 1:
-            hou.ui.setStatusMessage(
-                "Custom Notes: select exactly one sticky note in the network editor, "
-                "then click Link.", severity=warn)
+            if not auto:
+                hou.ui.setStatusMessage(
+                    "Custom Notes: select exactly one sticky note in the network editor, "
+                    "then click Link.", severity=warn)
             return
         note = picked[0]
-        if hou.ui.displayMessage(
+        key = (parent.path(), note.name())
+        if auto and key == self._sticky:           # already linked
+            return
+        doc = self.edit.document()
+        harmless = doc.isEmpty() or rich_to_unicode(doc) == note.text().rstrip()
+        if not (auto and harmless) and hou.ui.displayMessage(
                 "Link sticky note '%s'?\n\nThis panel's text will be replaced by the "
                 "sticky note's text, and the sticky note will then follow your edits."
                 % note.name(),
@@ -819,12 +982,25 @@ class NotesPanel(QtWidgets.QWidget):
             return
         self._loading = True                       # don't echo the load back out
         try:
-            self.edit.setPlainText(note.text())
+            self.edit.set_unicode(note.text())
         finally:
             self._loading = False
-        self._sticky = (parent.path(), note.name())
+        self._sticky = key
         self._set_user_data(STICKY_KEY, json.dumps(self._sticky))
+        self._edited = time.time()
+        self._update_footer()
         self.save()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # opening the panel with a sticky selected links it
+        QtCore.QTimer.singleShot(0, self._auto_link)
+
+    def _auto_link(self):
+        try:
+            self.link_sticky(auto=True)
+        except RuntimeError:               # panel closed in the meantime
+            pass
 
     def _update_sticky(self):
         if not self._sticky:
@@ -849,9 +1025,13 @@ class NotesPanel(QtWidgets.QWidget):
             link = root.userData(STICKY_KEY)
             self._sticky = tuple(json.loads(link)) if link else None
             mode = root.userData(MODE_KEY)
+            edited = root.userData(EDITED_KEY)
+            self._edited = float(edited) if edited else None
         except Exception:
             self._sticky = None
+            self._edited = None
             mode = None
+        self._update_footer()
         self.set_edit_mode(mode != "view", persist=False)
         self._loading = True
         try:
@@ -863,6 +1043,8 @@ class NotesPanel(QtWidgets.QWidget):
             self._loading = False
 
     def save(self):
+        if self._edited:
+            self._set_user_data(EDITED_KEY, repr(self._edited))
         try:
             html = self.edit.toHtml()
             root = hou.node("/")
