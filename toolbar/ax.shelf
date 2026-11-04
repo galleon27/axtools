@@ -1170,7 +1170,7 @@ import re
 import os
 
 # Define the list of keywords you want to look for
-search_terms = ['sequence', 'file', 'filename', 'map']
+search_terms = ['sequence', 'file', 'filename', 'map', 'image_sequence_b']
 
 nodes = hou.selectedNodes()
 
