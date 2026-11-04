@@ -11,7 +11,7 @@ class Placed(object):
 
 
 class Line(object):
-    __slots__ = ("glyphs", "width", "ascent", "descent", "cap", "size", "align",
+    __slots__ = ("glyphs", "width", "ascent", "descent", "cap", "size", "leading", "align",
                  "baseline", "offset")
 
 
@@ -64,13 +64,14 @@ def layout(segments, opts, get_font, missing):
         line.align = lp.get("align", "left") if lp else "left"
         pen = 0.0
         prev = None   # (Placed, shaping.Glyph, font, props)
-        asc = desc = cap = size = 0.0
+        asc = desc = cap = size = lead = 0.0
         in_space = True
 
         if not pieces and lp is not None:
             f = get_font(lp["font"])
             s, _sx, sy = _units(lp)
             asc, desc, cap, size = f.ascender * sy, f.descender * sy, f.cap_height * sy, s
+            lead = _char_leading(lp, opts)
 
         for seg, start, part in pieces:
             run += 1
@@ -86,6 +87,7 @@ def layout(segments, opts, get_font, missing):
             desc = min(desc, font.descender * uy)
             cap = max(cap, font.cap_height * uy)
             size = max(size, s)
+            lead = max(lead, _char_leading(props, opts))
 
             for g in glyphs:
                 # kerning across a style change when font and scale match
@@ -127,19 +129,19 @@ def layout(segments, opts, get_font, missing):
         vis = [g for g in line.glyphs if g.visible]
         line.width = (vis[-1].x + vis[-1].width) if vis else 0.0
         line.ascent, line.descent, line.cap, line.size = asc, desc, cap, size
+        line.leading = lead
         res.lines.append(line)
     res.num_words = word + 1
 
     # ---- vertical placement
-    mode = opts.get("leading_mode", "auto")
+    # A line sits its own leading below the previous baseline: the largest
+    # leading of any character on it (Illustrator's rule).
     baseline = 0.0
     for i, line in enumerate(res.lines):
         if i > 0:
-            if mode == "fixed":
-                lead = opts.get("leading", 1.2)
-            else:
-                lead = opts.get("auto_leading", 1.2) * (line.size or res.lines[i - 1].size)
-            baseline -= lead
+            if not line.leading:
+                line.leading = res.lines[i - 1].leading
+            baseline -= line.leading
         line.baseline = baseline
 
     # ---- horizontal alignment
@@ -183,6 +185,16 @@ def layout(segments, opts, get_font, missing):
             res.glyphs.append(g)
     res.bbox = (xmin + dx, bottom + dy, xmax + dx, top + dy)
     return res
+
+
+def _char_leading(props, opts):
+    """Character leading; 0 means auto, which follows the Layout tab."""
+    lead = props.get("leading", 0.0) or 0.0
+    if lead > 0:
+        return lead
+    if opts.get("leading_mode", "auto") == "fixed":
+        return opts.get("leading", 1.2)
+    return opts.get("auto_leading", 1.2) * props["size"]
 
 
 def _justify(line, target):

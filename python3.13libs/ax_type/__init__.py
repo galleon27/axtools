@@ -13,6 +13,7 @@ from . import fonts, markup, shaping, layout, build
 STYLE_PROPS = (
     ("font", "font", "str"),
     ("size", "size", "float"),
+    ("leading", "clead", "float"),   # 'leading' is taken by the Layout tab
     ("color", "color", "color"),
     ("alpha", "alpha", "float"),
     ("track", "track", "float"),
@@ -27,10 +28,17 @@ STYLE_PROPS = (
 )
 
 
+PROP_DEFAULTS = {"leading": 0.0}
+
+
 def _eval(node, name, kind):
+    """Parm value, or None if this version of the HDA doesn't have the parm."""
     if kind == "color":
-        return tuple(node.parmTuple(name).eval())
+        pt = node.parmTuple(name)
+        return tuple(pt.eval()) if pt is not None else None
     p = node.parm(name)
+    if p is None:
+        return None
     if kind == "menu":
         return p.evalAsString()
     if kind == "toggle":
@@ -55,14 +63,20 @@ def read_styles(hda):
             continue
         d = {}
         for key, suffix, kind in STYLE_PROPS:
-            if hda.parm("suse_%s%d" % (suffix, i)).eval():
-                d[key] = _eval(hda, "s%s%d" % (suffix, i), kind)
+            use = hda.parm("suse_%s%d" % (suffix, i))
+            if use is not None and use.eval():
+                v = _eval(hda, "s%s%d" % (suffix, i), kind)
+                if v is not None:
+                    d[key] = v
         styles[name] = d
     return styles
 
 
 def read_base(hda):
-    base = {key: _eval(hda, suffix, kind) for key, suffix, kind in STYLE_PROPS}
+    base = {}
+    for key, suffix, kind in STYLE_PROPS:
+        v = _eval(hda, suffix, kind)
+        base[key] = v if v is not None else PROP_DEFAULTS.get(key)
     base["smallcaps_scale"] = hda.parm("smallcaps").eval()
     return base
 

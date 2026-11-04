@@ -95,10 +95,14 @@ def _load(s):
 
 
 class _Spin(QtWidgets.QDoubleSpinBox):
-    """Spin box with a blank state for mixed selections."""
+    """Spin box with a blank state for mixed selections.
 
-    def __init__(self, lo, hi, step, decimals, parent=None):
+    zero_text shows 0 as a word (e.g. leading 0 = 'Auto').
+    """
+
+    def __init__(self, lo, hi, step, decimals, parent=None, zero_text=None):
         QtWidgets.QDoubleSpinBox.__init__(self, parent)
+        self.zero_text = zero_text
         self.sentinel = lo - step
         self.setRange(self.sentinel, hi)
         self.setSingleStep(step)
@@ -107,6 +111,23 @@ class _Spin(QtWidgets.QDoubleSpinBox):
         self.setKeyboardTracking(False)
         self.setMinimumWidth(70)
         self.setLocale(QtCore.QLocale.c())  # '1.5', not '1,5' on comma-decimal locales
+
+    def textFromValue(self, value):
+        if self.zero_text and abs(value) < 1e-9:
+            return self.zero_text
+        return QtWidgets.QDoubleSpinBox.textFromValue(self, value)
+
+    def valueFromText(self, text):
+        if self.zero_text and text.strip().lower() == self.zero_text.lower():
+            return 0.0
+        return QtWidgets.QDoubleSpinBox.valueFromText(self, text)
+
+    def validate(self, text, pos):
+        if self.zero_text and self.zero_text.lower().startswith(text.strip().lower()) and text.strip():
+            state = (QtGui.QValidator.Acceptable if text.strip().lower() == self.zero_text.lower()
+                     else QtGui.QValidator.Intermediate)
+            return state, text, pos
+        return QtWidgets.QDoubleSpinBox.validate(self, text, pos)
 
     def set_mixed(self):
         self.setValue(self.sentinel)
@@ -205,12 +226,16 @@ class TypeEditor(QtWidgets.QDialog):
         row2.addWidget(self.font_combo, 1)
 
         self.spins = {}
-        for key, label, lo, hi, step, dec in (
-                ("size", "Size", 0.001, 1000, 0.1, 3),
-                ("track", "Track", -1000, 5000, 10, 1),
-                ("shift", "Shift", -100, 100, 0.05, 3)):
+        for key, label, lo, hi, step, dec, zero in (
+                ("size", "Size", 0.001, 1000, 0.1, 3, None),
+                ("leading", "Leading", 0.0, 1000, 0.1, 3, "Auto"),
+                ("track", "Track", -1000, 5000, 10, 1, None),
+                ("shift", "Shift", -100, 100, 0.05, 3, None)):
             row2.addWidget(QtWidgets.QLabel(label))
-            sp = _Spin(lo, hi, step, dec)
+            sp = _Spin(lo, hi, step, dec, zero_text=zero)
+            if key == "leading":
+                sp.setToolTip("Baseline distance for lines containing this text. Auto follows "
+                              "the Layout tab")
             sp.valueChanged.connect(lambda v, k=key, s=sp: self._on_spin(k, s))
             self.spins[key] = sp
             row2.addWidget(sp)
@@ -590,7 +615,7 @@ class TypeEditor(QtWidgets.QDialog):
             mp.set(i)
             node.parm("sname%d" % i).set(name)
             for key, suffix, kind in STYLE_PROPS:
-                if key not in diff:
+                if key not in diff or node.parm("suse_%s%d" % (suffix, i)) is None:
                     continue
                 node.parm("suse_%s%d" % (suffix, i)).set(1)
                 v = diff[key]

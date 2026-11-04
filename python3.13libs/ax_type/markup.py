@@ -53,9 +53,22 @@ def _parse_choice(choices):
     return parse
 
 
+def _parse_leading(v):
+    """'auto' or 0 = automatic leading, otherwise baseline distance in units."""
+    v = v.strip().lower()
+    if v == "auto":
+        return 0.0
+    f = float(v)
+    if f < 0:
+        raise ValueError("leading must be auto or >= 0, got %r" % v)
+    return f
+
+
 PROPS = {
     "font": ("font", str),
     "size": ("size", float),
+    "leading": ("leading", _parse_leading),
+    "lead": ("leading", _parse_leading),
     "color": ("color", _parse_color),
     "cd": ("color", _parse_color),
     "alpha": ("alpha", float),
@@ -75,8 +88,8 @@ PROPS = {
 }
 
 
-PROP_KEYS = ("font", "size", "color", "alpha", "track", "shift", "hscale", "vscale",
-             "slant", "case", "kern", "liga", "align")
+PROP_KEYS = ("font", "size", "leading", "color", "alpha", "track", "shift", "hscale",
+             "vscale", "slant", "case", "kern", "liga", "align")
 
 
 class Segment(object):
@@ -274,6 +287,8 @@ def format_value(key, v):
         if all(abs(i / 255.0 - c) < 1e-6 and 0 <= i <= 255 for i, c in zip(ints, v)):
             return "#%02x%02x%02x" % tuple(ints)
         return ",".join("%g" % c for c in v)
+    if key == "leading" and v <= 0:
+        return "auto"
     if key in ("kern", "liga"):
         return "on" if v else "off"
     if isinstance(v, float):
