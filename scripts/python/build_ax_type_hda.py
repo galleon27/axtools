@@ -61,7 +61,7 @@ Click __Edit Text...__ to open the editor. Type as usual, select some text, then
 * __New Style from Selection__ saves the selection's look as a new character style and applies it.
 * __Clear Format__ removes the style and overrides from the selection.
 
-With __Live__ on, the node updates while you edit. __OK__ keeps the changes, __Cancel__ restores the text from when the editor opened, and __Reload__ re-reads the node if you edited the Text parm by hand. The editor writes the tag markup described below, so you can still fine-tune it by hand.
+With __Live__ on, the node updates while you edit; with it off, click __Apply__ to push your changes to the node without closing the editor. __OK__ keeps the changes, __Cancel__ restores the text from when the editor opened, and __Reload__ re-reads the node if you edited the Text parm by hand. The editor writes the tag markup described below, so you can still fine-tune it by hand.
 
 == Markup ==
 

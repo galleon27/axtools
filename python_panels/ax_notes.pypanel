@@ -10,6 +10,7 @@
 
 def createInterface():
     return ax_notes.NotesPanel()]]></script>
+    <includeInPaneTabMenu menu_position="421" create_separator="false"/>
     <help><![CDATA[]]></help>
   </interface>
 </pythonPanelDocument>

@@ -11,6 +11,9 @@ Features
       colours don't) and keeps it updated live while you edit
     * "Link sticky" (or opening the panel with one sticky selected) reads a
       sticky's text back into rich text and keeps it in sync
+    * "Open DOCX" loads a Word document (headings, bold/italic/underline/strike,
+      colours, highlights, bullet/numbered lists, tables, checkboxes) into the
+      note - replacing it or inserting at the cursor; images become [image]
     * Footer shows when the note was last edited
     * Edit / View mode toggle (view mode hides formatting, locks the text,
       but to-do boxes can still be ticked)
@@ -28,6 +31,7 @@ Works with PySide2 (Houdini 18.5 - 20.5) and PySide6 (Houdini 21+).
 """
 
 import json
+import os
 import re
 import time
 
@@ -51,6 +55,7 @@ STORAGE_KEY = "custom_notes_html"      # user-data key on the root node (/)
 STICKY_KEY = "custom_notes_sticky"     # JSON [parent path, sticky name]
 MODE_KEY = "custom_notes_mode"         # "edit" or "view"
 EDITED_KEY = "custom_notes_edited"     # epoch seconds of the last edit
+DOCX_DIR_KEY = "custom_notes_docx_dir" # folder of the last opened .docx
 PLACEHOLDER = "Write your notes here..."
 BOX_OFF = "\u2610"                     # ☐
 BOX_ON = "\u2611"                      # ☑
@@ -211,6 +216,324 @@ def rich_to_unicode(doc):
             lines.append(DIVIDER_TEXT)
         block = block.next()
     return "\n".join(lines).rstrip()
+
+
+# --------------------------------------------------------------------------- #
+# .docx -> rich text (standard library only: a .docx is a zip of XML parts)
+# --------------------------------------------------------------------------- #
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_W14 = "{http://schemas.microsoft.com/office/word/2010/wordml}"
+
+# Word's named highlight colours -> muted tones that read on the dark panel
+_DOCX_HIGHLIGHTS = {
+    "yellow": "#7a6a00", "darkYellow": "#7a6a00",
+    "green": "#2f6f3a", "darkGreen": "#2f6f3a",
+    "red": "#7a2f2f", "darkRed": "#7a2f2f",
+    "blue": "#2f4f7a", "darkBlue": "#2f4f7a",
+    "magenta": "#5a3a7a", "darkMagenta": "#5a3a7a",
+    "cyan": "#2f6a6f", "darkCyan": "#2f6a6f",
+    "lightGray": "#555555", "darkGray": "#444444", "black": "#2a2a2a",
+}
+_MONO_FONTS = ("consolas", "courier", "menlo", "monaco", "lucida console",
+               "source code", "fira code", "jetbrains mono", "cascadia")
+_BLOCK_MARGINS = ("margin-top:0px; margin-bottom:0px; margin-left:0px; "
+                  "margin-right:0px; -qt-block-indent:0; text-indent:0px;")
+# CSS weight that Qt's HTML import turns back into BOLD (Qt5 divides by 8)
+CSS_BOLD = BOLD * 8 if BOLD < 100 else BOLD
+_DONE_CSS = "text-decoration: line-through; color:#%02x%02x%02x;" % DONE_COLOR
+
+
+def _html_escape(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _on(el):
+    """A Word toggle property (<w:b/>, <w:i w:val="0"/>, ...) -> bool."""
+    if el is None:
+        return False
+    return el.get(_W + "val", "true").lower() not in ("0", "false", "off", "none")
+
+
+def _readable_color(hex6):
+    """Word text colour -> CSS colour, or None if it's auto / too dark for the panel."""
+    if not hex6 or hex6.lower() == "auto" or len(hex6) != 6:
+        return None
+    try:
+        r, g, b = int(hex6[0:2], 16), int(hex6[2:4], 16), int(hex6[4:6], 16)
+    except ValueError:
+        return None
+    if 0.299 * r + 0.587 * g + 0.114 * b < 70:  # black / navy text: use the default
+        return None
+    return "#" + hex6
+
+
+class _DocxReader(object):
+    def __init__(self, path):
+        import zipfile
+        import xml.etree.ElementTree as ET
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                if "word/document.xml" not in names:
+                    raise ValueError("not a Word document (no word/document.xml)")
+                self.doc = ET.fromstring(z.read("word/document.xml"))
+                numbering = (ET.fromstring(z.read("word/numbering.xml"))
+                             if "word/numbering.xml" in names else None)
+                styles = (ET.fromstring(z.read("word/styles.xml"))
+                          if "word/styles.xml" in names else None)
+        except zipfile.BadZipFile:
+            raise ValueError("not a valid .docx file (it may be an old .doc file)")
+        except ET.ParseError as ex:
+            raise ValueError("the document XML is damaged (%s)" % ex)
+        self._styles = self._read_styles(styles)
+        self._num_fmts = self._read_numbering(numbering)
+
+    # ---- lookup tables ---------------------------------------------------- #
+    @staticmethod
+    def _read_styles(root):
+        """styleId -> heading level (1-3), for paragraph styles that are headings."""
+        out = {}
+        if root is None:
+            return out
+        for st in root.iter(_W + "style"):
+            sid = st.get(_W + "styleId", "")
+            name_el = st.find(_W + "name")
+            name = (name_el.get(_W + "val", "") if name_el is not None else "").lower()
+            level = None
+            for cand in (name, sid.lower()):
+                if cand == "title":
+                    level = 1
+                    break
+                m = re.match(r"heading\s*(\d)", cand)
+                if m:
+                    level = min(3, max(1, int(m.group(1))))
+                    break
+            if level is None:
+                ol = st.find(_W + "pPr/" + _W + "outlineLvl")
+                if ol is not None and ol.get(_W + "val", "").isdigit():
+                    level = min(3, int(ol.get(_W + "val")) + 1)
+            if level:
+                out[sid] = level
+        return out
+
+    @staticmethod
+    def _read_numbering(root):
+        """(numId, ilvl) -> Word numFmt ("bullet", "decimal", ...)."""
+        out = {}
+        if root is None:
+            return out
+        abstract = {}
+        for an in root.iter(_W + "abstractNum"):
+            levels = {}
+            for lvl in an.findall(_W + "lvl"):
+                fmt = lvl.find(_W + "numFmt")
+                levels[lvl.get(_W + "ilvl", "0")] = (
+                    fmt.get(_W + "val", "decimal") if fmt is not None else "decimal")
+            abstract[an.get(_W + "abstractNumId")] = levels
+        for num in root.iter(_W + "num"):
+            ref = num.find(_W + "abstractNumId")
+            if ref is None:
+                continue
+            for ilvl, fmt in abstract.get(ref.get(_W + "val"), {}).items():
+                out[(num.get(_W + "numId"), ilvl)] = fmt
+        return out
+
+    # ---- runs ------------------------------------------------------------- #
+    def _run_css(self, rpr, link):
+        css = []
+        if rpr is not None:
+            if _on(rpr.find(_W + "b")):
+                css.append("font-weight:%d;" % CSS_BOLD)
+            if _on(rpr.find(_W + "i")):
+                css.append("font-style:italic;")
+            deco = []
+            if _on(rpr.find(_W + "u")):
+                deco.append("underline")
+            if _on(rpr.find(_W + "strike")) or _on(rpr.find(_W + "dstrike")):
+                deco.append("line-through")
+            if deco:
+                css.append("text-decoration:%s;" % " ".join(deco))
+            col = rpr.find(_W + "color")
+            col = _readable_color(col.get(_W + "val") if col is not None else None)
+            if col and not link:
+                css.append("color:%s;" % col)
+            bg = None
+            hl = rpr.find(_W + "highlight")
+            if hl is not None and hl.get(_W + "val") not in (None, "none"):
+                bg = _DOCX_HIGHLIGHTS.get(hl.get(_W + "val"), "#555555")
+            fonts = rpr.find(_W + "rFonts")
+            family = fonts.get(_W + "ascii", "") if fonts is not None else ""
+            if family and family.lower().startswith(_MONO_FONTS):
+                css.append("font-family:'%s';" % family)
+                bg = "#%02x%02x%02x" % CODE_BG        # the panel's inline-code look
+            if bg:
+                css.append("background-color:%s;" % bg)
+        if link:
+            css.append("color:#74c0fc; text-decoration:underline;")
+        return "".join(css)
+
+    def _run(self, r, state, link=False):
+        parts = []
+        for ch in r:
+            tag = ch.tag
+            if tag == _W + "t":
+                parts.append(_html_escape(ch.text or ""))
+            elif tag == _W + "tab":
+                parts.append("&nbsp;" * 4)
+            elif tag in (_W + "br", _W + "cr"):
+                parts.append("<br />")
+            elif tag in (_W + "drawing", _W + "pict", _W + "object"):
+                parts.append('<span style="color:#8a909c;">[image]</span>')
+            elif tag == _W + "fldChar":                # legacy form checkbox
+                cb = ch.find(_W + "ffData/" + _W + "checkBox")
+                if cb is not None:
+                    checked = cb.find(_W + "checked")
+                    if checked is None:
+                        checked = cb.find(_W + "default")
+                    self._box(state, _on(checked))
+        if not parts:
+            return
+        css = self._run_css(r.find(_W + "rPr"), link) + state["css"]
+        if state["done"]:
+            css += _DONE_CSS
+        html = "".join(parts)
+        state["out"].append('<span style="%s">%s</span>' % (css, html) if css else html)
+        state["has_text"] = True
+
+    def _box(self, state, checked):
+        """A Word checkbox becomes the panel's own clickable to-do marker."""
+        mark = BOX_ON if checked else BOX_OFF
+        if not state["has_text"]:                     # leading box: a to-do line
+            state["done"] = checked
+            state["out"].append(mark + " ")
+        else:
+            state["out"].append(mark)
+        state["has_text"] = True
+
+    def _inline(self, parent, state, link=False):
+        for el in parent:
+            tag = el.tag
+            if tag == _W + "r":
+                self._run(el, state, link)
+            elif tag == _W + "hyperlink":
+                self._inline(el, state, True)
+            elif tag == _W + "sdt":
+                cb = el.find(_W + "sdtPr/" + _W14 + "checkbox")
+                if cb is not None:
+                    self._box(state, _on(cb.find(_W14 + "checked")))
+                else:
+                    content = el.find(_W + "sdtContent")
+                    if content is not None:
+                        self._inline(content, state, link)
+            elif tag in (_W + "ins", _W + "smartTag", _W + "fldSimple",
+                         _W + "customXml", _W + "moveTo"):
+                self._inline(el, state, link)
+            # w:del, w:moveFrom, bookmarks, proofing marks: skipped
+
+    # ---- paragraphs / blocks ---------------------------------------------- #
+    def _paragraph(self, p):
+        """-> (inner html, block css, list info (numFmt, ilvl) or None)."""
+        ppr = p.find(_W + "pPr")
+        level, align, list_info = None, "", None
+        if ppr is not None:
+            st = ppr.find(_W + "pStyle")
+            if st is not None:
+                sid = st.get(_W + "val", "")
+                level = self._styles.get(sid)
+                if level is None:                     # no styles.xml: go by the id
+                    m = re.match(r"heading\s*(\d)", sid.lower())
+                    level = 1 if sid.lower() == "title" else (
+                        min(3, max(1, int(m.group(1)))) if m else None)
+            jc = ppr.find(_W + "jc")
+            if jc is not None and jc.get(_W + "val") in ("center", "right", "both"):
+                align = " align=\"%s\"" % {"both": "justify"}.get(
+                    jc.get(_W + "val"), jc.get(_W + "val"))
+            np_ = ppr.find(_W + "numPr")
+            if np_ is not None:
+                nid = np_.find(_W + "numId")
+                ilvl = np_.find(_W + "ilvl")
+                nid = nid.get(_W + "val") if nid is not None else None
+                ilvl = ilvl.get(_W + "val", "0") if ilvl is not None else "0"
+                if nid and nid != "0":
+                    list_info = (self._num_fmts.get((nid, ilvl), "decimal"),
+                                 int(ilvl) if ilvl.isdigit() else 0)
+        state = {"out": [], "has_text": False, "done": False, "css": ""}
+        if level:
+            state["css"] = "font-size:%spt; font-weight:%d;" % (HEADING_SIZES[level], CSS_BOLD)
+        self._inline(p, state)
+        return "".join(state["out"]), align, list_info
+
+    def _blocks(self, parent, out):
+        open_list = None                              # (tag, indent) currently open
+        for el in parent:
+            tag = el.tag
+            if tag == _W + "sdt":                     # block-level content control
+                content = el.find(_W + "sdtContent")
+                if content is not None:
+                    if open_list:
+                        out.append("</%s>" % open_list[0])
+                        open_list = None
+                    self._blocks(content, out)
+                continue
+            if tag == _W + "p":
+                inner, align, list_info = self._paragraph(el)
+                if list_info:
+                    fmt, ilvl = list_info
+                    ltag = "ul" if fmt == "bullet" else "ol"
+                    key = (ltag, ilvl + 1)
+                    if open_list != key:
+                        if open_list:
+                            out.append("</%s>" % open_list[0])
+                        out.append('<%s style="%s -qt-list-indent:%d; list-style-type:%s;">'
+                                   % (ltag, _BLOCK_MARGINS, ilvl + 1,
+                                      "disc" if ltag == "ul" else "decimal"))
+                        open_list = key
+                    out.append('<li style="%s"%s>%s</li>' % (_BLOCK_MARGINS, align, inner))
+                    continue
+                if open_list:
+                    out.append("</%s>" % open_list[0])
+                    open_list = None
+                if inner:
+                    out.append('<p style="%s"%s>%s</p>' % (_BLOCK_MARGINS, align, inner))
+                else:
+                    out.append('<p style="-qt-paragraph-type:empty; %s"><br /></p>'
+                               % _BLOCK_MARGINS)
+            elif tag == _W + "tbl":
+                if open_list:
+                    out.append("</%s>" % open_list[0])
+                    open_list = None
+                out.append('<table border="1" cellspacing="0" cellpadding="4" '
+                           'style="border-color:#6a7080; border-style:solid;">')
+                for tr in el.findall(_W + "tr"):
+                    out.append("<tr>")
+                    for tc in tr.findall(_W + "tc"):
+                        span = tc.find(_W + "tcPr/" + _W + "gridSpan")
+                        colspan = (' colspan="%s"' % span.get(_W + "val")
+                                   if span is not None else "")
+                        cell = []
+                        self._blocks(tc, cell)
+                        out.append("<td%s>%s</td>" % (colspan, "".join(cell)))
+                    out.append("</tr>")
+                out.append("</table>")
+        if open_list:
+            out.append("</%s>" % open_list[0])
+
+    def to_html(self):
+        body = self.doc.find(_W + "body")
+        if body is None:
+            raise ValueError("the document has no body")
+        out = []
+        self._blocks(body, out)
+        return "<html><body>%s</body></html>" % "".join(out)
+
+
+def docx_to_html(path):
+    """Convert a Word .docx file into HTML the notes editor understands.
+
+    Raises ValueError with a readable message for files that can't be read.
+    """
+    return _DocxReader(path).to_html()
 
 
 # --------------------------------------------------------------------------- #
@@ -685,6 +1008,12 @@ class NotesPanel(QtWidgets.QWidget):
             "Link the sticky note selected in the network editor: its text is "
             "loaded into this panel, and it then follows your edits")
         self.b_link.clicked.connect(lambda *_: self.link_sticky())
+        self.b_docx = QtWidgets.QPushButton("OPEN DOCX")
+        self.b_docx.setFocusPolicy(Qt.NoFocus)
+        self.b_docx.setToolTip(
+            "Open a Word (.docx) file and load its text and formatting into this note")
+        self.b_docx.clicked.connect(lambda *_: self.open_docx())
+        header.addWidget(self.b_docx)
         header.addWidget(self.b_link)
         header.addWidget(self.b_sticky)
 
@@ -990,6 +1319,44 @@ class NotesPanel(QtWidgets.QWidget):
         self._edited = time.time()
         self._update_footer()
         self.save()
+
+    # ---- Word documents --------------------------------------------------- #
+    def open_docx(self):
+        warn = hou.severityType.Warning
+        start = ""
+        try:
+            start = hou.node("/").userData(DOCX_DIR_KEY) or ""
+        except Exception:
+            pass
+        if not start or not os.path.isdir(start):
+            start = hou.text.expandString("$HIP")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open Word document", start, "Word documents (*.docx);;All files (*)")
+        if not path:
+            return
+        self._set_user_data(DOCX_DIR_KEY, os.path.dirname(path))
+        try:
+            html = docx_to_html(path)
+        except Exception as ex:
+            hou.ui.setStatusMessage("Custom Notes: could not read %s (%s)"
+                                    % (os.path.basename(path), ex), severity=warn)
+            return
+
+        replace = True
+        if not self.edit.document().isEmpty():
+            choice = hou.ui.displayMessage(
+                "Load '%s' into this note?" % os.path.basename(path),
+                buttons=("Replace", "Insert at cursor", "Cancel"),
+                default_choice=0, close_choice=2, title="Open Word document")
+            if choice == 2:
+                return
+            replace = choice == 0
+        if replace:
+            self.edit.setHtml(html)            # textChanged -> autosave / sticky / footer
+        else:
+            self.edit.textCursor().insertHtml(html)
+        self.edit.setCurrentCharFormat(QTextCharFormat())
+        hou.ui.setStatusMessage("Custom Notes: loaded " + os.path.basename(path))
 
     def showEvent(self, e):
         super().showEvent(e)

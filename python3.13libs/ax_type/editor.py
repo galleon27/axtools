@@ -273,6 +273,12 @@ class TypeEditor(QtWidgets.QDialog):
         self.live.setChecked(True)
         self.live.setToolTip("Update the node while editing")
         row3.addWidget(self.live)
+        self.apply_btn = QtWidgets.QPushButton("Apply")
+        self.apply_btn.setToolTip("Write the text to the node now (for when Live is off)")
+        self.apply_btn.clicked.connect(self.apply_to_node)
+        row3.addWidget(self.apply_btn)
+        self.live.toggled.connect(self._on_live_toggled)
+        self.apply_btn.setEnabled(not self.live.isChecked())
         for label, fn in (("Reload", self.reload), ("OK", self.accept), ("Cancel", self.reject)):
             b = QtWidgets.QPushButton(label)
             b.clicked.connect(fn)
@@ -586,6 +592,18 @@ class TypeEditor(QtWidgets.QDialog):
         if getattr(self, "_loading", False):
             return
         if self.live.isChecked():
+            self._write_timer.start()
+
+    def apply_to_node(self):
+        """Apply button: push the current text to the node without closing."""
+        self._write_timer.stop()
+        self.write_to_node()
+        self.status.setText("Applied to %s" % self.node.name())
+
+    def _on_live_toggled(self, live):
+        # Apply is only needed when Live is off; turning Live on syncs right away
+        self.apply_btn.setEnabled(not live)
+        if live and not getattr(self, "_loading", False):
             self._write_timer.start()
 
     # ------------------------------------------------------------- styles

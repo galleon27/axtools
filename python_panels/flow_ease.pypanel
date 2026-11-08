@@ -10,6 +10,7 @@
 
 def createInterface():
     return flow_ease.FlowPanel()]]></script>
+    <includeInPaneTabMenu menu_position="420" create_separator="false"/>
     <includeInToolbarMenu menu_position="420" create_separator="false"/>
     <help><![CDATA[]]></help>
   </interface>
