@@ -48,80 +48,260 @@ DEFAULT_TEXT = ('AX [title]TYPE[/title]\n'
 
 HELP = r'''= AX Type =
 
+#type: node
+#context: sop
+#internal: AX_type
 #icon: SOP/font
+#tags: text, font, type, typography, motion design
 
-"""Illustrator-style text: per-word fonts, sizes, colors and tracking via inline tags and character styles."""
+"""Point type with per-character fonts, sizes, colors, tracking and leading, set through character styles, inline tags or a rich text editor."""
+
+== Overview ==
+
+The Font SOP applies one font, size and color to the whole string. AX Type lets
+each word or letter have its own: font, size, color, alpha, tracking, leading,
+baseline shift, horizontal and vertical scale, slant and case. Looks you reuse
+can be saved as named character styles.
+
+Formatting is stored as tags in the Text parameter (`The [title]QUICK[/title] fox`).
+You don't have to type them. __Edit Text...__ opens an editor where you select
+text and pick a style, font or color, and the editor writes the tags for you.
+
+Text is shaped with the font's kerning and standard ligatures, and uses the
+font's real small caps when it has them. The output is filled faces, outline
+curves or one point per glyph, with per glyph, word and line attributes for
+animation.
+
+== Quick start ==
+
+# Put down an AX Type node. It starts with sample text and a `title` style.
+# Click __Edit Text...__, type your text, select a word and pick a __Style__,
+  __Font__, __Size__ or __Color__.
+# Click __OK__.
+# Set __Output__ to Faces, Curves or Points, and set the base look on the
+  __Character__ tab.
+# Save looks you want to reuse on the __Character Styles__ tab, then apply them
+  from the editor.
 
 == Editing text ==
 
-Click __Edit Text...__ to open the editor. Type as usual, select some text, then:
+Click __Edit Text...__, type as usual, then select some text and:
 
-* Pick a __Style__ from the Character Styles tab, or set __Font__, __Size__, __Track__, __Shift__, __Color__ or __Case__. Only the property you change is overridden.
-* __Left/Center/Right/Justify__ align the selected lines.
-* __New Style from Selection__ saves the selection's look as a new character style and applies it.
-* __Clear Format__ removes the style and overrides from the selection.
+* pick a __Style__, or set __Font__, __Size__, __Leading__, __Track__,
+  __Shift__, __Color__ or __Case__. Only the property you change is overridden.
+* click __Left__, __Center__, __Right__ or __Justify__ to align the selected
+  lines.
+* click __New Style from Selection__ to save the selection's look as a new
+  character style and apply it.
+* click __Clear Format__ to remove the style and overrides from the selection.
 
-With __Live__ on, the node updates while you edit; with it off, click __Apply__ to push your changes to the node without closing the editor. __OK__ keeps the changes, __Cancel__ restores the text from when the editor opened, and __Reload__ re-reads the node if you edited the Text parm by hand. The editor writes the tag markup described below, so you can still fine-tune it by hand.
+The buttons along the bottom:
+
+* __Live__: update the node as you type. Off by default.
+* __Apply__: write the text to the node without closing the editor (when Live
+  is off).
+* __Reload__: re-read the node, for when you changed the Text parameter by hand.
+* __OK__ keeps your changes. __Cancel__ puts back the text the node had when the
+  editor opened.
+
+The editor preview is approximate. Check the result in the viewport. You can
+still edit the tags in the Text parameter directly.
+
+== Character styles ==
+
+Each entry on the __Character Styles__ tab has a __Style Name__ and a list of
+properties, each with a toggle. Only properties that are toggled on take effect.
+The rest come from the surrounding text: the __Character__ tab, or an outer tag.
+That is why styles can nest and layer.
+
+Apply a style with a tag of the same name (`[title]...[/title]`) or from the
+editor's __Style__ menu. Edit the style and all text that uses it updates.
+
+New nodes come with one style, `title` (Arial Black, size 1.6, tracking 20).
 
 == Markup ==
 
-Tags in the Text field style the text they wrap. Tags nest.
+A tag styles the text it wraps. Tags can nest.
 
 :box:
-    `The [title]QUICK[/title] brown fox` - apply the character style named _title_.
+    `The [title]QUICK[/title] brown fox`: applies the character style `title`.
 
-    `[font="Times New Roman Italic" size=2 color=#ff5a1f]fox[/]` - inline overrides; `[/]` closes the last tag.
+    `[font="Times New Roman Italic" size=2 color=#ff5a1f]fox[/]`: inline
+    overrides. `[/]` closes the most recent tag.
 
-    `[title track=200]X[/]` - a style plus overrides.
+    `[title track=200]X[/]`: a style with an override on top.
 
-    `\[` and `\]` - literal brackets. Brackets that are not a known style or `key=value` tag are kept as text.
+    `\[` and `\]`: literal brackets. A bracket that isn't a known style name or a
+    `key=value` tag is also left as text.
 
-Properties usable in tags (and in Character Styles):
+Properties you can use in tags and character styles:
 
-`font`: Full font name (`Arial Bold`), family (`Arial`) or file path. Collections accept `path.ttc,1`.
-`size`: Font size (em height in Houdini units).
+`font`: Full font name (`Arial Bold`), family (`Arial`) or file path. For a font inside a collection, use `path.ttc,1`.
+`size`: Font size, as em height in Houdini units.
+`leading` / `lead`: Baseline distance for the lines this text is on, in units. `auto` uses the Layout tab setting.
 `color` / `cd`: `#rrggbb`, `#rgb` or `r,g,b`.
 `alpha`: Alpha.
-`track` / `tracking`: Tracking in 1/1000 em, like Illustrator.
+`track` / `tracking`: Tracking in 1/1000 em, as in Illustrator.
 `shift` / `baseline`: Baseline shift in units.
-`hscale`, `vscale`: Horizontal / vertical scale multipliers.
+`hscale`, `vscale`: Horizontal and vertical scale multipliers.
 `slant`: Faux italic angle in degrees.
-`case`: `none`, `upper`, `lower`, `title`, `smallcaps` (uses the font's real small caps when available).
-`kern`, `liga`: `on`/`off` - font kerning and standard ligatures.
-`align`: `left`, `center`, `right`, `justify` - applies to the line the tag starts on.
+`case`: `none`, `upper`, `lower`, `title` or `smallcaps`. `smallcaps` uses the font's real small caps when it has them.
+`kern` / `kerning`, `liga` / `ligatures`: `on` or `off`. Turns font kerning and standard ligatures on or off.
+`align`: `left`, `center`, `right` or `justify`. Applies to the line the tag starts on.
+
+== Layout ==
+
+AX Type sets point type: a line ends only where you type a new line. It does not
+wrap text into a box or place it on a path.
+
+All lines are aligned within a block as wide as the longest line, so lines with
+different alignment still share the block's edges. Justify stretches each line
+except the last to that width.
+
+__Vertical Origin__ and __Horizontal Origin__ choose which point of the block
+sits at the origin. __Translate__ and __Uniform Scale__ then move and scale the
+finished block.
+
+Line spacing comes from __Leading__ on the Layout tab, unless the text on a line
+has its own leading (from a `leading=` tag, a style, or the Character tab).
+
+== Fonts ==
+
+AX Type searches for fonts in this order:
+
+* __Extra Font Folders__ on the Fonts tab
+* folders in `HOUDINI_FONT_PATH`
+* Houdini's fonts in `$HFS/houdini/fonts`
+* system fonts. On Windows that is `C:\Windows\Fonts` and the per-user
+  `%LOCALAPPDATA%\Microsoft\Windows\Fonts`. On macOS and Linux it is the
+  standard system and user font folders.
+
+It reads `.ttf`, `.otf`, `.ttc` and `.otc` files. Fonts can be given by full
+name, family name or file path.
+
+The list of fonts found is cached so the font menus open quickly. Click
+__Rebuild Font Index__ after installing fonts or adding a folder.
+
+If a font can't be found, the node warns and falls back to DejaVu Sans. Any
+characters missing from a font are listed in a warning as well.
 
 == Output attributes ==
 
-Primitive attributes (point attributes in Points mode): `char`, `glyph`, `font`, `style`, `char_index`, `glyph_index`, `word_index`, `line_index`, `run_index`, `glyph_u`, `word_u`, `line_u`, `size`, `Cd`, `Alpha`. Curves add `ishole`; Points add `advance` and `pscale`. Detail: `text`, `num_glyphs`, `num_words`, `num_lines`, `text_bounds` (xmin, ymin, xmax, ymax).
+Primitive attributes (point attributes in Points mode): `char`, `glyph`, `font`,
+`style`, `char_index`, `glyph_index`, `word_index`, `line_index`, `run_index`,
+`glyph_u`, `word_u`, `line_u`, `size`, `Cd`, `Alpha`.
+
+Curves output adds `ishole`. Points output adds `advance` and `pscale`.
+
+Detail attributes: `text`, `num_glyphs`, `num_words`, `num_lines`, and
+`text_bounds` (xmin, ymin, xmax, ymax).
+
+The `*_u` attributes run from 0 to 1 across the glyphs, words or lines.
+
+== Tips ==
+
+* To animate per letter or word, set __Pack__ and animate the packed primitives
+  by `name`. Or drive a wrangle or Transform Pieces from the `*_index` and `*_u`
+  attributes.
+* Use __Points__ output with Copy to Points. Each point sits at its glyph's
+  baseline origin, with `pscale` set to the size and `advance` to the glyph
+  width.
+* Use __Curves__ output to extrude or sweep outlines. `ishole` marks the
+  counters (the holes in o, e, a).
+* Put repeated looks in character styles rather than inline tags, so you can
+  change them in one place.
 
 @parameters
 
 Edit Text:
-    Opens the rich text editor for this node.
+    Opens the rich text editor.
 Text:
-    Text with optional style tags. Use new lines for multiple lines.
+    The text, with optional style tags. Press Enter to start a new line.
 Output:
-    Faces (filled, with holes), Curves (outlines) or Points (one per glyph at its baseline origin).
+    Faces: filled polygons with holes. Curves: glyph outlines. Points: one point
+    per glyph at its baseline origin.
 Curve Tolerance:
-    Maximum deviation in units when converting glyph curves to polygons.
+    Maximum distance, in units, between the glyph curves and the polygons made
+    from them. Lower values give smoother, heavier geometry. Not used for Points.
+
+== Layout ==
+
 Align:
-    Base line alignment around the origin, like Illustrator point type. Lines are aligned inside a block as wide as the widest line, so lines with a different `[align=...]` tag share the block's edges. Justify stretches every line except the last to the block width.
+    Default alignment for every line. Lines are aligned within a block as wide as
+    the longest line. Justify stretches each line except the last to that width.
+    An `[align=...]` tag overrides this for its line.
 Vertical Origin:
-    Which part of the text block sits at the origin.
+    Which part of the block sits at the origin: the first baseline, the top, the
+    cap height of the first line, the center or the bottom.
 Horizontal Origin:
-    Alignment keeps the origin where alignment puts it (like Illustrator point type); the others move the block bounds.
+    From Alignment places the origin where the alignment puts it, as with
+    Illustrator point type. Left, Center and Right put that edge or the center of
+    the block on the origin.
 Leading:
-    Auto uses the largest size on each line times Auto Leading; Fixed uses a constant baseline distance.
+    Auto: the largest size on each line times Auto Leading. Fixed: a constant
+    baseline distance. Character leading overrides either for its lines.
+Auto Leading:
+    Line spacing as a multiple of the largest size on the line.
+Leading (Fixed):
+    Baseline distance in units.
+Translate:
+    Moves the finished block.
+Uniform Scale:
+    Scales the finished block.
 Pack:
-    Pack per glyph, word or line into packed primitives with a `name` attribute, for animation.
+    Packs each glyph, word or line into a packed primitive with a `name`
+    attribute. Not used for Points.
+
+== Character ==
+
+The base look for all text. Tags and character styles override it.
+
 Font:
-    Base font. Full name, family name or a file path.
-Character Styles:
-    Named styles referenced by tags. Only enabled properties override the surrounding style.
+    Full font name, family name or file path.
+Size:
+    Font size, as em height in Houdini units.
+Color:
+    Text color, written to `Cd`.
+Alpha:
+    Text alpha, written to `Alpha`.
+Tracking:
+    Extra space between letters, in 1/1000 em.
+Leading:
+    Baseline distance for the lines this text is on. 0 means Auto, which uses the
+    Layout tab setting.
+Baseline Shift:
+    Moves text up or down from the baseline, in units.
+Horizontal Scale:
+    Horizontal glyph scale.
+Vertical Scale:
+    Vertical glyph scale.
+Slant:
+    Faux italic angle in degrees.
+Case:
+    Normal, ALL CAPS, lowercase, Title Case or Small Caps.
+Kerning:
+    Uses the font's kerning.
+Ligatures:
+    Uses the font's standard ligatures (fi, fl).
+Faux Small Caps Scale:
+    Size of faux small caps, used when the font has no real small caps.
+
+== Character Styles ==
+
+Styles:
+    Named styles that tags refer to. Each property has a toggle, and only toggled
+    properties override the surrounding text. A style can also set line
+    alignment.
+
+== Fonts ==
+
 Extra Font Folders:
-    Additional folders to search for fonts (one per line).
+    More folders to search for fonts, one per line.
 Rebuild Font Index:
-    Rescan font folders after installing new fonts.
+    Rescans the font folders. Use after installing fonts.
+Reload Module on Cook (dev):
+    Reloads the `ax_type` Python module on every cook. Only for development of
+    the module. Leave it off, as it slows cooking.
 '''
 
 CASE_MENU = (("none", "upper", "lower", "title", "smallcaps"),
@@ -290,7 +470,7 @@ def build(path=HDA_PATH):
     defn.setIcon("SOP_font")
     defn.addSection("OnCreated", ON_CREATED)
     defn.setExtraFileOption("OnCreated/IsPython", True)
-    defn.addSection("HelpText", HELP)
+    defn.addSection("Help", HELP)
     defn.setComment("Illustrator-style rich text: per-word fonts, sizes, colors, tracking.")
     node.matchCurrentDefinition()
     geo.destroy()

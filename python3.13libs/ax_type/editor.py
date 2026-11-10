@@ -21,7 +21,7 @@ from . import read_base, read_styles, _extra_dirs, STYLE_PROPS
 P_STYLE = QtGui.QTextFormat.UserProperty + 1
 P_OVR = QtGui.QTextFormat.UserProperty + 2
 BASE_PT = 18.0
-PARA_SEP = " "
+PARA_SEP = "\u2029"   # Qt paragraph separator (QTextDocument block break)
 
 ALIGN_TO_QT = {"left": QtCore.Qt.AlignLeft, "center": QtCore.Qt.AlignHCenter,
                "right": QtCore.Qt.AlignRight, "justify": QtCore.Qt.AlignJustify}
@@ -270,7 +270,7 @@ class TypeEditor(QtWidgets.QDialog):
         self.status.setStyleSheet("color: #8a909c;")
         row3.addWidget(self.status, 1)
         self.live = QtWidgets.QCheckBox("Live")
-        self.live.setChecked(True)
+        self.live.setChecked(False)
         self.live.setToolTip("Update the node while editing")
         row3.addWidget(self.live)
         self.apply_btn = QtWidgets.QPushButton("Apply")

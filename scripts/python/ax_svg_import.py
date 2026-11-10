@@ -2,14 +2,14 @@
 AX SVG Importer - reads SVG and Adobe Illustrator (.ai) files into Houdini
 as cubic Bezier curves with colour attributes.
 
-Called from the AX::AX_SVG_importer HDA's parm callbacks (File / Reload):
+Called from the AX::AX_SVG_importer HDA:
 
-    import importlib, ax_svg_import
-    importlib.reload(ax_svg_import)
-    ax_svg_import.import_file(kwargs["node"])
+    Python SOP inside the HDA:  ax_svg_import.cook(hou.pwd())
+    File parm callback:         ax_svg_import.file_changed(kwargs["node"])
+    Reload button callback:     ax_svg_import.reload(kwargs["node"])
 
-The parsed geometry is stored in the HDA's stash, so files are only read when
-the file changes or Reload is pressed, and the .hip keeps working without them.
+The file is read when the node cooks. No geometry is saved in the HDA or the
+.hip, so the file has to stay where the File parm points.
 
 Supported
     SVG   path (all commands incl. Q/T/A), rect (rounded), circle, ellipse,
@@ -1375,9 +1375,11 @@ def load_shapes(path, artboard=0):
     return parse_svg(path)
 
 
-def build_geometry(shapes):
+def build_geometry(shapes, geo=None):
+    """Write shapes into geo (a new hou.Geometry if None) and return it."""
     import hou
-    geo = hou.Geometry()
+    if geo is None:
+        geo = hou.Geometry()
     a_cd = geo.addAttrib(hou.attribType.Prim, "Cd", (1.0, 1.0, 1.0))
     a_alpha = geo.addAttrib(hou.attribType.Prim, "Alpha", 1.0)
     a_fill = geo.addAttrib(hou.attribType.Prim, "fill_color", (0.0, 0.0, 0.0))
@@ -1424,34 +1426,65 @@ def build_geometry(shapes):
     return geo
 
 
-def import_file(node):
-    """Parm callback entry point: read the file and store it in the HDA's stash."""
+PYTHON_SOP = "import_svg"     # the Python SOP inside the HDA that calls cook()
+
+
+def _artboard_choice(hda, path):
+    """Artboard parm value, clamped to the file's artboard count.
+
+    The Artboard parm is an int menu, and Houdini stores the menu *position*:
+    0 = All artboards, 1..N = that artboard (see artboard_menu).
+    """
+    board_parm = hda.parm("artboard")
+    choice = board_parm.eval() if board_parm is not None else 1
+    if choice > 1 and _is_pdf_like(path):
+        count = len(list_artboards(path))
+        if count and choice > count:            # file has fewer artboards
+            choice = 1
+    return choice
+
+
+def cook(sop):
+    """Python SOP entry point: read the HDA's file into the SOP's geometry.
+
+    The file is read on every cook and nothing is stored in the .hip.
+    """
     import hou
-    path = node.evalParm("file").strip()
-    target = node.parm("geo_data")
+    hda = sop.parent()
+    geo = sop.geometry()
+    geo.clear()
+    path = hda.evalParm("file").strip()
     if not path:
-        target.set(hou.Geometry())
         return
     full = hou.text.expandString(path)
-    # The Artboard parm is an int menu, and Houdini stores the menu *position*:
-    # 0 = All artboards, 1..N = that artboard (see artboard_menu).
-    board_parm = node.parm("artboard")
-    choice = board_parm.eval() if board_parm is not None else 1
     try:
-        if choice > 1 and _is_pdf_like(full):
-            count = len(list_artboards(full))
-            if count and choice > count:        # new file has fewer artboards
-                choice = 1
-                board_parm.set(1)               # doesn't re-run the callback
+        choice = _artboard_choice(hda, full)
         artboard = ALL_ARTBOARDS if choice == 0 else max(0, choice - 1)
         shapes = load_shapes(full, artboard)
     except (OSError, ValueError) as ex:
-        hou.ui.displayMessage("AX SVG importer could not read\n%s\n\n%s" % (path, ex),
-                              severity=hou.severityType.Error, title="AX SVG importer")
-        return
-    geo = build_geometry(shapes)
-    with hou.undos.group("AX SVG importer: import %s" % os.path.basename(path)):
-        target.set(geo)
+        raise hou.NodeError("Could not read %s: %s" % (path, ex))
+    build_geometry(shapes, geo)
+
+
+def file_changed(hda):
+    """File parm callback: reset Artboard if the new file has fewer artboards."""
+    import hou
+    try:
+        full = hou.text.expandString(hda.evalParm("file").strip())
+        if full and os.path.isfile(full) and _artboard_choice(hda, full) == 1:
+            board_parm = hda.parm("artboard")
+            if board_parm.eval() > 1:
+                board_parm.set(1)
+    except (OSError, ValueError):
+        pass                                    # cook() reports read errors
+
+
+def reload(hda):
+    """Reload button callback: re-read the file after it changed on disk."""
+    sop = hda.node(PYTHON_SOP)
+    if sop is not None:
+        sop.cook(force=True)
+    hda.cook(force=True)
 
 
 def artboard_menu(node):
