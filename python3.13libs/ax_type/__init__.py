@@ -131,6 +131,7 @@ def cook(node, hda=None):
         "valign": hda.parm("valign").evalAsString(),
         "horigin": hda.parm("horigin").evalAsString(),
         "block_align": base["align"],
+        "skip_empty": bool(hda.parm("skipempty").eval()) if hda.parm("skipempty") else False,
     }
     lay = layout.layout(segments, opts, get_font, missing)
     if missing:

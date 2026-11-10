@@ -168,12 +168,18 @@ def parse(text, base, styles=None, warnings=None):
     stack = [(None, None, dict(base))]
     segments = []
     buf = []
+    # True while the innermost open tag has no text yet. An empty tag still
+    # leaves a zero-length segment so an otherwise empty line takes its look.
+    empty_tag = [False]
 
-    def flush():
-        if buf:
+    def flush(closing=False):
+        text = "".join(buf)
+        if text or (closing and empty_tag[0]):
             names = tuple(s for _, s, _ in stack[1:] if s)
-            segments.append(Segment("".join(buf), stack[-1][2], names))
-            del buf[:]
+            segments.append(Segment(text, stack[-1][2], names))
+        if text:
+            empty_tag[0] = False
+        del buf[:]
 
     pos = 0
     for m in _TAG_RE.finditer(text):
@@ -191,7 +197,8 @@ def parse(text, base, styles=None, warnings=None):
             buf.append(tok)
             continue
         if body.startswith("/"):
-            flush()
+            flush(closing=len(stack) > 1)
+            empty_tag[0] = False
             close = body[1:].strip()
             if len(stack) == 1:
                 warnings.append("Closing tag [%s] without opening tag" % body)
@@ -213,6 +220,7 @@ def parse(text, base, styles=None, warnings=None):
             props.update(styles.get(style, {}))
         props.update(overrides)
         stack.append((name, style, props))
+        empty_tag[0] = True
     buf.append(text[pos:])
     flush()
     return segments

@@ -43,6 +43,11 @@ def layout(segments, opts, get_font, missing):
     line_props = [segments[0].props if segments else None]
     pos = 0
     for seg in segments:
+        if not seg.text:
+            # an empty tag, e.g. [title][/title]: an empty line takes its look
+            if not lines_pieces[-1]:
+                line_props[-1] = seg.props
+            continue
         parts = seg.text.split("\n")
         for k, part in enumerate(parts):
             if k > 0:
@@ -132,6 +137,14 @@ def layout(segments, opts, get_font, missing):
         line.leading = lead
         res.lines.append(line)
     res.num_words = word + 1
+
+    # ---- optionally drop lines with nothing visible on them
+    if opts.get("skip_empty"):
+        kept = [l for l in res.lines if any(g.visible for g in l.glyphs)]
+        res.lines = kept or res.lines[:1]
+        for li, line in enumerate(res.lines):
+            for g in line.glyphs:
+                g.line = li
 
     # ---- vertical placement
     # A line sits its own leading below the previous baseline: the largest
