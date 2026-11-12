@@ -81,6 +81,14 @@ def _qt_family(spec, extra):
     return res
 
 
+def _raw_text(parm):
+    """Text as typed, keeping backtick expressions and $VARS unexpanded."""
+    try:
+        return parm.unexpandedString()
+    except hou.OperationFailed:   # keyframed or expression-driven parm
+        return parm.eval()
+
+
 def _dump(ovr):
     return json.dumps({k: list(v) if isinstance(v, tuple) else v for k, v in ovr.items()},
                       sort_keys=True)
@@ -153,7 +161,7 @@ class TypeEditor(QtWidgets.QDialog):
         self._syncing = False
         self._fmt_cache = {}
         self._read_node_styles()
-        self._original = node.parm("text").eval()
+        self._original = _raw_text(node.parm("text"))
 
         self._write_timer = QtCore.QTimer(self)
         self._write_timer.setSingleShot(True)
@@ -537,6 +545,10 @@ class TypeEditor(QtWidgets.QDialog):
             runs = []
             for s, e, style, ovr in self._char_data(start, end):
                 runs.append((block.text()[s - start:e - start], style, ovr))
+            if not block.text():
+                style, ovr = self.data_of(block.charFormat())
+                if style or ovr:
+                    runs.append(("", style, ovr))
             lines.append((self._block_align(block), runs))
             block = block.next()
         return markup.serialize(lines, self.base.get("align", "left"))
@@ -556,6 +568,12 @@ class TypeEditor(QtWidgets.QDialog):
                 bf = QtGui.QTextBlockFormat()
                 bf.setAlignment(ALIGN_TO_QT.get(align, QtCore.Qt.AlignLeft))
                 cur.setBlockFormat(bf)
+                if len(runs) == 1 and not runs[0][0]:
+                    # empty line from an empty tag: the block keeps the tag's look
+                    fmt = self.visual(runs[0][1], runs[0][2])
+                    cur.setBlockCharFormat(fmt)
+                    cur.setCharFormat(fmt)
+                    continue
                 cur.setBlockCharFormat(self.visual(None, {}))
                 for text, style, ovr in runs:
                     cur.insertText(text, self.visual(style, ovr))
@@ -570,7 +588,7 @@ class TypeEditor(QtWidgets.QDialog):
         self.sync_ui()
 
     def load_from_node(self):
-        self.set_markup(self.node.parm("text").eval())
+        self.set_markup(_raw_text(self.node.parm("text")))
 
     def reload(self):
         self._read_node_styles()

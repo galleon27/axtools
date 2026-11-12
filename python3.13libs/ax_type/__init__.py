@@ -7,7 +7,7 @@ import importlib
 import sys
 
 from . import _ft_compat  # noqa: F401
-from . import fonts, markup, shaping, layout, build
+from . import fonts, markup, shaping, layout, build, arrays
 
 # Character style properties: (prop key, parm suffix, kind)
 STYLE_PROPS = (
@@ -99,7 +99,8 @@ def cook(node, hda=None):
     extra = _extra_dirs(hda)
     base = read_base(hda)
     styles = read_styles(hda)
-    segments = markup.parse(hda.parm("text").eval(), base, styles, warnings)
+    text = arrays.text_with_arrays(hda)
+    segments = markup.parse(text, base, styles, warnings)
     if not segments:
         return
 
@@ -157,7 +158,7 @@ def font_menu(hda=None):
 
 def dev_reload():
     """Reload all submodules (font caches are dropped too). Returns the package."""
-    for name in ("fonts", "markup", "shaping", "layout", "build"):
+    for name in ("fonts", "markup", "shaping", "layout", "build", "arrays"):
         importlib.reload(sys.modules[__name__ + "." + name])
     pkg = importlib.reload(sys.modules[__name__])
     if __name__ + ".editor" in sys.modules:  # only loaded once the editor was opened

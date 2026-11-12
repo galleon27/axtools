@@ -7,7 +7,8 @@ from . import shaping
 class Placed(object):
     """A positioned glyph. x/y is the baseline origin in output units."""
     __slots__ = ("font", "name", "text", "chars", "props", "styles", "x", "y",
-                 "sx", "sy", "shear", "width", "line", "word", "run", "visible")
+                 "sx", "sy", "shear", "width", "line", "word", "run", "visible",
+                 "glyph_scale")
 
 
 class Line(object):
@@ -112,6 +113,7 @@ def layout(segments, opts, get_font, missing):
                 p.styles = seg.styles
                 p.sx = ux * g.scale
                 p.sy = uy * g.scale
+                p.glyph_scale = g.scale   # faux small caps factor, else 1
                 p.shear = shear
                 p.x = pen
                 p.y = props.get("shift", 0.0)

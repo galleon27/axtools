@@ -275,6 +275,12 @@ def char_runs(segments, base, styles):
         if style not in styles:
             style = None
         ovr = prune(seg.props, base, styles, style)
+        if not seg.text:
+            # an empty tag on an empty line: keep it as a placeholder run so the
+            # line keeps its look ([title][/title])
+            if not lines[-1][1] and (style or ovr):
+                lines[-1][1].append(("", style, ovr))
+            continue
         for k, part in enumerate(seg.text.split("\n")):
             if k > 0:
                 lines.append([None, [], seg.props.get("align", default)])
@@ -282,6 +288,8 @@ def char_runs(segments, base, styles):
                 lines[-1][0] = seg.props.get("align", default)
             if part:
                 runs = lines[-1][1]
+                if len(runs) == 1 and not runs[0][0]:
+                    del runs[:]   # the line has text after all; drop the placeholder
                 if runs and runs[-1][1] == style and runs[-1][2] == ovr:
                     runs[-1] = (runs[-1][0] + part, style, ovr)
                 else:
@@ -316,8 +324,12 @@ def serialize(lines, base_align="left"):
     out = []
     for align, runs in lines:
         merged = []
+        # a line holding only an empty run keeps it, as an empty tag
+        empty = [r for r in runs if not r[0] and (r[1] or r[2])]
+        if empty and not any(r[0] for r in runs):
+            runs = empty[:1]
         for text, style, ovr in runs:
-            if not text:
+            if not text and len(runs) > 1:
                 continue
             if merged and merged[-1][1] == style and merged[-1][2] == ovr:
                 merged[-1] = (merged[-1][0] + text, style, ovr)
