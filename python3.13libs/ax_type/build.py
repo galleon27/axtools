@@ -181,14 +181,17 @@ def write(geo, lay, opts):
         add("glyph_u", 0.0, [gi / float(max(nvis - 1, 1)) for gi in gidx])
         add("word_u", 0.0, per(lambda g: g.word / float(max(nwords - 1, 1))))
         add("line_u", 0.0, per(lambda g: g.line / float(max(nlines - 1, 1))))
-        add("size", 0.0, per(lambda g: g.props["size"] * gscale))
+        # drawn em size: includes faux small caps and Uniform Scale
+        add("size", 0.0, per(lambda g: g.props["size"] * g.glyph_scale * gscale))
         add("Cd", (1.0, 1.0, 1.0), per(lambda g: tuple(g.props.get("color", (1, 1, 1)))), 3)
         add("Alpha", 1.0, per(lambda g: g.props.get("alpha", 1.0)))
         if mode == OUT_CURVES:
             add("ishole", 0, prim_hole)
         if mode == OUT_POINTS:
             add("advance", 0.0, per(lambda g: g.width * gscale))
-            add("pscale", 0.0, per(lambda g: g.props["size"] * gscale))
+            add("pscale", 0.0, per(lambda g: g.props["size"] * g.glyph_scale * gscale))
+            add("scale", (1.0, 1.0, 1.0),
+                per(lambda g: (g.props.get("hscale", 1.0), g.props.get("vscale", 1.0), 1.0)), 3)
         if pack != PACK_NONE:
             fmt = {PACK_GLYPH: lambda g, gi: "glyph_%d" % gi,
                    PACK_WORD: lambda g, gi: "word_%d" % g.word,
