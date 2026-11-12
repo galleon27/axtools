@@ -68,14 +68,47 @@ def camera_changed(node):
         node.setPosition(hou.Vector2(pos[0], pos[1] - 1.2))
 
 
+def _context_network(kwargs):
+    """The OBJ network the tool was run in (Tab menu), or None (shelf click)."""
+    pane = (kwargs or {}).get("pane")
+    try:
+        net = pane.pwd() if pane is not None else None
+    except Exception:
+        net = None
+    if net is not None and net.childTypeCategory() == hou.objNodeTypeCategory():
+        return net
+    return None
+
+
+def _pick_camera(net, interactive=True):
+    """Choose a camera. With a network, only cameras directly inside it count.
+
+    Order: selected camera, viewport camera, the only camera, then ask.
+    """
+    def ok(c):
+        return _is_camera(c) and (net is None or c.parent() == net)
+
+    sel = [n for n in hou.selectedNodes() if ok(n)]
+    if sel:
+        return sel[0]
+    cam = _viewport_camera()
+    if cam is not None and ok(cam):
+        return cam
+    cams = [c for c in net.children() if _is_camera(c)] if net is not None else _scene_cameras()
+    if len(cams) == 1:
+        return cams[0]
+    if cams and interactive and hou.isUIAvailable():
+        picked = hou.ui.selectFromList([c.path() for c in cams], exclusive=True,
+                                       title="AX Camera Guides", message="Pick a camera")
+        return cams[picked[0]] if picked else None
+    return None
+
+
 def on_created(node):
     node.setColor(hou.Color((0.8, 0.4, 0.2)))
     if node.evalParm("camera"):
         return
-    cam = _viewport_camera()
-    if cam is None:
-        cams = _scene_cameras()
-        cam = cams[0] if len(cams) == 1 else None
+    cam = _pick_camera(node.parent(), interactive=False)
     if cam is not None:
         _set_camera(node, cam)
 
@@ -99,24 +132,17 @@ def look_through(node):
 
 
 def create_for_viewport(kwargs=None):
-    """Shelf tool: add guides for the viewport camera (or a picked one)."""
-    cam = _viewport_camera()
+    """Shelf / Tab tool: add guides for a camera, or select the existing ones.
+
+    From the Tab menu, the camera comes from the network you are in. From the
+    shelf, any camera in the scene can be used.
+    """
+    net = _context_network(kwargs)
+    cam = _pick_camera(net)
     if cam is None:
-        sel = [n for n in hou.selectedNodes() if _is_camera(n)]
-        cam = sel[0] if sel else None
-    if cam is None:
-        cams = _scene_cameras()
-        if len(cams) == 1:
-            cam = cams[0]
-        elif cams:
-            picked = hou.ui.selectFromList([c.path() for c in cams], exclusive=True,
-                                           title="AX Camera Guides",
-                                           message="Pick a camera")
-            if not picked:
-                return None
-            cam = cams[picked[0]]
-    if cam is None:
-        hou.ui.displayMessage("No OBJ camera found.", severity=hou.severityType.Warning)
+        where = " in %s" % net.path() if net is not None else ""
+        hou.ui.displayMessage("No OBJ camera found%s." % where,
+                              severity=hou.severityType.Warning)
         return None
 
     existing = [n for n in cam.outputs() if n.type().name() == HDA_TYPE]
