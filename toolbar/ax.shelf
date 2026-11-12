@@ -28,6 +28,7 @@
     <memberTool name="Loop Sequence"/>
     <memberTool name="set_item_color"/>
     <memberTool name="Advanced Notes"/>
+    <memberTool name="Camera Guides"/>
   </toolshelf>
 
   <tool name="GSG Octane Material" label="GSG Octane Material" icon="custom_hda_icon">
@@ -2056,5 +2057,11 @@ def edit_sticky_note():
 
 
 edit_sticky_note()]]></script>
+  </tool>
+
+  <tool name="Camera Guides" label="Camera Guides" icon="OBJ_camera">
+    <helpText><![CDATA[Adds AX Camera Guides to the camera the viewport is looking through.]]></helpText>
+    <script scriptType="python"><![CDATA[import ax_camera_guides
+ax_camera_guides.create_for_viewport(kwargs)]]></script>
   </tool>
 </shelfDocument>
