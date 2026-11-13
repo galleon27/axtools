@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 !scripts/python/nodeColor.pyc
 !scripts/python/split_sop.pyc
+config/icons/ax_icons.md
