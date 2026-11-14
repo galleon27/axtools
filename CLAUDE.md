@@ -31,6 +31,9 @@ All other logic lives in the external module.
   external module.
 - Menu scripts: `import ax_<name>; return ax_<name>.<menu_fn>(kwargs["node"])`.
 - Never use a Python SOP, for cooking or for anything else.
+- VEX-based tools stay as wrangles inside the HDA. Don't write or call their logic from
+  an external Python script, and don't add Python callbacks or helper buttons to them
+  unless asked.
 - An HDA that creates geometry always has a Reload button. Its callback regenerates
   the geometry, for example by writing it into a Stash SOP inside the HDA.
 - A package with several modules gets a `dev_reload()` that runs `importlib.reload`
