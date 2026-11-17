@@ -18,8 +18,10 @@ chain and Update Position moves P directly.
 
 The internal advects live in the editable subnet `stack` and are created,
 wired and linked here, one per multiparm instance. Slot K of the multiparm
-drives node `advectK`.
+drives the node named by its label_K parm (default `advectK`).
 """
+
+import re
 
 import hou
 
@@ -27,6 +29,7 @@ STACK = "stack"
 NODE_TYPE = "popadvectbyvolumes"
 NODE_PREFIX = "advect"
 OUT_NODE = "OUT"
+SLOT_KEY = "ax_slot"
 MIN_ATTEN = 1e-4
 
 # Parms not linked one to one.
@@ -116,24 +119,57 @@ def _link(internal, node, k):
             p.set('`chsop("../../%s%d")`' % (name, k), follow_parm_reference=False)
 
 
+def _slot_name(node, k):
+    """Valid node name for slot k: the label_K parm, or advectK when it is empty."""
+    label = str(_eval(node, "label_%d" % k, "") or "").strip()
+    name = re.sub(r"[^A-Za-z0-9_]", "_", label)
+    if not name:
+        return NODE_PREFIX + str(k)
+    if name[0].isdigit():
+        name = "_" + name
+    return name
+
+
+def _rename(node, nodes):
+    """Rename the internal advects to their slot names (two-phase, so swaps don't clash)."""
+    wanted = [_slot_name(node, k) for k in range(1, len(nodes) + 1)]
+    if [n.name() for n in nodes] == wanted:
+        return
+    for i, n in enumerate(nodes):
+        n.setName("__ax_tmp%d" % i, unique_name=True)
+    for n, name in zip(nodes, wanted):
+        n.setName(name, unique_name=True)  # duplicate labels get a number added
+
+
 def sync(node):
     """Make the internal advects match the multiparm: one node per slot, wired and linked."""
     stack = _stack(node)
     count = _count(node)
 
+    existing = {}
+    for child in stack.children():
+        if child.type().name() != NODE_TYPE:
+            continue
+        slot = child.userData(SLOT_KEY)
+        if slot is None and child.name().startswith(NODE_PREFIX):
+            slot = child.name()[len(NODE_PREFIX):]
+        if slot is not None and slot not in existing:
+            existing[slot] = child
+
     nodes = []
     for k in range(1, count + 1):
-        n = stack.node(NODE_PREFIX + str(k))
-        if n is None or n.type().name() != NODE_TYPE:
-            if n is not None:
-                n.destroy()
-            n = stack.createNode(NODE_TYPE, NODE_PREFIX + str(k))
+        n = existing.get(str(k))
+        if n is None:
+            n = stack.createNode(NODE_TYPE)
+        n.setUserData(SLOT_KEY, str(k))
         nodes.append(n)
 
     keep = set(nodes)
     for child in stack.children():
         if child.type().name() == NODE_TYPE and child not in keep:
             child.destroy()
+
+    _rename(node, nodes)
 
     stack_in = stack.indirectInputs()[0]
     prev = stack_in
