@@ -24,6 +24,34 @@ The HDA stores the UI: parm templates, the Help section, OnCreated defaults (Pyt
 with the `OnCreated/IsPython` extra file option) and, if needed, a short PythonModule.
 All other logic lives in the external module.
 
+### Node color and icon
+Set the color in the OnCreated script with `node.setColor(hou.Color((r, g, b)))` and the
+icon with `definition.setIcon("<name>")`. Icons live in `config/icons/` and are referenced
+by bare name, without a path or extension. Use the same name in the Help `#icon:` line.
+
+| Kind of node | Color (r, g, b) | Icon |
+|---|---|---|
+| Importer (reads data into Houdini) | `(1, 0.5, 0.1)` | `ax_import` |
+| Exporter (writes data out of Houdini) | `(0.8, 0.1, 0.1)` | `ax_export` |
+| Anything else that generates geometry | `(0.145, 0.667, 0.557)` | `custom_hda_icon` |
+| Everything else | no color rule | `custom_hda_icon` |
+
+Importers and exporters are decided by what the node does, not by its name. The default
+icon is `custom_hda_icon` unless the node is an importer or exporter.
+
+### TAB menu submenu
+The TAB menu path is stored in the `Tools.shelf` section (`<toolSubmenu>`), set in the
+Type Properties under Interactive > Shelf Tools > Context.
+
+| Kind of node | Submenu |
+|---|---|
+| Importer | `AX/Import` |
+| Exporter | `AX/Export` |
+| Everything else | `AX` (or `AX/<Group>` for a group like `AX/Camera`) |
+
+Use the same importer/exporter decision as for color and icon. To change it on an
+existing HDA, patch the `Tools.shelf` section in place (see "Changing HDAs").
+
 ### Wiring Python
 - Button callbacks call the module directly:
   `import ax_<name>; ax_<name>.<fn>(kwargs["node"])`. With a PythonModule,
@@ -63,7 +91,8 @@ Build the first version with a one-off hython script:
    `"C:/Program Files/Side Effects Software/Houdini 22.0.459/bin/hython.exe"`.
 2. Create `/obj/geo` → `subnet`, then build the internal network ending in `output0`.
 3. Call `sub.createDigitalAsset(name=..., hda_file_name=..., description=...)`.
-4. On the definition: `setParmTemplateGroup(...)`, `addSection("OnCreated", ...)`
+4. On the definition: `setParmTemplateGroup(...)`, `setIcon(...)` and
+   `addSection("OnCreated", ...)` (including the node color, see "Node color and icon")
    with `setExtraFileOption("OnCreated/IsPython", True)`, `addSection("Help", ...)`,
    and if needed `addSection("PythonModule", ...)` with
    `setExtraFileOption("PythonModule/IsPython", True)`.
