@@ -173,7 +173,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.model = grid.AssetModel(self._drag_payload, self)
         self.view = grid.AssetView()
         self.view.setModel(self.model)
-        self.view.activated.connect(lambda _i: self._import_selected())
+        self.view.import_requested.connect(self._import_selected)
         self.view.customContextMenuRequested.connect(self._context_menu)
         self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.stack.addWidget(self.view)

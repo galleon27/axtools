@@ -296,6 +296,11 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
 
 # --- view ------------------------------------------------------------------------------
 class AssetView(QtWidgets.QListView):
+    """Thumbnail grid. Import is double-click or Enter only: Houdini's style turns on
+    single-click activation, so QAbstractItemView.activated can't be used for it."""
+
+    import_requested = QtCore.Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
@@ -322,6 +327,22 @@ class AssetView(QtWidgets.QListView):
         opt.initFrom(self)
         self.setGridSize(self.delegate.sizeHint(opt, QtCore.QModelIndex()))
         self.doItemsLayout()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and \
+                self.indexAt(event.position().toPoint()).isValid():
+            event.accept()
+            self.import_requested.emit()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and \
+                self.selectionModel().hasSelection():
+            event.accept()
+            self.import_requested.emit()
+            return
+        super().keyPressEvent(event)
 
     def selected_records(self):
         rows = sorted(i.row() for i in self.selectionModel().selectedIndexes())
