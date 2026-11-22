@@ -28,8 +28,20 @@ DEFAULTS = {
     "splitter": [],
     "copy_on_ingest": True,
     "read_geo_info": True,
+    "ingest_render": False,
     "last_ingest_dir": "",
     "last_category": "",
+    # publish
+    "publish_formats": ["bgeo.sc"],
+    "publish_center": False,
+    "publish_ground": False,
+    "publish_unpack": False,
+    "publish_thumbnail": "karma",  # "karma", "image" or "none"
+    # Karma thumbnails
+    "thumb_renderer": "BRAY_HdKarma",
+    "thumb_samples": 16,
+    "thumb_resolution": 512,
+    "thumb_timeout": 300,
 }
 
 

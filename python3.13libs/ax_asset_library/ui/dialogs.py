@@ -3,7 +3,7 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import library, prefs as _prefs
+from .. import karma, library, prefs as _prefs, publish, schema
 
 Qt = QtCore.Qt
 
@@ -58,6 +58,12 @@ class IngestDialog(QtWidgets.QDialog):
         self.info_check.setToolTip("Loads each file once to store its size and counts. "
                                    "Slower for large files.")
         form.addRow("", self.info_check)
+
+        self.render_check = QtWidgets.QCheckBox("Render missing thumbnails with Karma")
+        self.render_check.setChecked(settings.get("ingest_render"))
+        self.render_check.setToolTip("Assets without a matching preview image get a Karma "
+                                     "thumbnail, rendered in the background.")
+        form.addRow("", self.render_check)
         lay.addLayout(form)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
@@ -87,6 +93,7 @@ class IngestDialog(QtWidgets.QDialog):
             "tags": self.tags_edit.text(),
             "copy": self.copy_check.isChecked(),
             "read_info": self.info_check.isChecked(),
+            "render": self.render_check.isChecked(),
         }
 
 
@@ -131,7 +138,7 @@ class SettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("AX Asset Library settings")
         self.settings = settings
-        self.resize(640, 380)
+        self.resize(640, 480)
         lay = QtWidgets.QVBoxLayout(self)
 
         lay.addWidget(QtWidgets.QLabel("<b>Library roots</b>"))
@@ -182,6 +189,32 @@ class SettingsDialog(QtWidgets.QDialog):
         self.formats.setToolTip("When an asset has several formats, the first one in this list "
                                 "is imported.")
         form.addRow("Format order", self.formats)
+
+        self.renderer = QtWidgets.QComboBox()
+        for key, label in karma.RENDERERS:
+            self.renderer.addItem(label, key)
+        idx = self.renderer.findData(settings.get("thumb_renderer"))
+        if idx < 0:
+            self.renderer.addItem(settings.get("thumb_renderer"), settings.get("thumb_renderer"))
+            idx = self.renderer.count() - 1
+        self.renderer.setCurrentIndex(idx)
+        self.renderer.setToolTip("Karma engine used by husk for thumbnail renders.")
+        form.addRow("Thumbnail renderer", self.renderer)
+
+        self.samples = QtWidgets.QSpinBox()
+        self.samples.setRange(1, 1024)
+        self.samples.setValue(settings.get("thumb_samples"))
+        self.samples.setToolTip("Path-traced samples per pixel for thumbnail renders. "
+                                "More samples: less noise, slower renders.")
+        form.addRow("Thumbnail samples", self.samples)
+
+        self.resolution = QtWidgets.QSpinBox()
+        self.resolution.setRange(64, 2048)
+        self.resolution.setSingleStep(64)
+        self.resolution.setValue(settings.get("thumb_resolution"))
+        self.resolution.setToolTip("Rendered size in pixels. The stored thumbnail is at most "
+                                   "512 x 512.")
+        form.addRow("Render size", self.resolution)
         lay.addLayout(form)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
@@ -221,5 +254,214 @@ class SettingsDialog(QtWidgets.QDialog):
         self.settings.set("roots", roots, save=False)
         self.settings.set("path_mode", self.path_mode.currentData(), save=False)
         self.settings.set("geo_format_order", order or list(_prefs.GEO_FORMAT_ORDER), save=False)
+        self.settings.set("thumb_renderer", self.renderer.currentData(), save=False)
+        self.settings.set("thumb_samples", self.samples.value(), save=False)
+        self.settings.set("thumb_resolution", self.resolution.value(), save=False)
         self.settings.save()
         self.accept()
+
+
+class PublishDialog(QtWidgets.QDialog):
+    """Options for saving a node's geometry as a new asset or a new version of one."""
+
+    def __init__(self, node_path, name, settings, records, existing=None, parent=None):
+        """existing: AssetRecord to add a version to (name, category and root locked)."""
+        super().__init__(parent)
+        self.settings = settings
+        self.records = records
+        self.existing = existing
+        self.roots = settings.writable_roots()
+        self.setWindowTitle("New version of %s" % existing.name if existing
+                            else "Save to library")
+
+        lay = QtWidgets.QVBoxLayout(self)
+        src = QtWidgets.QLabel("Geometry from <b>%s</b>" % node_path)
+        src.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(src)
+
+        form = QtWidgets.QFormLayout()
+        self.root_combo = QtWidgets.QComboBox()
+        for r in self.roots:
+            self.root_combo.addItem(r["path"], r)
+        self.root_combo.setToolTip("Library root the asset is written to.")
+        form.addRow("Library", self.root_combo)
+
+        self.cat_combo = QtWidgets.QComboBox()
+        self.cat_combo.setEditable(True)
+        self.cat_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.cat_combo.setToolTip("Folder under geometry/. Use '/' for sub-folders.")
+        form.addRow("Category", self.cat_combo)
+
+        self.name_edit = QtWidgets.QLineEdit(name)
+        self.name_edit.setToolTip("Asset and folder name. Spaces and special characters "
+                                  "become '_'. An existing name in the same category saves "
+                                  "a new version of that asset.")
+        form.addRow("Name", self.name_edit)
+
+        self.status = QtWidgets.QLabel()
+        form.addRow("", self.status)
+
+        self.tags_edit = QtWidgets.QLineEdit()
+        self.tags_edit.setPlaceholderText("rock, cliff")
+        self.tags_edit.setToolTip("Comma-separated tags. For a new version they are added to "
+                                  "the existing tags.")
+        form.addRow("Tags", self.tags_edit)
+
+        self.desc_edit = QtWidgets.QLineEdit()
+        self.desc_edit.setToolTip("Short description. For a new version, leave empty to keep "
+                                  "the current one.")
+        form.addRow("Description", self.desc_edit)
+
+        self.note_edit = QtWidgets.QLineEdit()
+        self.note_edit.setPlaceholderText("what changed in this version")
+        self.note_edit.setToolTip("Note stored with this version, shown in the version list.")
+        form.addRow("Version note", self.note_edit)
+
+        fmt_row = QtWidgets.QHBoxLayout()
+        self.fmt_checks = {}
+        for fmt in publish.PUBLISH_FORMATS:
+            c = QtWidgets.QCheckBox(fmt)
+            c.setChecked(fmt == "bgeo.sc" or fmt in settings.get("publish_formats"))
+            if fmt == "bgeo.sc":
+                c.setEnabled(False)
+                c.setToolTip("Always written; used for import and thumbnails.")
+            else:
+                c.setToolTip("Also write a .%s file. If Houdini can't write it, the asset is "
+                             "saved without it and a warning is shown." % fmt)
+            fmt_row.addWidget(c)
+            self.fmt_checks[fmt] = c
+        fmt_row.addStretch()
+        form.addRow("Formats", fmt_row)
+
+        self.center_check = QtWidgets.QCheckBox("Center on X and Z")
+        self.center_check.setChecked(settings.get("publish_center"))
+        self.center_check.setToolTip("Move the bounding box center to the origin on X and Z.")
+        self.ground_check = QtWidgets.QCheckBox("Move to ground (Y = 0)")
+        self.ground_check.setChecked(settings.get("publish_ground"))
+        self.ground_check.setToolTip("Move the geometry up or down so its lowest point is at Y = 0.")
+        self.unpack_check = QtWidgets.QCheckBox("Unpack packed primitives")
+        self.unpack_check.setChecked(settings.get("publish_unpack"))
+        self.unpack_check.setToolTip("Unpack packed primitives (and packed disk files) before "
+                                     "saving, so the asset holds plain geometry.")
+        opts = QtWidgets.QVBoxLayout()
+        for c in (self.center_check, self.ground_check, self.unpack_check):
+            opts.addWidget(c)
+        form.addRow("Options", opts)
+
+        self.thumb_karma = QtWidgets.QRadioButton("Render with Karma")
+        self.thumb_karma.setToolTip("Render a thumbnail in the background after saving.")
+        self.thumb_image = QtWidgets.QRadioButton("Image file")
+        self.thumb_image.setToolTip("Use an existing image, cropped to a square.")
+        self.thumb_none = QtWidgets.QRadioButton("None")
+        self.thumb_none.setToolTip("No new thumbnail. A new version keeps the current one.")
+        self.image_edit = QtWidgets.QLineEdit()
+        self.image_edit.setToolTip("Image file for the thumbnail.")
+        browse = QtWidgets.QPushButton("...")
+        browse.setFixedWidth(28)
+        browse.clicked.connect(self._browse_image)
+        img_row = QtWidgets.QHBoxLayout()
+        img_row.addWidget(self.thumb_image)
+        img_row.addWidget(self.image_edit, 1)
+        img_row.addWidget(browse)
+        thumbs = QtWidgets.QVBoxLayout()
+        thumbs.addWidget(self.thumb_karma)
+        thumbs.addLayout(img_row)
+        thumbs.addWidget(self.thumb_none)
+        mode = settings.get("publish_thumbnail")
+        {"image": self.thumb_image, "none": self.thumb_none}.get(mode, self.thumb_karma).setChecked(True)
+        form.addRow("Thumbnail", thumbs)
+        lay.addLayout(form)
+
+        self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                                  QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self._accept)
+        self.buttons.rejected.connect(self.reject)
+        lay.addWidget(self.buttons)
+
+        if existing is not None:
+            root = settings.root_for(existing.root)
+            idx = self.root_combo.findText(root["path"]) if root else -1
+            self.root_combo.setCurrentIndex(max(0, idx))
+            self.cat_combo.setEditText(existing.category)
+            for w in (self.root_combo, self.cat_combo, self.name_edit):
+                w.setEnabled(False)
+        else:
+            self.root_combo.currentIndexChanged.connect(self._fill_categories)
+            self._fill_categories()
+            self.cat_combo.setEditText(settings.get("last_category"))
+        self.cat_combo.editTextChanged.connect(self._update_status)
+        self.name_edit.textChanged.connect(self._update_status)
+        self.root_combo.currentIndexChanged.connect(self._update_status)
+        self._update_status()
+        self.resize(520, self.sizeHint().height())
+
+    def _fill_categories(self):
+        root = self.root_combo.currentData()
+        text = self.cat_combo.currentText()
+        self.cat_combo.blockSignals(True)
+        self.cat_combo.clear()
+        if root:
+            self.cat_combo.addItems(library.categories(self.records, root["expanded"], "geometry"))
+        self.cat_combo.setEditText(text)
+        self.cat_combo.blockSignals(False)
+
+    def _browse_image(self):
+        start = os.path.dirname(self.image_edit.text()) or self.settings.get("last_ingest_dir")
+        path, _f = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Thumbnail image", start,
+            "Images (%s)" % " ".join("*" + e for e in sorted(schema.IMAGE_EXTS)))
+        if path:
+            self.image_edit.setText(path)
+            self.thumb_image.setChecked(True)
+
+    def _update_status(self, *_):
+        ok = self.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        root = self.root_combo.currentData()
+        name = schema.sanitize_name(self.name_edit.text()) if self.name_edit.text().strip() else ""
+        if not root or not name:
+            self.status.setText("<span style='color:#dc463c'>Choose a library and a name.</span>")
+            ok.setEnabled(False)
+            return
+        ok.setEnabled(True)
+        if self.existing is not None:
+            try:
+                data = schema.load(self.existing.sidecar)
+            except schema.SidecarError:
+                data = None
+        else:
+            data = publish.existing_asset(root, self.cat_combo.currentText(), name)
+        if data is None:
+            self.status.setText("New asset <b>%s</b>" % name)
+            ok.setText("Save")
+        elif data.get("type") != "geometry":
+            self.status.setText("<span style='color:#dc463c'>%s exists as a %s asset.</span>"
+                                % (name, data.get("type")))
+            ok.setEnabled(False)
+        else:
+            self.status.setText("<b>%s</b> exists: saves %s" % (
+                name, schema.version_label(schema.next_version(data))))
+            ok.setText("Save version")
+
+    def _accept(self):
+        if self.thumb_image.isChecked() and not os.path.isfile(self.image_edit.text()):
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), "Pick an existing image file.")
+            return
+        self.accept()
+
+    def values(self):
+        thumb = "karma" if self.thumb_karma.isChecked() else (
+            "image" if self.thumb_image.isChecked() else "none")
+        return {
+            "root": self.root_combo.currentData(),
+            "category": self.cat_combo.currentText().strip(),
+            "name": self.name_edit.text().strip(),
+            "tags": self.tags_edit.text(),
+            "description": self.desc_edit.text().strip(),
+            "note": self.note_edit.text().strip(),
+            "formats": [f for f, c in self.fmt_checks.items() if c.isChecked()],
+            "center": self.center_check.isChecked(),
+            "ground": self.ground_check.isChecked(),
+            "unpack": self.unpack_check.isChecked(),
+            "thumbnail": thumb,
+            "image": self.image_edit.text() if thumb == "image" else "",
+        }

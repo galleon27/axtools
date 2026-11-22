@@ -5,7 +5,7 @@ import time
 import hou
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import importers, library, prefs as _prefs, publish, schema
+from .. import importers, library, prefs as _prefs, publish, schema, thumbnails
 from . import details, dialogs, grid
 
 Qt = QtCore.Qt
@@ -128,6 +128,15 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.size_slider.valueChanged.connect(self._on_size_changed)
         bar.addWidget(self.size_slider)
 
+        self.btn_publish = QtWidgets.QToolButton()
+        self.btn_publish.setText("Save selection")
+        self.btn_publish.setIcon(icon("BUTTONS_save"))
+        self.btn_publish.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_publish.setToolTip("Save the selected SOP node or Geometry object as an asset. "
+                                    "An existing name in the same category saves a new version.")
+        self.btn_publish.clicked.connect(lambda: self._publish())
+        bar.addWidget(self.btn_publish)
+
         self.btn_add = QtWidgets.QToolButton()
         self.btn_add.setText("Add")  # shown if the icon is missing
         self.btn_add.setIcon(icon("BUTTONS_list_add"))
@@ -189,6 +198,11 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.details.copy_requested.connect(self._copy_paths)
         self.details.reveal_requested.connect(self._reveal_selected)
         self.details.thumbnail_requested.connect(self._set_thumbnail)
+        self.details.render_requested.connect(self._render_selected)
+        self.details.set_current_requested.connect(self._set_current_version)
+        queue = thumbnails.karma_queue()
+        queue.finished.connect(self._on_render_finished)
+        queue.changed.connect(self._on_queue_changed)
         self.splitter.addWidget(self.details)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -353,7 +367,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 out.append(r)
         out = library.sort_records(out, self.sort_combo.currentData() or "name")
 
-        keep = {r.key for r in self.view.selected_records()} | self._select_after_scan
+        # Freshly saved/added assets replace the selection; otherwise keep it.
+        keep = self._select_after_scan or {r.key for r in self.view.selected_records()}
         self.model.set_records(out)
         self._reselect(keep)
         if self._select_after_scan and not self._scanning:
@@ -390,6 +405,9 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             parts.append("%d shown" % shown)
         if self._scanning:
             parts.append("scanning...")
+        rendering = len(thumbnails.karma_queue())
+        if rendering:
+            parts.append("rendering %d thumbnail(s)" % rendering)
         if self._scan_errors:
             parts.append("%d scan problem(s)" % len(self._scan_errors))
             self.status.setToolTip("\n".join(self._scan_errors[:30]))
@@ -407,13 +425,23 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     # ---- selection / actions -------------------------------------------------------------
     def _on_selection_changed(self, *_):
-        self.details.set_records(self.view.selected_records())
+        recs = self.view.selected_records()
+        rendering = len(recs) == 1 and thumbnails.karma_queue().is_pending(recs[0].asset_dir)
+        self.details.set_records(recs, rendering)
+
+    def _picked_version(self, recs):
+        """Version chosen in the details pane, when it shows exactly these records."""
+        rec = self.details._rec
+        if len(recs) == 1 and rec is not None and rec.key == recs[0].key:
+            return self.details.selected_version()
+        return None
 
     def _drag_payload(self, recs):
         paths, texts = [], []
+        version = self._picked_version(recs)
         for r in recs:
             try:
-                p, value = importers.file_for(r, self.settings)
+                p, value = importers.file_for(r, self.settings, version)
             except importers.AssetImportError:
                 continue
             paths.append(p)
@@ -425,7 +453,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         if not recs:
             return
         try:
-            nodes, warnings = importers.import_records(recs, self.settings)
+            nodes, warnings = importers.import_records(recs, self.settings,
+                                                       self._picked_version(recs))
         except importers.AssetImportError as e:
             hou.ui.displayMessage(str(e), severity=hou.severityType.Warning,
                                   title="AX Asset Library")
@@ -492,11 +521,132 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             menu.addAction("Copy path", self._copy_paths)
             if len(recs) == 1:
                 menu.addAction("Show in folder", self._reveal_selected)
-                menu.addAction("Set thumbnail from image...", self._set_thumbnail)
+                menu.addAction("Thumbnail from image...", self._set_thumbnail)
+            if any(r.type == "geometry" for r in recs):
+                menu.addAction("Render thumbnail (Karma)", self._render_selected)
+            if len(recs) == 1 and recs[0].type == "geometry":
+                menu.addAction("Save selected node as new version",
+                               lambda: self._publish(recs[0]))
             menu.addSeparator()
+        menu.addAction("Save selected node to library...", lambda: self._publish())
         menu.addAction("Add files...", self._add_files)
         menu.addAction("Rescan", self.rescan)
         menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    # ---- versions / thumbnails --------------------------------------------------------------
+    def _read_only(self, rec):
+        root = self.settings.root_for(rec.root)
+        return bool(root and root["read_only"])
+
+    def _error(self, e):
+        msg = e.instanceMessage() if isinstance(e, hou.Error) else str(e)
+        hou.ui.displayMessage(msg, severity=hou.severityType.Warning, title="AX Asset Library")
+
+    def _set_current_version(self, number):
+        recs = self.view.selected_records()
+        if len(recs) != 1 or not number:
+            return
+        try:
+            publish.set_current_version(recs[0], number, self._read_only(recs[0]))
+        except (hou.Error, schema.SidecarError, OSError) as e:
+            self._error(e)
+            return
+        self._message("%s: %s is now current." % (recs[0].name, schema.version_label(number)))
+        self.rescan()
+
+    def _render_selected(self):
+        recs = [r for r in self.view.selected_records() if r.type == "geometry"]
+        queued, problems = 0, []
+        for rec in recs:
+            try:
+                if publish.render_record_thumbnail(rec, self.settings):
+                    queued += 1
+            except (hou.Error, OSError, ImportError) as e:
+                msg = e.instanceMessage() if isinstance(e, hou.Error) else str(e)
+                problems.append("%s: %s" % (rec.name, msg))
+        text = "Rendering %d thumbnail(s)." % queued if queued else "No thumbnails queued."
+        if problems:
+            text += "  " + "  ".join(problems)
+        self._message(text, warning=bool(problems))
+        self._on_selection_changed()
+
+    def _render_missing(self, report):
+        """Queue Karma thumbnails for freshly ingested assets that got no preview image."""
+        for name, asset_dir in report.created:
+            try:
+                data = schema.load(os.path.join(asset_dir, schema.SIDECAR))
+                if data["thumbnail"].get("file"):
+                    continue
+                files = schema.current_version(data)["files"]
+                order = list(self.settings.get("geo_format_order"))
+                key = schema.pick_file(files, order)
+                publish.render_thumbnail(asset_dir, name, schema.resolve(asset_dir, files[key]),
+                                         data["info"].get("bounds"), self.settings)
+            except (hou.Error, schema.SidecarError, OSError, ImportError, KeyError,
+                    TypeError) as e:
+                report.warn("%s: thumbnail render not started (%s)" % (
+                    name, e.instanceMessage() if isinstance(e, hou.Error) else e))
+
+    def _on_queue_changed(self):
+        self._update_status()
+        self._on_selection_changed()
+
+    def _on_render_finished(self, asset_dir, ok, message):
+        self._message(message, warning=not ok)
+        self.rescan()
+
+    # ---- publish -------------------------------------------------------------------------------
+    def _publish(self, existing=None):
+        node = publish.publishable_node()
+        if node is None:
+            hou.ui.displayMessage("Select a SOP node or a Geometry object first.",
+                                  severity=hou.severityType.Message, title="AX Asset Library")
+            return
+        if not self.settings.writable_roots():
+            hou.ui.displayMessage("Add a library folder that is not read-only in Settings first.",
+                                  severity=hou.severityType.Warning, title="AX Asset Library")
+            return
+        if existing is not None and self._read_only(existing):
+            self._error(hou.OperationFailed("%s is in a read-only library root." % existing.name))
+            return
+        name = existing.name if existing is not None else publish.default_name(node)
+        dlg = dialogs.PublishDialog(node.path(), name, self.settings, self.records, existing, self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        v = dlg.values()
+        s = self.settings
+        if existing is None:
+            s.set("last_category", v["category"], save=False)
+        s.set("publish_formats", v["formats"], save=False)
+        s.set("publish_center", v["center"], save=False)
+        s.set("publish_ground", v["ground"], save=False)
+        s.set("publish_unpack", v["unpack"], save=False)
+        s.set("publish_thumbnail", v["thumbnail"])
+        try:
+            result = publish.publish_node(
+                node, v["root"], v["name"], v["category"], v["tags"], v["description"],
+                v["note"], v["formats"], v["center"], v["ground"], v["unpack"],
+                thumbnail_image=v["image"] or None,
+                asset_dir=existing.asset_dir if existing is not None else None)
+        except (hou.Error, schema.SidecarError, OSError) as e:
+            self._error(e)
+            return
+        warnings = list(result.warnings)
+        if v["thumbnail"] == "karma":
+            try:
+                publish.render_thumbnail(result.asset_dir, schema.sanitize_name(v["name"]),
+                                         result.geo_file, result.bounds, self.settings)
+            except (hou.Error, OSError, ImportError) as e:
+                warnings.append("thumbnail render not started: %s" % (
+                    e.instanceMessage() if isinstance(e, hou.Error) else e))
+        self._select_after_scan = {library.norm_path(os.path.join(result.asset_dir,
+                                                                  schema.SIDECAR))}
+        what = "new asset" if result.created else schema.version_label(result.version)
+        msg = "Saved %s (%s)." % (schema.sanitize_name(v["name"]), what)
+        if warnings:
+            msg += "  " + "  ".join(warnings)
+        self._message(msg, warning=bool(warnings))
+        self.rescan()
 
     # ---- adding files ----------------------------------------------------------------------
     def _add_files(self):
@@ -526,7 +676,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         v = dlg.values()
         self.settings.set("last_category", v["category"], save=False)
         self.settings.set("copy_on_ingest", v["copy"], save=False)
-        self.settings.set("read_geo_info", v["read_info"])
+        self.settings.set("read_geo_info", v["read_info"], save=False)
+        self.settings.set("ingest_render", v["render"])
         try:
             report = publish.ingest_geometry(paths, v["root"], v["category"], v["tags"],
                                              copy=v["copy"], read_info=v["read_info"])
@@ -536,6 +687,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             return
         self._select_after_scan = {library.norm_path(os.path.join(d, schema.SIDECAR))
                                    for _n, d in report.created}
+        if v["render"]:
+            self._render_missing(report)
         if report.skipped or report.failed or report.warnings:
             dialogs.ReportDialog(report, self).exec()
         self._message("Add to library: " + report.summary,

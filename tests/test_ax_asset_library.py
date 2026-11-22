@@ -11,7 +11,13 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
 
-from ax_asset_library import library, prefs, schema  # noqa: E402
+from ax_asset_library import karma, library, prefs, schema  # noqa: E402
+
+try:
+    import pxr  # noqa: F401
+    HAVE_PXR = True
+except ImportError:
+    HAVE_PXR = False
 
 
 def make_asset(root, asset_type, category, name, files=("model.bgeo.sc",), tags=(), thumb=False,
@@ -191,6 +197,90 @@ class ScanTests(unittest.TestCase):
         self.assertEqual([r.name for r in library.sort_records(recs, "added")][:2],
                          ["Sunset", "Oak_A"])
         self.assertEqual([r.name for r in library.sort_records(recs)], ["Boulder", "Oak_A", "Sunset"])
+
+
+class VersionTests(unittest.TestCase):
+    def test_versions_in_records(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "lib")
+            asset_dir, data = make_asset(root, "geometry", "rocks", "Boulder")
+            os.makedirs(os.path.join(asset_dir, "v002"))
+            open(os.path.join(asset_dir, "v002", "b.bgeo.sc"), "w").close()
+            self.assertEqual(schema.next_version(data), 2)
+            schema.add_version(data, {"bgeo.sc": "v002/b.bgeo.sc"}, note="fixed normals")
+            schema.set_current(data, 1)
+            with self.assertRaises(ValueError):
+                schema.set_current(data, 9)
+            schema.save(os.path.join(asset_dir, schema.SIDECAR), data)
+            rec, = library.scan_roots([root], os.path.join(d, "cache"))[0]
+            self.assertEqual(rec.current, 1)
+            self.assertEqual(rec.versions, [1, 2])
+            self.assertEqual(rec.version(2)["note"], "fixed normals")
+            self.assertTrue(rec.files_for(2)["bgeo.sc"].endswith(os.path.join("v002", "b.bgeo.sc")))
+            self.assertEqual(rec.files_for(None), rec.files)
+            self.assertEqual(rec.files_for(7), {})
+
+    def test_old_index_version_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "cache")
+            os.makedirs(cache)
+            with open(library.index_path(cache, d), "w") as f:
+                json.dump({"version": 1, "root": d, "entries": {"x": {}}}, f)
+            self.assertEqual(library.load_index(cache, d), {})
+
+
+class KarmaTests(unittest.TestCase):
+    def test_frame_camera_fits_bounds(self):
+        bounds = [[-1, 0, -1], [1, 2, 1]]
+        eye, center, near, far = karma.frame_camera(bounds)
+        self.assertEqual(center, (0.0, 1.0, 0.0))
+        radius = (12 ** 0.5) / 2
+        dist = sum((eye[i] - center[i]) ** 2 for i in range(3)) ** 0.5
+        import math
+        half_fov = math.atan(karma.APERTURE / 2 / karma.FOCAL)
+        self.assertGreaterEqual(math.asin(radius / dist), 0)
+        self.assertLess(math.asin(radius / dist), half_fov)   # sphere inside the frame
+        self.assertGreater(eye[1], center[1])                 # looking down a bit
+        self.assertTrue(0 < near < dist - radius < dist + radius < far)
+
+    def test_renderable_and_conversion(self):
+        self.assertTrue(karma.is_renderable([[0, 0, 0], [1, 1, 1]]))
+        self.assertFalse(karma.is_renderable([[0, 0, 0], [0, 0, 0]]))
+        self.assertFalse(karma.is_renderable(None))
+        self.assertFalse(karma.is_renderable([[0, 0, 0], [float("inf"), 1, 1]]))
+        self.assertFalse(karma.needs_conversion("a.bgeo.sc"))
+        self.assertTrue(karma.needs_conversion("a.fbx"))
+        args = karma.husk_args("C:\\t\\s.usda", "C:\\t\\o.png", "BRAY_HdKarmaXPU")
+        self.assertEqual(args[-1], "C:/t/s.usda")
+        self.assertIn("BRAY_HdKarmaXPU", args)
+
+    @unittest.skipUnless(HAVE_PXR, "pxr not available")
+    def test_write_stage(self):
+        from pxr import Usd, UsdGeom, UsdRender
+        with tempfile.TemporaryDirectory() as d:
+            layer = os.path.join(d, "asset.usda")
+            st = Usd.Stage.CreateNew(layer)
+            UsdGeom.Cube.Define(st, "/rock")
+            st.GetRootLayer().Save()
+            stage_path, image = karma.work_paths(d)
+            karma.write_stage(stage_path, layer, [[-1, -1, -1], [1, 1, 1]], image, 256, 8)
+            stage = Usd.Stage.Open(stage_path)
+            self.assertTrue(stage.GetPrimAtPath("/rock"))              # sublayered asset
+            settings = UsdRender.Settings(stage.GetPrimAtPath(karma.SETTINGS_PATH))
+            self.assertEqual(tuple(settings.GetResolutionAttr().Get()), (256, 256))
+            self.assertEqual(settings.GetCameraRel().GetTargets()[0].pathString, "/AXThumb/cam")
+            self.assertEqual(stage.GetMetadata("renderSettingsPrimPath"), karma.SETTINGS_PATH)
+            self.assertEqual(settings.GetPrim().GetAttribute(
+                "karma:global:pathtracedsamples").Get(), 8)
+            product = UsdRender.Product(stage.GetPrimAtPath("/Render/Products/thumb"))
+            self.assertEqual(product.GetProductNameAttr().Get(), image.replace("\\", "/"))
+            cam = UsdGeom.Camera(stage.GetPrimAtPath("/AXThumb/cam"))
+            # The camera looks at the bounds center: center projects to the middle of the frame.
+            xf = cam.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+            p = xf.Transform((0, 0, 0))
+            self.assertAlmostEqual(p[0], 0, places=6)
+            self.assertAlmostEqual(p[1], 0, places=6)
+            self.assertLess(p[2], 0)                                    # in front (-Z)
 
 
 class QueryTests(unittest.TestCase):

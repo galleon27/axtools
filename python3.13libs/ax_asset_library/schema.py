@@ -198,9 +198,13 @@ def current_version(data):
     return version_entry(data, data.get("current"))
 
 
-def add_version(data, files, note="", author=""):
+def next_version(data):
+    return max([v["version"] for v in data.get("versions", [])] or [0]) + 1
+
+
+def add_version(data, files, note="", author="", number=None):
     """Append a version with `files` ({key: path relative to the asset folder}); make it current."""
-    number = max([v["version"] for v in data["versions"]] or [0]) + 1
+    number = number or next_version(data)
     data["versions"].append({
         "version": number,
         "created": now_iso(),
@@ -210,6 +214,12 @@ def add_version(data, files, note="", author=""):
     })
     data["current"] = number
     return number
+
+
+def set_current(data, number):
+    if version_entry(data, number) is None:
+        raise ValueError("no version %s" % number)
+    data["current"] = number
 
 
 def resolve(asset_dir, relpath):

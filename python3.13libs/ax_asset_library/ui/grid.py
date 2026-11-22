@@ -3,7 +3,7 @@ import collections
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import schema
+from .. import schema, thumbnails
 
 Qt = QtCore.Qt
 RecordRole = Qt.ItemDataRole.UserRole + 1
@@ -227,6 +227,10 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
             self._placeholder(painter, box, rec)
 
         self._badges(painter, box, rec)
+        if thumbnails.karma_queue().is_pending(rec.asset_dir):
+            painter.fillRect(box, QtGui.QColor(0, 0, 0, 140))
+            painter.setPen(QtGui.QColor(230, 230, 230))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, "Rendering...")
 
         border = SELECT_COLOR if selected else (WARN_COLOR if (rec.broken or rec.missing)
                                                 else QtGui.QColor(0, 0, 0))
@@ -310,6 +314,7 @@ class AssetView(QtWidgets.QListView):
         self.delegate = AssetDelegate(self)
         self.setItemDelegate(self.delegate)
         thumb_cache().changed.connect(self.viewport().update)
+        thumbnails.karma_queue().changed.connect(self.viewport().update)
 
     def set_thumb_size(self, size):
         self.delegate.size = int(size)

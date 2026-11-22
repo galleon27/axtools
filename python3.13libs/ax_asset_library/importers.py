@@ -101,12 +101,12 @@ def _lop_type(names):
     raise AssetImportError("No LOP node type found among: %s" % ", ".join(names))
 
 
-def _tag_node(node, rec, settings):
+def _tag_node(node, rec, settings, version):
     root = settings.root_for(rec.root)
     node.setUserData(UD_ID, rec.id or "")
-    node.setUserData(UD_VERSION, str(rec.current))
+    node.setUserData(UD_VERSION, str(version))
     node.setUserData(UD_ROOT, root["path"] if root else rec.root)  # "$AX_ASSET_LIB" when typed so
-    node.setComment("%s %s" % (rec.name, schema.version_label(rec.current)))
+    node.setComment("%s %s" % (rec.name, schema.version_label(version)))
     node.setGenericFlag(hou.nodeFlag.DisplayComment, True)
 
 
@@ -123,11 +123,14 @@ def _start_position(editor, network, anchor):
     return hou.Vector2(0, 0)
 
 
-def file_for(rec, settings):
-    """(absolute path, parm path) of the file to load for a geometry record."""
-    path = rec.primary_file(settings.get("geo_format_order"))
+def file_for(rec, settings, version=None):
+    """(absolute path, parm path) of the file to load; current version when version is None."""
+    files = rec.files_for(version)
+    key = schema.pick_file(files, settings.get("geo_format_order"))
+    path = files.get(key, "") if key else ""
     if not path:
-        raise AssetImportError("%s has no files in version %s." % (rec.name, rec.current))
+        raise AssetImportError("%s has no files in version %s."
+                               % (rec.name, version or rec.current))
     root = settings.root_for(rec.root) or {"path": rec.root, "expanded": rec.root}
     return path, _prefs.parm_path(path, root, settings.get("path_mode"))
 
@@ -145,12 +148,12 @@ def _sop_loader(parent, rec, path, parm_value):
     return node
 
 
-def _import_geometry(rec, network, ctx, pos, anchor, settings):
-    path, value = file_for(rec, settings)
+def _import_geometry(rec, network, ctx, pos, anchor, settings, version):
+    path, value = file_for(rec, settings, version)
     if ctx == "sop":
         node = _sop_loader(network, rec, path, value)
         node.setPosition(pos)
-        _tag_node(node, rec, settings)
+        _tag_node(node, rec, settings, version)
         return node
 
     if ctx == "obj":
@@ -161,8 +164,8 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings):
         loader.setDisplayFlag(True)
         loader.setRenderFlag(True)
         geo.setPosition(pos)
-        _tag_node(geo, rec, settings)
-        _tag_node(loader, rec, settings)
+        _tag_node(geo, rec, settings, version)
+        _tag_node(loader, rec, settings, version)
         return geo
 
     # LOP: Reference LOP; Houdini's USD plugins read bgeo and abc files as layers too.
@@ -175,21 +178,25 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings):
         if anchor.isDisplayFlagSet():
             ref.setDisplayFlag(True)
     ref.setPosition(pos)
-    _tag_node(ref, rec, settings)
+    _tag_node(ref, rec, settings, version)
     return ref
 
 
 IMPORTERS = {"geometry": _import_geometry}
 
 
-def import_records(records, settings):
+def import_records(records, settings, version=None):
     """Import records into the current network. Returns (nodes, warnings).
+
+    `version` picks a version other than the current one (single record only).
 
     Raises AssetImportError when nothing can be imported (no editor, wrong context,
     unsupported type).
     """
     editor, network, ctx = current_target()
     records = [r for r in records if not r.broken]
+    if len(records) != 1:
+        version = None
     if not records:
         raise AssetImportError("Nothing to import: the selected assets have errors.")
     unsupported = sorted({schema.TYPE_LABELS.get(r.type, r.type) for r in records
@@ -209,10 +216,12 @@ def import_records(records, settings):
                 warnings.append("Skipped %s: %s import is not available yet."
                                 % (rec.name, schema.TYPE_LABELS.get(rec.type, rec.type)))
                 continue
-            if rec.missing:
-                warnings.append("%s: missing file(s) %s." % (rec.name, ", ".join(rec.missing)))
+            use = version or rec.current
+            missing = sorted(k for k, p in rec.files_for(use).items() if not os.path.exists(p))
+            if missing:
+                warnings.append("%s: missing file(s) %s." % (rec.name, ", ".join(missing)))
             try:
-                node = fn(rec, network, ctx, pos, anchor, settings)
+                node = fn(rec, network, ctx, pos, anchor, settings, use)
             except AssetImportError as e:
                 warnings.append("%s: %s" % (rec.name, e))
                 continue

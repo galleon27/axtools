@@ -23,6 +23,12 @@ Each asset is a folder with an `asset.json` file:
 * Double-click or press Enter to import the selected assets into the network shown in the
   network editor. SOP gets a File or Alembic SOP, OBJ a Geometry node, LOP a Reference LOP.
 * Drag an asset onto a parameter field to paste its path.
+* __Save selection__ writes the selected SOP node or Geometry object to the library as
+  bgeo.sc (plus USD or Alembic if ticked). Saving under an existing name in the same
+  category adds a new version. Pick a version in the details pane to import it, or click
+  __Make current__ to make it the default.
+* __Render thumbnail__ renders a Karma thumbnail with husk in the background. Renderer,
+  samples and size are in Settings.
 * Drop geometry files or folders onto the panel to add them to the library. An image next to
   a file with the same name (`rock.jpg`, `rock_preview.png`) becomes its thumbnail.
 * Search with words or fields: `type:geo`, `tag:rock`, `cat:trees`, `fmt:abc`, `-tag:wip`,

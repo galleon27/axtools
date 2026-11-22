@@ -15,7 +15,7 @@ import re
 
 from . import schema
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2  # bump when AssetRecord fields change: old caches are ignored
 
 
 class AssetRecord:
@@ -24,21 +24,21 @@ class AssetRecord:
     FIELDS = ("key", "id", "name", "type", "category", "tags", "description", "author",
               "created", "modified", "asset_dir", "root", "current", "versions", "files",
               "missing", "thumb", "thumb_mtime", "info", "problems", "sidecar_mtime",
-              "source_kind")
+              "source_kind", "thumb_method", "version_list")
 
     __slots__ = FIELDS
 
     def __init__(self, **kw):
         for f in self.FIELDS:
             setattr(self, f, kw.get(f))
-        for f in ("tags", "versions", "missing", "problems"):
+        for f in ("tags", "versions", "missing", "problems", "version_list"):
             if getattr(self, f) is None:
                 setattr(self, f, [])
         for f in ("files", "info"):
             if getattr(self, f) is None:
                 setattr(self, f, {})
         for f in ("name", "type", "category", "description", "author", "created", "modified",
-                  "thumb", "source_kind"):
+                  "thumb", "source_kind", "thumb_method"):
             if getattr(self, f) is None:
                 setattr(self, f, "")
 
@@ -64,6 +64,20 @@ class AssetRecord:
         key = self.primary_key(order)
         return self.files.get(key, "") if key else ""
 
+    def version(self, number):
+        """{version, created, author, note, files (absolute)} or None."""
+        for v in self.version_list:
+            if v.get("version") == number:
+                return v
+        return None
+
+    def files_for(self, number=None):
+        """Absolute files of a version (current when number is None)."""
+        if number is None or number == self.current:
+            return self.files
+        v = self.version(number)
+        return v["files"] if v else {}
+
     def __repr__(self):
         return "<AssetRecord %s %s/%s>" % (self.type, self.category, self.name)
 
@@ -84,7 +98,12 @@ def _record_from_sidecar(data, asset_dir, root, category, folder_type, mtime):
         atype = folder_type
     cur = schema.current_version(data) or {}
     files = {k: schema.resolve(asset_dir, v) for k, v in cur.get("files", {}).items()}
-    thumb_rel = (data.get("thumbnail") or {}).get("file") or schema.THUMB
+    thumb_info = data.get("thumbnail") or {}
+    thumb_rel = thumb_info.get("file") or schema.THUMB
+    version_list = [{"version": v["version"], "created": v.get("created", ""),
+                     "author": v.get("author", ""), "note": v.get("note", ""),
+                     "files": {k: schema.resolve(asset_dir, p) for k, p in v.get("files", {}).items()}}
+                    for v in sorted(data.get("versions", []), key=lambda v: v["version"])]
     return AssetRecord(
         key=_norm(os.path.join(asset_dir, schema.SIDECAR)),
         id=data.get("id"), name=data.get("name") or os.path.basename(asset_dir),
@@ -96,6 +115,7 @@ def _record_from_sidecar(data, asset_dir, root, category, folder_type, mtime):
         files=files, thumb=schema.resolve(asset_dir, thumb_rel),
         info=dict(data.get("info", {})), problems=problems, sidecar_mtime=mtime,
         source_kind=(data.get("source") or {}).get("kind", ""),
+        thumb_method=thumb_info.get("method", ""), version_list=version_list,
     )
 
 
