@@ -7,6 +7,7 @@ import os
 
 import hou
 
+from . import materials
 from . import prefs as _prefs
 from . import schema
 
@@ -19,6 +20,9 @@ UD_ROOT = "ax_asset_root"
 SOP_LOADERS = {".abc": ("alembic", "fileName")}
 DEFAULT_SOP_LOADER = ("file", "file")
 LOP_REFERENCE_TYPES = ("reference::2.0", "reference")
+LOP_DOME_TYPES = ("domelight::3.0", "domelight::2.0", "domelight")
+DOME_TEXTURE_PARMS = ("xn__inputstexturefile_r3ah", "texture_file")
+TYPE_KEYS = {"hdri": ["hdri"], "image": ["image"]}
 
 CONTEXT_LABELS = {"sop": "SOP", "obj": "OBJ", "lop": "LOP"}
 
@@ -123,16 +127,31 @@ def _start_position(editor, network, anchor):
     return hou.Vector2(0, 0)
 
 
+def _root(rec, settings):
+    return settings.root_for(rec.root) or {"path": rec.root, "expanded": rec.root}
+
+
+def to_parm(rec, settings, path):
+    return _prefs.parm_path(path, _root(rec, settings), settings.get("path_mode"))
+
+
 def file_for(rec, settings, version=None):
-    """(absolute path, parm path) of the file to load; current version when version is None."""
+    """(absolute path, parm path) of the file to load; current version when version is None.
+
+    For a material this is the folder holding its textures.
+    """
     files = rec.files_for(version)
-    key = schema.pick_file(files, settings.get("geo_format_order"))
-    path = files.get(key, "") if key else ""
+    if rec.type == "material":
+        key = "basecolor" if "basecolor" in files else schema.pick_file(files, [])
+        path = os.path.dirname(files[key]) if key else ""
+    else:
+        order = TYPE_KEYS.get(rec.type) or settings.get("geo_format_order")
+        key = schema.pick_file(files, order)
+        path = files.get(key, "") if key else ""
     if not path:
         raise AssetImportError("%s has no files in version %s."
                                % (rec.name, version or rec.current))
-    root = settings.root_for(rec.root) or {"path": rec.root, "expanded": rec.root}
-    return path, _prefs.parm_path(path, root, settings.get("path_mode"))
+    return path, to_parm(rec, settings, path)
 
 
 def parm_path_for(rec, settings):
@@ -148,7 +167,14 @@ def _sop_loader(parent, rec, path, parm_value):
     return node
 
 
-def _import_geometry(rec, network, ctx, pos, anchor, settings, version):
+def _wire_lop(node, anchor):
+    if anchor is not None and anchor.type().category() == hou.lopNodeTypeCategory():
+        node.setInput(0, anchor)
+        if anchor.isDisplayFlagSet():
+            node.setDisplayFlag(True)
+
+
+def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     path, value = file_for(rec, settings, version)
     if ctx == "sop":
         node = _sop_loader(network, rec, path, value)
@@ -173,22 +199,76 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version):
     if _set_first(ref, ("filepath1", "filepath"), value) is None:
         raise AssetImportError("%s has no file path parameter." % ref.type().name())
     _set_first(ref, ("primpath1", "primpath"), "/assets/" + schema.sanitize_name(rec.name))
-    if anchor is not None and anchor.type().category() == hou.lopNodeTypeCategory():
-        ref.setInput(0, anchor)
-        if anchor.isDisplayFlagSet():
-            ref.setDisplayFlag(True)
+    _wire_lop(ref, anchor)
     ref.setPosition(pos)
     _tag_node(ref, rec, settings, version)
     return ref
 
 
-IMPORTERS = {"geometry": _import_geometry}
+# --- materials ----------------------------------------------------------------------------
+def _import_material(rec, network, ctx, pos, anchor, settings, version, opts):
+    renderer = opts.get("renderer")
+    if not renderer:
+        raise AssetImportError("No renderer chosen for the material.")
+    files = rec.files_for(version)
+    maps = {ch: to_parm(rec, settings, p) for ch, p in files.items()}
+    disp = (rec.info or {}).get("displacement_scale")
+    try:
+        if ctx == "lop":
+            lib = network.createNode("materiallibrary", unique_name(network, rec.name))
+            mat = materials.build(lib, schema.sanitize_name(rec.name), maps, renderer,
+                                  lop=True, disp_scale=disp)
+            _wire_lop(lib, anchor)
+            lib.setPosition(pos)
+            _tag_node(lib, rec, settings, version)
+            _tag_node(mat, rec, settings, version)
+            return lib
+        matnet = hou.node("/mat")
+        if matnet is None:
+            raise AssetImportError("/mat not found.")
+        mat = materials.build(matnet, unique_name(matnet, rec.name), maps, renderer,
+                              disp_scale=disp)
+        mat.moveToGoodPosition()
+        _tag_node(mat, rec, settings, version)
+        return mat
+    except materials.MaterialError as e:
+        raise AssetImportError(str(e))
 
 
-def import_records(records, settings, version=None):
+# --- HDRIs / images ---------------------------------------------------------------------
+def _import_hdri(rec, network, ctx, pos, anchor, settings, version, opts):
+    _path, value = file_for(rec, settings, version)
+    if ctx == "sop":
+        raise AssetImportError("HDRIs import into an OBJ network (Environment Light) or a "
+                               "LOP network (Dome Light).")
+    if ctx == "obj":
+        light = network.createNode("envlight", unique_name(network, rec.name))
+        if _set_first(light, ("env_map",), value) is None:
+            raise AssetImportError("envlight has no env_map parameter.")
+    else:
+        light = network.createNode(_lop_type(LOP_DOME_TYPES), unique_name(network, rec.name))
+        if _set_first(light, DOME_TEXTURE_PARMS, value) is None:
+            raise AssetImportError("%s has no texture parameter." % light.type().name())
+        _wire_lop(light, anchor)
+    light.setPosition(pos)
+    _tag_node(light, rec, settings, version)
+    return light
+
+
+def _import_image(rec, network, ctx, pos, anchor, settings, version, opts):
+    raise AssetImportError("images have no node to create. Use Copy path, or drag the image "
+                           "onto a parameter.")
+
+
+IMPORTERS = {"geometry": _import_geometry, "material": _import_material,
+             "hdri": _import_hdri, "image": _import_image}
+
+
+def import_records(records, settings, version=None, renderer=None):
     """Import records into the current network. Returns (nodes, warnings).
 
     `version` picks a version other than the current one (single record only).
+    `renderer` ("karma", "octane", "redshift") is needed when materials are imported.
 
     Raises AssetImportError when nothing can be imported (no editor, wrong context,
     unsupported type).
@@ -204,6 +284,13 @@ def import_records(records, settings, version=None):
     if unsupported and len(unsupported) == len({r.type for r in records}):
         raise AssetImportError("Import for %s assets is not available yet."
                                % ", ".join(unsupported))
+    if all(r.type == "image" for r in records):
+        raise AssetImportError("Images have no node to create. Use Copy path, or drag the "
+                               "image onto a parameter.")
+    if ctx == "sop" and all(r.type == "hdri" for r in records):
+        raise AssetImportError("HDRIs import into an OBJ network (Environment Light) or a "
+                               "LOP network (Dome Light).")
+    opts = {"renderer": renderer}
 
     anchor = _anchor(network)
     pos = _start_position(editor, network, anchor)
@@ -221,12 +308,13 @@ def import_records(records, settings, version=None):
             if missing:
                 warnings.append("%s: missing file(s) %s." % (rec.name, ", ".join(missing)))
             try:
-                node = fn(rec, network, ctx, pos, anchor, settings, use)
+                node = fn(rec, network, ctx, pos, anchor, settings, use, opts)
             except AssetImportError as e:
                 warnings.append("%s: %s" % (rec.name, e))
                 continue
             nodes.append(node)
-            pos = pos + hou.Vector2(3.0, 0)
+            if node.parent() == network:
+                pos = pos + hou.Vector2(3.0, 0)
         for i, node in enumerate(nodes):
             node.setSelected(True, clear_all_selected=(i == 0))
         if nodes:

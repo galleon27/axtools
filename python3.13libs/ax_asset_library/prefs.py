@@ -29,6 +29,7 @@ DEFAULTS = {
     "copy_on_ingest": True,
     "read_geo_info": True,
     "ingest_render": False,
+    "material_renderer": "karma",  # last renderer picked for a material import
     "last_ingest_dir": "",
     "last_category": "",
     # publish

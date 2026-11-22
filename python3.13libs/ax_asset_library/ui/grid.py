@@ -124,8 +124,12 @@ def tooltip(rec):
     if "polycount" in info:
         lines.append("%s prims, %s points" % (format(info["polycount"], ","),
                                               format(info.get("pointcount", 0), ",")))
+    res = info.get("resolution")
+    if isinstance(res, list) and len(res) == 2:
+        lines.append("%d x %d" % tuple(res))
     if rec.files:
-        lines.append("Formats: " + ", ".join(sorted(rec.files)))
+        lines.append(("Channels: " if rec.type == "material" else "Formats: ") +
+                     ", ".join(sorted(rec.files)))
     for p in rec.problems:
         lines.append("<span style='color:#dc463c'>%s</span>" % p)
     if rec.missing:

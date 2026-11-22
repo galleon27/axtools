@@ -8,7 +8,7 @@ import tempfile
 
 import hou
 
-from . import karma, schema, thumbnails
+from . import karma, schema, textures, thumbnails
 
 # Files copied along with a geometry file of the same name (OBJ materials).
 COMPANION_EXTS = {".obj": (".mtl",)}
@@ -22,6 +22,7 @@ class IngestReport:
         self.skipped = []   # (path, reason)
         self.failed = []    # (path, reason)
         self.warnings = []  # messages, each once
+        self.created_types = {}  # asset_dir -> asset type
 
     def warn(self, msg):
         if msg not in self.warnings:
@@ -142,96 +143,209 @@ def geometry_info(path):
     return info
 
 
-# --- ingest ---------------------------------------------------------------------------
-def _write_asset(root, category, name, files, tags, copy, read_info, thumb_src, report):
-    asset_dir = asset_dir_for(root, "geometry", category, name)
-    if os.path.exists(asset_dir):
-        report.skipped.append((files[0], "%s already exists in the library" % name))
-        return None
-    os.makedirs(asset_dir)
+# --- ingest plan ------------------------------------------------------------------------
+class IngestItem:
+    """One asset to create: type, name, {key: source file}, optional thumbnail source."""
+
+    def __init__(self, asset_type, name, files, thumb=None, extra=(), info=None):
+        self.type = asset_type
+        self.name = schema.sanitize_name(name)
+        self.files = dict(files)
+        self.thumb = thumb
+        self.extra = list(extra)        # copied along, not recorded as version files
+        self.info = dict(info or {})
+
+    @property
+    def first(self):
+        return next(iter(self.files.values()))
+
+    def __repr__(self):
+        return "<IngestItem %s %s %s>" % (self.type, self.name, sorted(self.files))
+
+
+class IngestPlan:
+    def __init__(self):
+        self.items = []
+        self.skipped = []   # (path, reason)
+
+    def by_type(self, asset_type):
+        return [i for i in self.items if i.type == asset_type]
+
+    def counts(self):
+        out = {}
+        for i in self.items:
+            out[i.type] = out.get(i.type, 0) + 1
+        return out
+
+
+def image_size(path):
+    """(w, h) of an image file, or None when Houdini can't read it."""
     try:
-        _fill_asset(asset_dir, root, category, name, files, tags, copy, read_info, thumb_src, report)
-    except BaseException:
-        shutil.rmtree(asset_dir, ignore_errors=True)  # no half-written assets in the library
-        raise
-    report.created.append((name, asset_dir))
-    return asset_dir
+        res = hou.imageResolution(path)
+    except hou.Error:
+        return None
+    return tuple(res) if res and res[0] > 0 else None
 
 
-def _fill_asset(asset_dir, root, category, name, files, tags, copy, read_info, thumb_src, report):
-    vdir = os.path.join(asset_dir, schema.version_label(1))
-    os.makedirs(vdir)
-    data = schema.new_asset(name, "geometry", category=category, tags=tags, author=author())
-    data["source"].update(kind="ingest", origin_path=files[0].replace("\\", "/"))
+def plan_ingest(paths):
+    """Decide which assets dropped files and folders make, without writing anything.
 
-    version_files, sizes = {}, {}
-    for f in files:
-        if copy:
-            dst = os.path.join(vdir, os.path.basename(f))
-            shutil.copy2(f, dst)
-            for ext in COMPANION_EXTS.get(schema.file_ext(f), ()):
-                comp = os.path.splitext(f)[0] + ext
-                if os.path.isfile(comp):
-                    shutil.copy2(comp, os.path.join(vdir, os.path.basename(comp)))
-        else:
-            dst = os.path.abspath(f)
-        key = schema.format_key(f)
-        version_files[key] = schema.relpath(asset_dir, dst)
-        sizes[key] = os.path.getsize(dst)
-    schema.add_version(data, version_files, note="ingested", author=data["author"])
-    data["info"]["file_sizes"] = sizes
-    data["info"]["formats"] = sorted(version_files)
-
-    if read_info:
-        try:
-            data["info"].update(geometry_info(files[0]))
-        except hou.Error as e:
-            report.warn("%s: could not read geometry info (%s)" % (name, e.instanceMessage()))
-
-    if thumb_src:
-        try:
-            thumbnails.make_thumbnail(thumb_src, os.path.join(asset_dir, schema.THUMB))
-            data["thumbnail"].update(file=schema.THUMB, method="image", generated=schema.now_iso())
-        except Exception as e:  # a bad preview image must not fail the ingest
-            report.warn("%s: thumbnail failed (%s)" % (name, e))
-
-    schema.save(os.path.join(asset_dir, schema.SIDECAR), data)
-
-
-def ingest_geometry(paths, root, category="", tags=None, copy=True, read_info=True):
-    """Create one geometry asset per file group in `paths` under `root` (a prefs root dict)."""
-    check_writable(root)
-    category = clean_category(category)
-    tags = schema.clean_tags(tags or [])
-    report = IngestReport()
+    Geometry files group by folder + name; image files form texture sets (materials) by
+    channel names; other HDR files with a 2:1 aspect are HDRIs; the rest are images.
+    Preview images become thumbnails instead of assets.
+    """
+    plan = IngestPlan()
     geo, images, other = collect(paths)
     companions = {os.path.normcase(os.path.splitext(os.path.abspath(g))[0] + ext)
                   for g in geo for ext in COMPANION_EXTS.get(schema.file_ext(g), ())}
     for p in other:
         if os.path.normcase(os.path.abspath(p)) not in companions:
-            report.skipped.append((p, "not a geometry file"))
+            plan.skipped.append((p, "not a geometry or image file"))
+
     groups = group_geometry(geo)
     per_folder = {}
     for _, files in groups:
         d = os.path.normcase(os.path.dirname(os.path.abspath(files[0])))
         per_folder[d] = per_folder.get(d, 0) + 1
+    used_images = set()
+    for stem, files in groups:
+        folder = os.path.normcase(os.path.dirname(os.path.abspath(files[0])))
+        thumb = find_thumbnail(files[0], images, per_folder[folder] == 1)
+        if thumb:
+            used_images.add(os.path.normcase(os.path.abspath(thumb)))
+        plan.items.append(IngestItem("geometry", stem,
+                                     {schema.format_key(f): f for f in files}, thumb))
 
+    rest = [i for i in images if os.path.normcase(os.path.abspath(i)) not in used_images]
+    sets, leftovers, previews = textures.group(rest)
+    for ts in sets:
+        info = {"channels": sorted(ts.channels)}
+        height = textures.megascans_height(ts.folder)
+        if height is not None:
+            info["displacement_scale"] = height
+        plan.items.append(IngestItem("material", ts.name, ts.channels, ts.preview,
+                                     extra=ts.extra, info=info))
+    for p in previews:
+        plan.skipped.append((p, "preview image without an asset"))
+    for p in leftovers:
+        size = image_size(p) if schema.file_ext(p) in textures.HDR_EXTS else None
+        kind = "hdri" if textures.looks_like_hdri(p, size) else "image"
+        info = {"resolution": list(size)} if size else {}
+        plan.items.append(IngestItem(kind, schema.strip_ext(p), {kind: p}, info=info))
+    return plan
+
+
+# --- writing assets ---------------------------------------------------------------------
+def _write_asset(root, category, item, tags, copy, read_info, report):
+    asset_dir = asset_dir_for(root, item.type, category, item.name)
+    if os.path.exists(asset_dir):
+        report.skipped.append((item.first, "%s already exists in the library" % item.name))
+        return None
+    os.makedirs(asset_dir)
+    try:
+        _fill_asset(asset_dir, category, item, tags, copy, read_info, report)
+    except BaseException:
+        shutil.rmtree(asset_dir, ignore_errors=True)  # no half-written assets in the library
+        raise
+    report.created.append((item.name, asset_dir))
+    report.created_types[asset_dir] = item.type
+    return asset_dir
+
+
+def _copy_into(vdir, src, used):
+    """Copy src into vdir; a second file with the same name gets a numeric suffix."""
+    base = os.path.basename(src)
+    name, n = base, 1
+    while name.lower() in used:
+        stem, ext = schema.strip_ext(base), schema.file_ext(base)
+        name = "%s_%d%s" % (stem, n, ext)
+        n += 1
+    used.add(name.lower())
+    dst = os.path.join(vdir, name)
+    shutil.copy2(src, dst)
+    return dst
+
+
+def _fill_asset(asset_dir, category, item, tags, copy, read_info, report):
+    vdir = os.path.join(asset_dir, schema.version_label(1))
+    os.makedirs(vdir)
+    data = schema.new_asset(item.name, item.type, category=category, tags=tags, author=author())
+    data["source"].update(kind="ingest", origin_path=item.first.replace("\\", "/"))
+
+    version_files, sizes, used = {}, {}, set()
+    for key, f in item.files.items():
+        if copy:
+            dst = _copy_into(vdir, f, used)
+            for ext in COMPANION_EXTS.get(schema.file_ext(f), ()):
+                comp = os.path.splitext(f)[0] + ext
+                if os.path.isfile(comp):
+                    _copy_into(vdir, comp, used)
+        else:
+            dst = os.path.abspath(f)
+        version_files[key] = schema.relpath(asset_dir, dst)
+        sizes[key] = os.path.getsize(dst)
+    extra = []
+    for f in item.extra:
+        dst = _copy_into(vdir, f, used) if copy else os.path.abspath(f)
+        extra.append(schema.relpath(asset_dir, dst))
+    schema.add_version(data, version_files, note="ingested", author=data["author"])
+    data["info"].update(item.info)
+    data["info"]["file_sizes"] = sizes
+    data["info"]["formats"] = sorted({schema.format_key(f) for f in item.files.values()})
+    if extra:
+        data["info"]["extra_files"] = extra
+
+    if item.type == "geometry" and read_info:
+        try:
+            data["info"].update(geometry_info(item.first))
+        except hou.Error as e:
+            report.warn("%s: could not read geometry info (%s)" % (item.name, e.instanceMessage()))
+    elif item.type == "material":
+        size = image_size(item.files.get("basecolor") or item.first)
+        if size:
+            data["info"]["resolution"] = list(size)
+
+    # Thumbnail: the preview image, or for images/HDRIs the file itself.
+    thumb_src = item.thumb or (item.first if item.type in ("image", "hdri") else None)
+    if thumb_src:
+        try:
+            thumbnails.make_thumbnail(thumb_src, os.path.join(asset_dir, schema.THUMB))
+            data["thumbnail"].update(file=schema.THUMB, method="image", generated=schema.now_iso())
+        except Exception as e:  # a bad preview image must not fail the ingest
+            report.warn("%s: thumbnail failed (%s)" % (item.name, e))
+
+    schema.save(os.path.join(asset_dir, schema.SIDECAR), data)
+
+
+def ingest(plan, root, category="", tags=None, copy=True, read_info=True, types=None):
+    """Write the assets of an IngestPlan under `root` (a prefs root dict).
+
+    `types` limits which asset types are written (None = all).
+    """
+    check_writable(root)
+    category = clean_category(category)
+    tags = schema.clean_tags(tags or [])
+    report = IngestReport()
+    report.skipped.extend(plan.skipped)
+    items = [i for i in plan.items if types is None or i.type in types]
     with hou.InterruptableOperation("Adding assets to the library",
-                                    open_interrupt_dialog=len(groups) > 3) as op:
-        for i, (stem, files) in enumerate(groups):
-            name = schema.sanitize_name(stem)
-            folder = os.path.normcase(os.path.dirname(os.path.abspath(files[0])))
-            thumb = find_thumbnail(files[0], images, per_folder[folder] == 1)
+                                    open_interrupt_dialog=len(items) > 3) as op:
+        for n, item in enumerate(items):
             try:
-                _write_asset(root, category, name, files, tags, copy, read_info, thumb, report)
+                _write_asset(root, category, item, tags, copy, read_info, report)
             except OSError as e:
-                report.failed.append((files[0], str(e)))
+                report.failed.append((item.first, str(e)))
             try:
-                op.updateProgress(float(i + 1) / len(groups))
+                op.updateProgress(float(n + 1) / len(items))
             except hou.OperationInterrupted:
-                report.warn("Stopped by user after %d of %d." % (i + 1, len(groups)))
+                report.warn("Stopped by user after %d of %d." % (n + 1, len(items)))
                 break
     return report
+
+
+def ingest_geometry(paths, root, category="", tags=None, copy=True, read_info=True):
+    """Geometry-only ingest (kept for scripts written against phase 1)."""
+    return ingest(plan_ingest(paths), root, category, tags, copy, read_info, types={"geometry"})
 
 
 def set_thumbnail(rec, image_path, read_only=False):
@@ -415,6 +529,18 @@ def publish_node(node, root, name, category="", tags=None, description="", note=
 
 
 # --- Karma thumbnails -------------------------------------------------------------------
+RENDERABLE_TYPES = schema.RENDERABLE_TYPES
+
+
+def _queue(asset_dir, name, workdir, writer, settings):
+    queue = thumbnails.karma_queue()
+    queue.renderer = settings.get("thumb_renderer")
+    queue.timeout_s = settings.get("thumb_timeout")
+    res, samples = settings.get("thumb_resolution"), settings.get("thumb_samples")
+    return queue.add(asset_dir, name, workdir,
+                     lambda stage, image: writer(stage, image, res, samples))
+
+
 def render_thumbnail(asset_dir, name, geo_file, bounds, settings):
     """Queue a Karma thumbnail render for a geometry file. Returns True when queued.
 
@@ -434,24 +560,86 @@ def render_thumbnail(asset_dir, name, geo_file, bounds, settings):
                 geo.saveToFile(layer)
         if not karma.is_renderable(bounds):
             raise hou.OperationFailed("%s has no geometry to render." % name)
-        queue = thumbnails.karma_queue()
-        queue.renderer = settings.get("thumb_renderer")
-        queue.timeout_s = settings.get("thumb_timeout")
-        return queue.add(asset_dir, name, layer, bounds, workdir,
-                         settings.get("thumb_resolution"), settings.get("thumb_samples"))
+        return _queue(asset_dir, name, workdir,
+                      lambda st, im, r, sm: karma.write_stage(st, layer, bounds, im, r, sm),
+                      settings)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
+
+
+def render_material_thumbnail(asset_dir, name, maps, settings):
+    """Queue a shader-ball render. `maps` = {channel: absolute file}."""
+    maps = {k: v for k, v in maps.items() if k in textures.WIRED and k != "displacement"}
+    if not maps:
+        raise hou.OperationFailed("%s has no texture channels to render." % name)
+    workdir = tempfile.mkdtemp(prefix="ax_thumb_")
+    try:
+        return _queue(asset_dir, name, workdir,
+                      lambda st, im, r, sm: karma.write_material_stage(st, maps, im, r, sm),
+                      settings)
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+
+def render_hdri_thumbnail(asset_dir, name, hdri_file, settings):
+    workdir = tempfile.mkdtemp(prefix="ax_thumb_")
+    try:
+        return _queue(asset_dir, name, workdir,
+                      lambda st, im, r, sm: karma.write_hdri_stage(st, hdri_file, im, r, sm),
+                      settings)
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+
+def render_asset_thumbnail(asset_type, asset_dir, name, files, info, settings):
+    """Queue the Karma thumbnail that fits the asset type. `files` = {key: absolute path}."""
+    missing = [k for k, p in files.items() if not os.path.isfile(p)]
+    if asset_type == "geometry":
+        order = [f for f in settings.get("geo_format_order") if f in karma.LAYER_FORMATS]
+        key = schema.pick_file({k: p for k, p in files.items() if k not in missing},
+                               order + list(settings.get("geo_format_order")))
+        if not key:
+            raise hou.OperationFailed("%s: geometry file not found." % name)
+        return render_thumbnail(asset_dir, name, files[key], (info or {}).get("bounds"), settings)
+    if asset_type == "material":
+        return render_material_thumbnail(
+            asset_dir, name, {k: p for k, p in files.items() if k not in missing}, settings)
+    if asset_type == "hdri":
+        if "hdri" in missing or "hdri" not in files:
+            raise hou.OperationFailed("%s: HDRI file not found." % name)
+        return render_hdri_thumbnail(asset_dir, name, files["hdri"], settings)
+    raise hou.OperationFailed("%s: Karma thumbnails are for geometry, materials and HDRIs; "
+                              "images use the image itself." % name)
 
 
 def render_record_thumbnail(rec, settings):
     root = settings.root_for(rec.root)
     if root and root["read_only"]:
         raise hou.OperationFailed("%s is in a read-only library root." % rec.name)
-    if rec.type != "geometry":
-        raise hou.OperationFailed("Karma thumbnails are for geometry assets.")
-    order = [f for f in settings.get("geo_format_order") if f in karma.LAYER_FORMATS]
-    path = rec.primary_file(order + list(settings.get("geo_format_order")))
-    if not path or not os.path.isfile(path):
-        raise hou.OperationFailed("%s: geometry file not found." % rec.name)
-    return render_thumbnail(rec.asset_dir, rec.name, path, (rec.info or {}).get("bounds"), settings)
+    return render_asset_thumbnail(rec.type, rec.asset_dir, rec.name, rec.files, rec.info,
+                                  settings)
+
+
+def render_created(report, settings, only_missing=True):
+    """Queue Karma thumbnails for assets an ingest just created.
+
+    Geometry and materials without a thumbnail get one; HDRIs always do (their ingest
+    thumbnail is only a crop of the map). Problems are added to the report.
+    """
+    for name, asset_dir in report.created:
+        asset_type = report.created_types.get(asset_dir)
+        if asset_type not in RENDERABLE_TYPES:
+            continue
+        try:
+            data = schema.load(os.path.join(asset_dir, schema.SIDECAR))
+            if only_missing and asset_type != "hdri" and data["thumbnail"].get("file"):
+                continue
+            files = {k: schema.resolve(asset_dir, p)
+                     for k, p in schema.current_version(data)["files"].items()}
+            render_asset_thumbnail(asset_type, asset_dir, name, files, data["info"], settings)
+        except (hou.Error, schema.SidecarError, OSError, ImportError, KeyError, TypeError) as e:
+            report.warn("%s: thumbnail render not started (%s)" % (
+                name, e.instanceMessage() if isinstance(e, hou.Error) else e))

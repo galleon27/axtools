@@ -191,13 +191,16 @@ class KarmaQueue(QtCore.QObject):
     def __len__(self):
         return len(self._jobs) + (1 if self._current is not None else 0)
 
-    def add(self, asset_dir, name, layer_file, bounds, workdir, resolution=512, samples=16):
-        """Write the stage now (main thread) and queue the render. Returns False if queued already."""
+    def add(self, asset_dir, name, workdir, write_stage):
+        """Write the stage now (main thread) and queue the render. Returns False if queued already.
+
+        write_stage(stage_path, image_path) writes the USD stage to render (see karma.py).
+        """
         if self.is_pending(asset_dir):
             shutil.rmtree(workdir, ignore_errors=True)
             return False
         stage, image = karma.work_paths(workdir)
-        karma.write_stage(stage, layer_file, bounds, image, resolution, samples)
+        write_stage(stage, image)
         self._jobs.append(_Job(asset_dir, name, workdir, stage, image))
         self.changed.emit()
         self._next()

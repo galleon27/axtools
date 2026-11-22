@@ -5,6 +5,7 @@ import os
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import schema
+from ..schema import RENDERABLE_TYPES
 
 Qt = QtCore.Qt
 
@@ -200,7 +201,7 @@ class DetailsPane(QtWidgets.QWidget):
     def set_rendering(self, rendering):
         self.btn_render.setText("Rendering..." if rendering else "Render thumbnail")
         self.btn_render.setEnabled(not rendering and self._rec is not None
-                                   and self._rec.type == "geometry")
+                                   and self._rec.type in RENDERABLE_TYPES)
 
     def set_records(self, records, rendering=False):
         n = len(records)
@@ -248,7 +249,15 @@ class DetailsPane(QtWidgets.QWidget):
         row("Version", "%s of %d" % (schema.version_label(rec.current), len(rec.versions))
             if rec.versions else "")
         row("Tags", html.escape(", ".join(rec.tags)))
-        row("Formats", html.escape(", ".join(sorted(rec.files))))
+        if rec.type == "material":
+            row("Channels", html.escape(", ".join(sorted(rec.files))))
+        else:
+            row("Formats", html.escape(", ".join(sorted(rec.files))))
+        res = info.get("resolution")
+        if isinstance(res, list) and len(res) == 2:
+            row("Resolution", "%d x %d" % tuple(res))
+        if "displacement_scale" in info:
+            row("Displacement", "%g" % info["displacement_scale"])
         if "polycount" in info:
             row("Prims", format(info["polycount"], ","))
             row("Points", format(info.get("pointcount", 0), ","))

@@ -18,6 +18,8 @@ ASSET_TYPES = ("geometry", "material", "hdri", "image")
 TYPE_FOLDERS = {"geometry": "geometry", "material": "materials", "hdri": "hdri", "image": "images"}
 FOLDER_TYPES = {v: k for k, v in TYPE_FOLDERS.items()}
 TYPE_LABELS = {"geometry": "Geometry", "material": "Material", "hdri": "HDRI", "image": "Image"}
+# Types that get a Karma-rendered thumbnail (images use the image itself).
+RENDERABLE_TYPES = ("geometry", "material", "hdri")
 
 # Multi-part extensions first so ".bgeo.sc" wins over ".sc".
 _MULTI_EXTS = (".bgeo.sc", ".bgeo.gz", ".bgeo.lzma", ".bgeo.bz2", ".geo.sc", ".geo.gz")

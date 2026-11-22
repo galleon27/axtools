@@ -5,7 +5,7 @@ import time
 import hou
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import importers, library, prefs as _prefs, publish, schema, thumbnails
+from .. import importers, library, materials, prefs as _prefs, publish, schema, thumbnails
 from . import details, dialogs, grid
 
 Qt = QtCore.Qt
@@ -15,6 +15,8 @@ RESCAN_AFTER_S = 60  # rescan when the panel is shown again after this long
 SORT_MODES = (("name", "Name"), ("added", "Newest"), ("modified", "Recently changed"))
 IMAGE_FILTER = "Images (*.jpg *.jpeg *.png *.tga *.tif *.tiff *.bmp *.webp *.exr *.hdr *.rat)"
 GEO_FILTER = "Geometry (%s)" % " ".join("*" + e for e in sorted(schema.GEO_EXTS))
+ASSET_FILTER = "Geometry and images (%s)" % " ".join(
+    "*" + e for e in sorted(schema.GEO_EXTS | schema.IMAGE_EXTS))
 
 _ICONS = {}
 
@@ -448,13 +450,40 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             texts.append(value)
         return paths, "\n".join(texts)
 
-    def _import_selected(self):
+    def _ask_renderer(self):
+        """Menu at the cursor: which renderer to build materials for. None = cancelled."""
+        menu = QtWidgets.QMenu(self)
+        menu.addSection("Build material for")
+        last = self.settings.get("material_renderer")
+        choices = materials.available_renderers()
+        if not choices:
+            hou.ui.displayMessage("No Karma, Octane or Redshift material nodes found.",
+                                  severity=hou.severityType.Warning, title="AX Asset Library")
+            return None
+        default = None  # last used renderer, else the first one
+        for key, label in choices:
+            act = menu.addAction(label)
+            act.setData(key)
+            if default is None or key == last:
+                default = act
+        menu.setActiveAction(default)
+        chosen = menu.exec(QtGui.QCursor.pos(), default)
+        if chosen is None:
+            return None
+        self.settings.set("material_renderer", chosen.data())
+        return chosen.data()
+
+    def _import_selected(self, renderer=None):
         recs = self.view.selected_records()
         if not recs:
             return
+        if renderer is None and any(r.type == "material" for r in recs):
+            renderer = self._ask_renderer()
+            if renderer is None:
+                return
         try:
             nodes, warnings = importers.import_records(recs, self.settings,
-                                                       self._picked_version(recs))
+                                                       self._picked_version(recs), renderer)
         except importers.AssetImportError as e:
             hou.ui.displayMessage(str(e), severity=hou.severityType.Warning,
                                   title="AX Asset Library")
@@ -517,12 +546,17 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 label = "Import into %s" % importers.CONTEXT_LABELS[ctx]
             except importers.AssetImportError:
                 label = "Import"
-            menu.addAction(label, self._import_selected)
+            if any(r.type == "material" for r in recs):
+                for key, rlabel in materials.available_renderers():
+                    menu.addAction("%s as %s material" % (label, rlabel),
+                                   lambda k=key: self._import_selected(k))
+            else:
+                menu.addAction(label, lambda: self._import_selected())
             menu.addAction("Copy path", self._copy_paths)
             if len(recs) == 1:
                 menu.addAction("Show in folder", self._reveal_selected)
                 menu.addAction("Thumbnail from image...", self._set_thumbnail)
-            if any(r.type == "geometry" for r in recs):
+            if any(r.type in publish.RENDERABLE_TYPES for r in recs):
                 menu.addAction("Render thumbnail (Karma)", self._render_selected)
             if len(recs) == 1 and recs[0].type == "geometry":
                 menu.addAction("Save selected node as new version",
@@ -555,7 +589,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.rescan()
 
     def _render_selected(self):
-        recs = [r for r in self.view.selected_records() if r.type == "geometry"]
+        recs = [r for r in self.view.selected_records() if r.type in publish.RENDERABLE_TYPES]
         queued, problems = 0, []
         for rec in recs:
             try:
@@ -569,23 +603,6 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             text += "  " + "  ".join(problems)
         self._message(text, warning=bool(problems))
         self._on_selection_changed()
-
-    def _render_missing(self, report):
-        """Queue Karma thumbnails for freshly ingested assets that got no preview image."""
-        for name, asset_dir in report.created:
-            try:
-                data = schema.load(os.path.join(asset_dir, schema.SIDECAR))
-                if data["thumbnail"].get("file"):
-                    continue
-                files = schema.current_version(data)["files"]
-                order = list(self.settings.get("geo_format_order"))
-                key = schema.pick_file(files, order)
-                publish.render_thumbnail(asset_dir, name, schema.resolve(asset_dir, files[key]),
-                                         data["info"].get("bounds"), self.settings)
-            except (hou.Error, schema.SidecarError, OSError, ImportError, KeyError,
-                    TypeError) as e:
-                report.warn("%s: thumbnail render not started (%s)" % (
-                    name, e.instanceMessage() if isinstance(e, hou.Error) else e))
 
     def _on_queue_changed(self):
         self._update_status()
@@ -657,7 +674,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
     def _add_files(self):
         start = self.settings.get("last_ingest_dir") or hou.text.expandString("$HIP")
         paths, _f = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Add geometry to library", start, GEO_FILTER + ";;All files (*)")
+            self, "Add to library", start,
+            ";;".join((ASSET_FILTER, GEO_FILTER, IMAGE_FILTER, "All files (*)")))
         if paths:
             self.settings.set("last_ingest_dir", os.path.dirname(paths[0]))
             self._ingest(paths)
@@ -667,15 +685,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             hou.ui.displayMessage("Add a library folder that is not read-only in Settings first.",
                                   severity=hou.severityType.Warning, title="AX Asset Library")
             return
-        geo, _images, _other = publish.collect(paths)
-        groups = publish.group_geometry(geo)
-        if not groups:
+        plan = publish.plan_ingest(paths)
+        if not plan.items:
             hou.ui.displayMessage(
-                "No geometry files found. This version adds geometry only (%s)."
-                % ", ".join(sorted(schema.GEO_EXTS)),
-                severity=hou.severityType.Message, title="AX Asset Library")
+                "No geometry or image files found.", severity=hou.severityType.Message,
+                title="AX Asset Library")
             return
-        dlg = dialogs.IngestDialog(groups, self.settings, self.records, self)
+        dlg = dialogs.IngestDialog(plan, self.settings, self.records, self)
         if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         v = dlg.values()
@@ -684,8 +700,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.settings.set("read_geo_info", v["read_info"], save=False)
         self.settings.set("ingest_render", v["render"])
         try:
-            report = publish.ingest_geometry(paths, v["root"], v["category"], v["tags"],
-                                             copy=v["copy"], read_info=v["read_info"])
+            report = publish.ingest(plan, v["root"], v["category"], v["tags"],
+                                    copy=v["copy"], read_info=v["read_info"], types=v["types"])
         except hou.Error as e:
             hou.ui.displayMessage(e.instanceMessage(), severity=hou.severityType.Error,
                                   title="AX Asset Library")
@@ -693,7 +709,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._select_after_scan = {library.norm_path(os.path.join(d, schema.SIDECAR))
                                    for _n, d in report.created}
         if v["render"]:
-            self._render_missing(report)
+            publish.render_created(report, self.settings)
         if report.skipped or report.failed or report.warnings:
             dialogs.ReportDialog(report, self).exec()
         self._message("Add to library: " + report.summary,

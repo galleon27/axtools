@@ -11,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
 
-from ax_asset_library import karma, library, prefs, schema  # noqa: E402
+from ax_asset_library import karma, library, prefs, schema, textures  # noqa: E402
 
 try:
     import pxr  # noqa: F401
@@ -283,6 +283,106 @@ class KarmaTests(unittest.TestCase):
             self.assertAlmostEqual(p[0], 0, places=6)
             self.assertAlmostEqual(p[1], 0, places=6)
             self.assertLess(p[2], 0)                                    # in front (-Z)
+
+
+class TextureTests(unittest.TestCase):
+    def test_classify(self):
+        c = textures.classify
+        self.assertEqual(c("Rock_Wall_2K_Roughness.jpg"), ("Rock_Wall", "roughness"))
+        self.assertEqual(c("rock_wall_diff_2k.jpg"), ("rock_wall", "basecolor"))
+        self.assertEqual(c("rock_wall_nor_gl_4k.exr"), ("rock_wall", "normal"))
+        self.assertEqual(c("Metal_Plate_BaseColor.png"), ("Metal_Plate", "basecolor"))
+        self.assertEqual(c("Metal_Plate_Base_Color.png"), ("Metal_Plate", "basecolor"))
+        self.assertEqual(c("Metal_Plate_Roughness.png"), ("Metal_Plate", "roughness"))
+        self.assertEqual(c("vgvlbhqn_2K_Normal_LOD0.jpg"), ("vgvlbhqn", "normal"))
+        self.assertEqual(c("bricks_ambient_occlusion.png"), ("bricks", "ao"))
+        self.assertEqual(c("bricks_Cavity.jpg"), ("bricks", "other"))
+        self.assertEqual(c("holiday_photo.jpg"), (None, None))
+        self.assertTrue(textures.is_preview("vgvlbhqn_Preview.png"))
+        self.assertFalse(textures.is_preview("bricks_albedo.png"))
+
+    def _touch(self, d, *names):
+        for n in names:
+            p = os.path.join(d, n)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").close()
+        return [os.path.join(d, n) for n in names]
+
+    def test_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = self._touch(
+                d,
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Albedo.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Normal_LOD0.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Normal_LOD2.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Displacement.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Displacement.exr",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Cavity.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_Preview.png",
+                "mixed/wood_diff_2k.jpg", "mixed/wood_rough_2k.jpg",
+                "mixed/wood_nor_dx_2k.jpg", "mixed/wood_nor_gl_2k.jpg",
+                "mixed/metal_BaseColor.png", "mixed/metal_Metallic.png",
+                "mixed/onlyao_ao.png",
+                "mixed/photo.jpg", "mixed/sky.hdr", "mixed/notes.txt")
+            sets, leftovers, previews = textures.group(files)
+            by_name = {s.name: s for s in sets}
+            self.assertEqual(sorted(by_name), ["metal", "rock_cliff_vgvlbhqn", "wood"])
+            ms = by_name["rock_cliff_vgvlbhqn"]           # scan ID -> folder name
+            self.assertTrue(ms.channels["normal"].endswith("Normal_LOD0.jpg"))
+            self.assertTrue(ms.channels["displacement"].endswith(".exr"))
+            self.assertTrue(ms.preview.endswith("Preview.png"))
+            self.assertEqual(len(ms.extra), 3)             # LOD2, jpg disp, cavity
+            self.assertTrue(by_name["wood"].channels["normal"].endswith("nor_gl_2k.jpg"))
+            self.assertIsNone(by_name["wood"].preview)      # two sets in mixed/, no named preview
+            names = sorted(os.path.basename(p) for p in leftovers)
+            self.assertEqual(names, ["onlyao_ao.png", "photo.jpg", "sky.hdr"])
+            self.assertEqual(previews, [])
+
+    def test_hdri_and_height(self):
+        self.assertTrue(textures.looks_like_hdri("a.hdr"))
+        self.assertTrue(textures.looks_like_hdri("a.exr", (4096, 2048)))
+        self.assertFalse(textures.looks_like_hdri("a.exr", (1024, 1024)))
+        self.assertFalse(textures.looks_like_hdri("a.jpg", (4096, 2048)))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(textures.megascans_height(d))
+            with open(os.path.join(d, "x.json"), "w") as f:
+                json.dump({"meta": [{"key": "height", "value": "0.02 m"}]}, f)
+            self.assertEqual(textures.megascans_height(d), 0.02)
+
+
+class StageTests(unittest.TestCase):
+    @unittest.skipUnless(HAVE_PXR, "pxr not available")
+    def test_material_and_hdri_stages(self):
+        from pxr import Usd, UsdGeom, UsdLux, UsdShade
+        with tempfile.TemporaryDirectory() as d:
+            stage_path, image = karma.work_paths(d)
+            maps = {"basecolor": os.path.join(d, "a_albedo.png"),
+                    "normal": os.path.join(d, "a_normal.png"),
+                    "roughness": os.path.join(d, "a_rough.png")}
+            karma.write_material_stage(stage_path, maps, image, 128, 4)
+            st = Usd.Stage.Open(stage_path)
+            ball = st.GetPrimAtPath("/AXThumb/ball")
+            self.assertTrue(UsdGeom.PrimvarsAPI(ball).GetPrimvar("st").IsDefined())
+            mat, _rel = UsdShade.MaterialBindingAPI(ball).ComputeBoundMaterial()
+            self.assertEqual(mat.GetPath().pathString, "/AXThumb/materials/asset")
+            surf = mat.ComputeSurfaceSource("mtlx")[0]
+            self.assertEqual(surf.GetIdAttr().Get(), "ND_standard_surface_surfaceshader")
+            src = surf.GetInput("base_color").GetConnectedSources()[0][0].source
+            tex = UsdShade.Shader(src.GetPrim())
+            self.assertEqual(tex.GetIdAttr().Get(), "ND_tiledimage_color3")
+            self.assertEqual(tex.GetInput("file").GetAttr().GetColorSpace(), "srgb_texture")
+            nsrc = surf.GetInput("normal").GetConnectedSources()[0][0].source
+            self.assertEqual(UsdShade.Shader(nsrc.GetPrim()).GetIdAttr().Get(), "ND_normalmap_float")
+
+            hdir = os.path.join(d, "hdri")  # one work folder per render, as in the queue
+            os.makedirs(hdir)
+            stage_path, image = karma.work_paths(hdir)
+            karma.write_hdri_stage(stage_path, os.path.join(d, "sky.hdr"), image, 128, 4)
+            st = Usd.Stage.Open(stage_path)
+            dome = UsdLux.DomeLight(st.GetPrimAtPath("/AXThumb/dome"))
+            self.assertTrue(dome.GetTextureFileAttr().Get().path.endswith("sky.hdr"))
+            self.assertTrue(dome.GetPrim().GetAttribute("karma:light:renderlightgeo").Get())
+            self.assertTrue(st.GetPrimAtPath("/AXThumb/chrome"))
 
 
 class QueryTests(unittest.TestCase):
