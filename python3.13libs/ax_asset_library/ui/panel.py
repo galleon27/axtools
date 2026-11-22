@@ -5,12 +5,14 @@ import time
 import hou
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import importers, library, materials, prefs as _prefs, publish, schema, thumbnails
+from .. import (importers, library, manage, materials, prefs as _prefs, publish, scene,
+               schema, thumbnails)
 from . import details, dialogs, grid
 
 Qt = QtCore.Qt
 ScopeRole = Qt.ItemDataRole.UserRole + 10
 RESCAN_AFTER_S = 60  # rescan when the panel is shown again after this long
+RECENTLY_ADDED_DAYS = 14
 
 SORT_MODES = (("name", "Name"), ("added", "Newest"), ("modified", "Recently changed"))
 IMAGE_FILTER = "Images (*.jpg *.jpeg *.png *.tga *.tif *.tiff *.bmp *.webp *.exr *.hdr *.rat)"
@@ -52,6 +54,49 @@ class _ScanJob(QtCore.QRunnable):
         self.signals.finished.emit(self.generation, records, errors)
 
 
+# --- sidebar --------------------------------------------------------------------------------
+class AssetTree(QtWidgets.QTreeWidget):
+    """Sidebar. Dropping assets from the grid on a root, type or category moves them there."""
+
+    assets_dropped = QtCore.Signal(list, object)   # record keys, ("scope", root, type, category)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderHidden(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DropOnly)
+
+    def _target(self, event):
+        if not event.mimeData().hasFormat(grid.ASSET_MIME):
+            return None
+        item = self.itemAt(event.position().toPoint())
+        scope = item.data(0, ScopeRole) if item is not None else None
+        return scope if scope and scope[0] == "scope" else None
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(grid.ASSET_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._target(event) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        scope = self._target(event)
+        if scope is None:
+            event.ignore()
+            return
+        keys = bytes(event.mimeData().data(grid.ASSET_MIME)).decode("utf-8").splitlines()
+        event.acceptProposedAction()
+        # Let the drag finish before dialogs open.
+        QtCore.QTimer.singleShot(0, lambda: self.assets_dropped.emit(keys, scope))
+
+
 # --- panel -----------------------------------------------------------------------------------
 class AssetLibraryPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
@@ -63,6 +108,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._last_scan = 0.0
         self._scan_errors = []
         self._select_after_scan = set()
+        self._usage = {}          # record key -> scene.Usage
+        self._hip_callback = None
         self._pool = QtCore.QThreadPool()
         self._pool.setMaxThreadCount(1)
         self._scan_signals = _ScanSignals()
@@ -83,6 +130,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
         self._load_cached()
         self.rescan()
+        self._watch_hip()
 
     # ---- layout -----------------------------------------------------------------------------
     def _build_ui(self):
@@ -165,10 +213,10 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
         self.splitter = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
 
-        self.tree = QtWidgets.QTreeWidget()
-        self.tree.setHeaderHidden(True)
+        self.tree = AssetTree()
         self.tree.setMinimumWidth(140)
-        self.tree.currentItemChanged.connect(lambda *_: self._apply_filter())
+        self.tree.currentItemChanged.connect(self._on_scope_changed)
+        self.tree.assets_dropped.connect(self._on_assets_dropped)
         self.splitter.addWidget(self.tree)
 
         self.stack = QtWidgets.QStackedWidget()
@@ -176,6 +224,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.view = grid.AssetView()
         self.view.setModel(self.model)
         self.view.import_requested.connect(self._import_selected)
+        self.view.delete_requested.connect(self._trash_selected)
+        self.view.rename_requested.connect(self._rename_selected)
         self.view.customContextMenuRequested.connect(self._context_menu)
         self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.stack.addWidget(self.view)
@@ -202,6 +252,9 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.details.thumbnail_requested.connect(self._set_thumbnail)
         self.details.render_requested.connect(self._render_selected)
         self.details.set_current_requested.connect(self._set_current_version)
+        self.details.meta_save_requested.connect(self._save_meta)
+        self.details.scene_update_requested.connect(self._scene_update_selected)
+        self.details.scene_select_requested.connect(self._scene_select_selected)
         queue = thumbnails.karma_queue()
         queue.finished.connect(self._on_render_finished)
         queue.changed.connect(self._on_queue_changed)
@@ -279,7 +332,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             return  # a newer scan was started meanwhile
         self._scanning = False
         self._scan_errors = errors
-        self._set_records(records)
+        self.records = records
+        self._refresh_scene()
 
     def _set_records(self, records):
         self.records = records
@@ -307,6 +361,19 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             return it
 
         add(None, "All assets (%d)" % len(self.records), ("all",))
+        favs = _prefs.favorites(self.settings)
+        recent = _prefs.recent(self.settings)
+        n_fav = sum(1 for r in self.records if r.id in favs)
+        n_recent = sum(1 for r in self.records if r.id in recent)
+        n_added = sum(1 for r in self.records if self._recently_added(r))
+        add(None, "Favorites (%d)" % n_fav, ("favorites",),
+            "Assets marked with a star (right-click > Add to favorites). Stored per user.")
+        add(None, "Recently used (%d)" % n_recent, ("recent",),
+            "Assets you imported lately, newest first.")
+        add(None, "Recently added (%d)" % n_added, ("added",),
+            "Assets added to the library in the last %d days." % RECENTLY_ADDED_DAYS)
+        add(None, "In this scene (%d)" % len(self._usage), ("scene",),
+            "Assets with nodes in the open scene. Orange dot: a node uses an older version.")
         if bad:
             add(None, "Errors / missing files (%d)" % bad, ("broken",))
         for r in self._roots():
@@ -356,10 +423,20 @@ class AssetLibraryPanel(QtWidgets.QWidget):
     def _apply_filter(self):
         scope = self._current_scope() or ("all",)
         types = {t for t, b in self.type_buttons.items() if b.isChecked()}
-        query = library.Query(self.search.text())
+        favs = _prefs.favorites(self.settings)
+        recent = _prefs.recent(self.settings)
+        query = library.Query(self.search.text(), favs)
         out = []
         for r in self.records:
             if scope[0] == "broken" and not (r.broken or r.missing):
+                continue
+            if scope[0] == "favorites" and r.id not in favs:
+                continue
+            if scope[0] == "recent" and r.id not in recent:
+                continue
+            if scope[0] == "added" and not self._recently_added(r):
+                continue
+            if scope[0] == "scene" and r.key not in self._usage:
                 continue
             if scope[0] == "scope" and not library.in_scope(r, scope[1], scope[2], scope[3]):
                 continue
@@ -368,6 +445,9 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             if query.matches(r):
                 out.append(r)
         out = library.sort_records(out, self.sort_combo.currentData() or "name")
+        if scope[0] == "recent":
+            out.sort(key=lambda r: recent.get(r.id, ""), reverse=True)
+        self._refresh_marks(favs)
 
         # Freshly saved/added assets replace the selection; otherwise keep it.
         keep = self._select_after_scan or {r.key for r in self.view.selected_records()}
@@ -429,7 +509,9 @@ class AssetLibraryPanel(QtWidgets.QWidget):
     def _on_selection_changed(self, *_):
         recs = self.view.selected_records()
         rendering = len(recs) == 1 and thumbnails.karma_queue().is_pending(recs[0].asset_dir)
-        self.details.set_records(recs, rendering)
+        use = self._usage.get(recs[0].key) if len(recs) == 1 else None
+        editable = len(recs) == 1 and not self._read_only(recs[0]) and not recs[0].broken
+        self.details.set_records(recs, rendering, use, editable)
 
     def _picked_version(self, recs):
         """Version chosen in the details pane, when it shows exactly these records."""
@@ -496,6 +578,9 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         if warnings:
             msg += "  " + "  ".join(warnings)
         self._message(msg, warning=bool(warnings))
+        if nodes:
+            _prefs.add_recent(self.settings, [r.id for r in recs if r.id], schema.now_iso())
+            self._refresh_scene()
 
     def _copy_paths(self):
         _paths, text = self._drag_payload(self.view.selected_records())
@@ -562,10 +647,244 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 menu.addAction("Save selected node as new version",
                                lambda: self._publish(recs[0]))
             menu.addSeparator()
+            favs = _prefs.favorites(self.settings)
+            all_fav = all(r.id in favs for r in recs if r.id)
+            menu.addAction("Remove from favorites" if all_fav else "Add to favorites",
+                           lambda: self._set_favorite(recs, not all_fav))
+            used = [self._usage[r.key] for r in recs if r.key in self._usage]
+            if used:
+                menu.addAction("Select nodes in scene", self._scene_select_selected)
+                if any(u.outdated for u in used):
+                    menu.addAction("Update scene nodes to current version",
+                                   self._scene_update_selected)
+            editable = [r for r in recs if not self._read_only(r) and not r.broken]
+            if editable:
+                menu.addSeparator()
+                if len(recs) == 1:
+                    menu.addAction("Rename...  (F2)", self._rename_selected)
+                menu.addAction("Move to...", self._move_selected)
+                menu.addAction("Delete (move to trash)  (Del)", self._trash_selected)
+            menu.addSeparator()
         menu.addAction("Save selected node to library...", lambda: self._publish())
         menu.addAction("Add files...", self._add_files)
         menu.addAction("Rescan", self.rescan)
         menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    # ---- collections / scene ---------------------------------------------------------------
+    def _recently_added(self, rec):
+        if not rec.created:
+            return False
+        import datetime
+        try:
+            when = datetime.datetime.strptime(rec.created[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)  # created is UTC
+        return (now - when).days < RECENTLY_ADDED_DAYS
+
+    def _on_scope_changed(self, *_):
+        scope = self._current_scope()
+        if scope and scope[0] == "scene":
+            self._refresh_scene(rebuild=False)
+        self._apply_filter()
+
+    def _refresh_marks(self, favs=None):
+        d = self.view.delegate
+        d.favorites = _prefs.favorites(self.settings) if favs is None else favs
+        d.scene = {k: bool(u.outdated) for k, u in self._usage.items()}
+        self.view.viewport().update()
+
+    def _refresh_scene(self, rebuild=True):
+        """Find library assets in the open scene (walks all nodes once)."""
+        try:
+            self._usage = scene.usage(self.records)
+        except hou.Error:
+            self._usage = {}
+        self._refresh_marks()
+        if rebuild:
+            self._rebuild_tree()
+            self._apply_filter()
+        else:
+            self._on_selection_changed()
+
+    def _watch_hip(self):
+        def on_hip_event(event_type):
+            if event_type in (hou.hipFileEventType.AfterLoad, hou.hipFileEventType.AfterClear,
+                              hou.hipFileEventType.AfterMerge):
+                QtCore.QTimer.singleShot(0, self._refresh_scene)
+        try:
+            hou.hipFile.addEventCallback(on_hip_event)
+            self._hip_callback = on_hip_event
+        except (AttributeError, hou.Error):
+            self._hip_callback = None
+
+    def _unwatch_hip(self):
+        if self._hip_callback is not None:
+            try:
+                hou.hipFile.removeEventCallback(self._hip_callback)
+            except (hou.Error, ValueError):
+                pass
+            self._hip_callback = None
+
+    def _set_favorite(self, recs, on):
+        _prefs.set_favorite(self.settings, [r.id for r in recs if r.id], on)
+        self._rebuild_tree()
+        self._apply_filter()
+
+    def _scene_select_selected(self):
+        nodes = []
+        for r in self.view.selected_records():
+            if r.key in self._usage:
+                nodes.extend(self._usage[r.key].nodes)
+        scene.select_nodes(nodes)
+
+    def _scene_update_selected(self):
+        changed, warnings = 0, []
+        for r in self.view.selected_records():
+            use = self._usage.get(r.key)
+            if use is None or not use.outdated:
+                continue
+            n, w = scene.update_nodes(r, use.outdated, self.settings)
+            changed += n
+            warnings.extend(w)
+        self._refresh_scene()
+        msg = "Updated %d node(s) to the current version." % changed
+        if warnings:
+            msg += "  " + "  ".join(warnings)
+        self._message(msg, warning=bool(warnings))
+
+    def _save_meta(self, tags, description):
+        recs = self.view.selected_records()
+        if len(recs) != 1 or self._read_only(recs[0]):
+            return
+        try:
+            manage.set_meta(recs[0].asset_dir, tags, description)
+        except manage.ManageError as e:
+            self._error(e)
+            return
+        self._message("%s: tags saved." % recs[0].name)
+        self._select_after_scan = {recs[0].key}
+        self.rescan()
+
+    def _relink(self, old_rec, new_dir):
+        """Point scene nodes of a renamed/moved asset at its new folder. Returns warnings."""
+        use = self._usage.get(old_rec.key)
+        if use is None:
+            return []
+        try:
+            new_rec = library.load_record(new_dir, self._root_of(new_dir) or old_rec.root)
+        except (OSError, schema.SidecarError) as e:
+            return ["%s: scene nodes not relinked (%s)" % (old_rec.name, e)]
+        _n, warnings = scene.update_nodes(new_rec, use.nodes, self.settings, "keep")
+        return warnings
+
+    def _root_of(self, path):
+        p = os.path.normcase(os.path.abspath(path))
+        for r in self._roots():
+            if p.startswith(os.path.normcase(os.path.abspath(r["expanded"])) + os.sep):
+                return r["expanded"]
+        return None
+
+    def _rename_selected(self):
+        recs = self.view.selected_records()
+        if len(recs) != 1 or self._read_only(recs[0]) or recs[0].broken:
+            return
+        rec = recs[0]
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename %s" % rec.name,
+            "New name (renames the asset folder; nodes in this scene are relinked):",
+            text=rec.name)
+        if not ok or not name.strip() or schema.sanitize_name(name) == rec.name:
+            return
+        try:
+            new_dir = manage.rename(rec.asset_dir, name)
+        except manage.ManageError as e:
+            self._error(e)
+            return
+        warnings = self._relink(rec, new_dir)
+        self._after_move([(rec, new_dir)], "Renamed to %s." % schema.sanitize_name(name), warnings)
+
+    def _move_selected(self, target=None):
+        recs = [r for r in self.view.selected_records() if not self._read_only(r) and not r.broken]
+        if not recs:
+            return
+        if target is None:
+            dlg = dialogs.MoveDialog(recs, self.settings, self.records, self)
+            if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return
+            root, category = dlg.values()
+            if root is None:
+                return
+            target = (root["expanded"], category)
+        dst_root, category = target
+        moved, warnings = [], []
+        for rec in recs:
+            try:
+                new_dir = manage.move(rec.asset_dir, rec.type, rec.root, dst_root, category)
+            except manage.ManageError as e:
+                warnings.append(str(e))
+                continue
+            if os.path.normcase(new_dir) != os.path.normcase(rec.asset_dir):
+                warnings.extend(self._relink(rec, new_dir))
+                moved.append((rec, new_dir))
+        self._after_move(moved, "Moved %d asset(s)." % len(moved), warnings)
+
+    def _on_assets_dropped(self, keys, scope):
+        _s, root, asset_type, category = scope
+        by_key = {r.key: r for r in self.records}
+        recs = [by_key[k] for k in keys if k in by_key]
+        dst = self.settings.root_for(root)
+        if not recs or dst is None or dst["read_only"]:
+            self._message("Can't move assets into a read-only library root.", warning=True)
+            return
+        if asset_type is not None and any(r.type != asset_type for r in recs):
+            self._message("Assets can only move within their own type (%s)." %
+                          schema.TYPE_LABELS.get(asset_type, asset_type), warning=True)
+            return
+        sel = self.view.selectionModel()
+        sel.clearSelection()
+        for r in recs:
+            idx = self.model.index_of_key(r.key)
+            if idx.isValid():
+                sel.select(idx, QtCore.QItemSelectionModel.SelectionFlag.Select)
+        self._move_selected((dst["expanded"], category))
+
+    def _trash_selected(self):
+        recs = [r for r in self.view.selected_records() if not self._read_only(r)]
+        if not recs:
+            return
+        names = ", ".join(r.name for r in recs[:6]) + (" ..." if len(recs) > 6 else "")
+        used = sum(len(self._usage[r.key].nodes) for r in recs if r.key in self._usage)
+        text = "Move %d asset(s) to the library trash?\n\n%s" % (len(recs), names)
+        if used:
+            text += ("\n\n%d node(s) in this scene load these assets and will lose their "
+                     "files." % used)
+        text += "\n\nThe trash is the .trash folder in the library root; delete it there " \
+                "to free the space."
+        if hou.ui.displayMessage(text, buttons=("Move to trash", "Cancel"), default_choice=1,
+                                 close_choice=1, severity=hou.severityType.Warning,
+                                 title="AX Asset Library") != 0:
+            return
+        done, warnings = 0, []
+        for rec in recs:
+            try:
+                manage.trash(rec.asset_dir, rec.root, rec.type)
+                done += 1
+            except manage.ManageError as e:
+                warnings.append(str(e))
+        msg = "Moved %d asset(s) to the trash." % done
+        if warnings:
+            msg += "  " + "  ".join(warnings)
+        self._message(msg, warning=bool(warnings))
+        self.rescan()
+
+    def _after_move(self, moved, message, warnings):
+        self._select_after_scan = {library.norm_path(os.path.join(d, schema.SIDECAR))
+                                   for _r, d in moved}
+        if warnings:
+            message += "  " + "  ".join(warnings)
+        self._message(message, warning=bool(warnings))
+        self.rescan()
 
     # ---- versions / thumbnails --------------------------------------------------------------
     def _read_only(self, rec):
@@ -752,6 +1071,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         super().showEvent(event)
         if time.time() - self._last_scan > RESCAN_AFTER_S and not self._scanning:
             self.rescan()
+        elif self.records:
+            self._refresh_scene()
 
     def hideEvent(self, event):
         self._save_state()
@@ -759,4 +1080,5 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         self._save_state()
+        self._unwatch_hip()
         super().closeEvent(event)

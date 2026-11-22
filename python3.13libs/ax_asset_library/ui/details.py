@@ -76,6 +76,9 @@ class DetailsPane(QtWidgets.QWidget):
     thumbnail_requested = QtCore.Signal()
     render_requested = QtCore.Signal()
     set_current_requested = QtCore.Signal(int)
+    meta_save_requested = QtCore.Signal(str, str)   # tags, description
+    scene_update_requested = QtCore.Signal()
+    scene_select_requested = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -121,6 +124,45 @@ class DetailsPane(QtWidgets.QWidget):
         self.btn_current.clicked.connect(
             lambda: self.set_current_requested.emit(self.selected_version() or 0))
 
+        # In the open scene
+        self.scene_box = QtWidgets.QWidget()
+        srow = QtWidgets.QHBoxLayout(self.scene_box)
+        srow.setContentsMargins(0, 0, 0, 0)
+        self.scene_label = QtWidgets.QLabel()
+        self.scene_label.setWordWrap(True)
+        srow.addWidget(self.scene_label, 1)
+        self.btn_scene_select = QtWidgets.QPushButton("Select")
+        self.btn_scene_select.setToolTip("Select the nodes in this scene that load this asset.")
+        self.btn_scene_update = QtWidgets.QPushButton("Update")
+        self.btn_scene_update.setToolTip("Point the nodes in this scene at the current version.")
+        srow.addWidget(self.btn_scene_select)
+        srow.addWidget(self.btn_scene_update)
+        lay.addWidget(self.scene_box)
+        self.btn_scene_select.clicked.connect(self.scene_select_requested)
+        self.btn_scene_update.clicked.connect(self.scene_update_requested)
+
+        # Editable metadata
+        self.meta_box = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(self.meta_box)
+        form.setContentsMargins(0, 0, 0, 0)
+        self.tags_edit = QtWidgets.QLineEdit()
+        self.tags_edit.setPlaceholderText("rock, cliff")
+        self.tags_edit.setToolTip("Comma-separated tags. Search them with tag:<name>.")
+        self.desc_edit = QtWidgets.QPlainTextEdit()
+        self.desc_edit.setPlaceholderText("Description")
+        self.desc_edit.setFixedHeight(48)
+        self.desc_edit.setToolTip("Free text, found by the search field.")
+        self.btn_meta_save = QtWidgets.QPushButton("Save tags")
+        self.btn_meta_save.setToolTip("Write tags and description to the asset's asset.json.")
+        form.addRow("Tags", self.tags_edit)
+        form.addRow("Notes", self.desc_edit)
+        form.addRow("", self.btn_meta_save)
+        lay.addWidget(self.meta_box)
+        self.tags_edit.textChanged.connect(self._meta_changed)
+        self.desc_edit.textChanged.connect(self._meta_changed)
+        self.tags_edit.returnPressed.connect(self._save_meta)
+        self.btn_meta_save.clicked.connect(self._save_meta)
+
         self.body = QtWidgets.QLabel()
         self.body.setWordWrap(True)
         self.body.setTextFormat(Qt.TextFormat.RichText)
@@ -160,6 +202,7 @@ class DetailsPane(QtWidgets.QWidget):
         self.btn_thumb.clicked.connect(self.thumbnail_requested)
         self.btn_render.clicked.connect(self.render_requested)
         self._rec = None
+        self._editable = True
         self.set_records([])
 
     def selected_version(self):
@@ -203,9 +246,60 @@ class DetailsPane(QtWidgets.QWidget):
         self.btn_render.setEnabled(not rendering and self._rec is not None
                                    and self._rec.type in RENDERABLE_TYPES)
 
-    def set_records(self, records, rendering=False):
+    # ---- metadata / scene -------------------------------------------------------------------
+    def _meta_values(self):
+        return self.tags_edit.text(), self.desc_edit.toPlainText().strip()
+
+    def _meta_changed(self, *_):
+        rec = self._rec
+        if rec is None:
+            self.btn_meta_save.setEnabled(False)
+            return
+        tags, desc = self._meta_values()
+        dirty = schema.clean_tags(tags) != list(rec.tags) or desc != (rec.description or "")
+        self.btn_meta_save.setEnabled(dirty and self._editable)
+
+    def _save_meta(self):
+        if self.btn_meta_save.isEnabled():
+            self.meta_save_requested.emit(*self._meta_values())
+
+    def _fill_meta(self, rec, editable):
+        self._editable = editable
+        for w in (self.tags_edit, self.desc_edit):
+            w.blockSignals(True)
+        self.tags_edit.setText(", ".join(rec.tags))
+        self.desc_edit.setPlainText(rec.description or "")
+        for w in (self.tags_edit, self.desc_edit):
+            w.blockSignals(False)
+            w.setReadOnly(not editable)
+        self.btn_meta_save.setToolTip("Write tags and description to the asset's asset.json." if
+                                      editable else "This asset is in a read-only library root.")
+        self._meta_changed()
+
+    def _fill_scene(self, rec, use):
+        if use is None:
+            self.scene_box.hide()
+            return
+        outdated = len(use.outdated)
+        text = "In this scene: " + use.summary()
+        if outdated:
+            text += " <span style='color:#e0a030'>(%d older than %s)</span>" % (
+                outdated, schema.version_label(rec.current))
+        self.scene_label.setText(text)
+        self.btn_scene_update.setEnabled(outdated > 0)
+        self.btn_scene_update.setText("Update to %s" % schema.version_label(rec.current))
+        self.scene_box.show()
+
+    def set_records(self, records, rendering=False, usage=None, editable=True):
+        """usage: scene.Usage of the single selected record, or None if not in the scene."""
         n = len(records)
         self._rec = records[0] if n == 1 else None
+        self.meta_box.setVisible(n == 1)
+        if n == 1:
+            self._fill_meta(records[0], editable)
+            self._fill_scene(records[0], usage)
+        else:
+            self.scene_box.hide()
         for b in (self.btn_import, self.btn_copy):
             b.setEnabled(n > 0)
         for b in (self.btn_reveal, self.btn_thumb):
@@ -248,7 +342,6 @@ class DetailsPane(QtWidgets.QWidget):
         info = rec.info or {}
         row("Version", "%s of %d" % (schema.version_label(rec.current), len(rec.versions))
             if rec.versions else "")
-        row("Tags", html.escape(", ".join(rec.tags)))
         if rec.type == "material":
             row("Channels", html.escape(", ".join(sorted(rec.files))))
         else:
@@ -268,8 +361,6 @@ class DetailsPane(QtWidgets.QWidget):
         row("Added", _fmt_date(rec.created))
         row("Author", html.escape(rec.author))
         out = "<table>%s</table>" % "".join(rows)
-        if rec.description:
-            out += "<p>%s</p>" % html.escape(rec.description)
         warn = list(rec.problems) + ["missing file: %s" % k for k in rec.missing]
         if warn:
             out += "<p style='color:#dc463c'>%s</p>" % "<br>".join(html.escape(w) for w in warn)

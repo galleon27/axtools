@@ -48,6 +48,19 @@ def _set(node, parm, value):
             pass
 
 
+CHANNEL_KEY = "ax_channel"  # user data on texture nodes, read when updating to a new version
+
+
+def _tex_node(mat, node_type, channel):
+    """Texture node named after its channel (Octane renames nodes on creation, so the name
+    is set again) and tagged with the channel in user data."""
+    node = mat.createNode(node_type, channel)
+    if node.name() != channel:
+        node.setName(channel, unique_name=True)
+    node.setUserData(CHANNEL_KEY, channel)
+    return node
+
+
 # --- Karma ------------------------------------------------------------------------------
 def _karma(parent, name, maps, disp_scale):
     import voptoolutils
@@ -59,7 +72,7 @@ def _karma(parent, name, maps, disp_scale):
     disp = _child(mat, "mtlxdisplacement")
 
     def image(channel, signature, colorspace):
-        img = mat.createNode("mtlximage", channel)
+        img = _tex_node(mat, "mtlximage", channel)
         _set(img, "signature", signature)
         img.parm("file").set(maps[channel])
         _set(img, "filecolorspace", colorspace)
@@ -106,7 +119,7 @@ def _octane(parent, name, maps, disp_scale):
         out.setInput(0, surf)
 
     def image(channel, float_map):
-        img = mat.createNode("NT_TEX_FLOATIMAGE" if float_map else "NT_TEX_IMAGE", channel)
+        img = _tex_node(mat, "NT_TEX_FLOATIMAGE" if float_map else "NT_TEX_IMAGE", channel)
         img.parm("A_FILENAME").set(maps[channel])
         _set(img, "colorSpace", "NAMED_COLOR_SPACE_SRGB" if channel in textures.COLOR_CHANNELS
              else "NAMED_COLOR_SPACE_OTHER")
@@ -146,7 +159,7 @@ def _redshift(parent, name, maps, disp_scale, usd):
         out.setNamedInput("Surface", surf, 0)
 
     def image(channel):
-        img = mat.createNode("redshift::TextureSampler", channel)
+        img = _tex_node(mat, "redshift::TextureSampler", channel)
         img.parm("tex0").set(maps[channel])
         _set(img, "tex0_colorSpace", "sRGB" if channel in textures.COLOR_CHANNELS else "Raw")
         return img

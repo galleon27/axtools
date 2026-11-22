@@ -496,3 +496,60 @@ class PublishDialog(QtWidgets.QDialog):
             "thumbnail": thumb,
             "image": self.image_edit.text() if thumb == "image" else "",
         }
+
+
+class MoveDialog(QtWidgets.QDialog):
+    """Pick a library root and category to move assets to."""
+
+    def __init__(self, records, settings, all_records, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Move %s" % (records[0].name if len(records) == 1
+                                         else "%d assets" % len(records)))
+        self.all_records = all_records
+        self.types = {r.type for r in records}
+        lay = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self.root_combo = QtWidgets.QComboBox()
+        for r in settings.writable_roots():
+            self.root_combo.addItem(r["path"], r)
+        idx = self.root_combo.findText((settings.root_for(records[0].root) or {}).get("path", ""))
+        self.root_combo.setCurrentIndex(max(0, idx))
+        self.root_combo.setToolTip("Library root to move to. Read-only roots are not listed.")
+        form.addRow("Library", self.root_combo)
+        self.cat_combo = QtWidgets.QComboBox()
+        self.cat_combo.setEditable(True)
+        self.cat_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.cat_combo.setToolTip("Category folder. Use '/' for sub-folders; leave empty for "
+                                  "none. Assets stay under their own type folder.")
+        form.addRow("Category", self.cat_combo)
+        lay.addLayout(form)
+        note = QtWidgets.QLabel("Nodes in this scene that load these assets are relinked. "
+                                "Other .hip files that load them by path need relinking "
+                                "(for example with the Asset Manager).")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #9aa0a8;")
+        lay.addWidget(note)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                             QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Move")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.root_combo.currentIndexChanged.connect(self._fill)
+        self._fill()
+        self.cat_combo.setEditText(records[0].category)
+        self.resize(460, self.sizeHint().height())
+
+    def _fill(self):
+        root = self.root_combo.currentData()
+        text = self.cat_combo.currentText()
+        self.cat_combo.clear()
+        if root:
+            cats = set()
+            for t in self.types:
+                cats.update(library.categories(self.all_records, root["expanded"], t))
+            self.cat_combo.addItems(sorted(cats, key=str.lower))
+        self.cat_combo.setEditText(text)
+
+    def values(self):
+        return self.root_combo.currentData(), self.cat_combo.currentText().strip()

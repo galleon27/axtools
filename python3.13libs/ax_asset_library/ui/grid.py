@@ -17,6 +17,9 @@ TYPE_COLORS = {
 }
 TYPE_LETTERS = {"geometry": "G", "material": "M", "hdri": "H", "image": "I"}
 WARN_COLOR = QtGui.QColor(220, 70, 60)
+FAV_COLOR = QtGui.QColor(240, 200, 60)
+SCENE_COLOR = QtGui.QColor(90, 190, 110)
+OUTDATED_COLOR = QtGui.QColor(230, 150, 40)
 SELECT_COLOR = QtGui.QColor("#33AADD")
 
 
@@ -190,6 +193,19 @@ class AssetModel(QtCore.QAbstractListModel):
 
 
 # --- delegate --------------------------------------------------------------------------
+def _star(rect):
+    """Five-point star polygon inside rect."""
+    import math
+    cx, cy = rect.center().x() + 0.5, rect.center().y() + 0.5
+    r_out, r_in = rect.width() * 0.5, rect.width() * 0.22
+    pts = []
+    for i in range(10):
+        r = r_out if i % 2 == 0 else r_in
+        a = math.radians(-90 + i * 36)
+        pts.append(QtCore.QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
+    return QtGui.QPolygonF(pts)
+
+
 class AssetDelegate(QtWidgets.QStyledItemDelegate):
     PAD = 6
     GAP = 4
@@ -198,6 +214,8 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
         super().__init__(view)
         self.view = view
         self.size = 128
+        self.favorites = set()   # asset ids
+        self.scene = {}          # record key -> True when outdated, False when current
 
     def sizeHint(self, option, index):
         fm = option.fontMetrics
@@ -288,6 +306,20 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
             painter.setPen(QtGui.QColor(230, 230, 230))
             painter.drawText(vr, Qt.AlignmentFlag.AlignCenter, label)
 
+        # Favorite star and in-scene dot, bottom left.
+        x = box.x() + 3
+        if rec.id and rec.id in self.favorites:
+            star = QtCore.QRect(x, box.bottom() - 3 - h, h, h)
+            painter.setPen(QtGui.QColor(0, 0, 0, 160))
+            painter.setBrush(FAV_COLOR)
+            painter.drawPolygon(_star(star))
+            x += h + 3
+        if rec.key in self.scene:
+            dot = QtCore.QRect(x, box.bottom() - 3 - h, h, h).adjusted(2, 2, -2, -2)
+            painter.setPen(QtGui.QColor(0, 0, 0, 160))
+            painter.setBrush(OUTDATED_COLOR if self.scene[rec.key] else SCENE_COLOR)
+            painter.drawEllipse(dot)
+
         # Warning, bottom right.
         if rec.broken or rec.missing:
             wr = QtCore.QRect(box.right() - 3 - h, box.bottom() - 3 - h, h, h)
@@ -304,6 +336,8 @@ class AssetView(QtWidgets.QListView):
     single-click activation, so QAbstractItemView.activated can't be used for it."""
 
     import_requested = QtCore.Signal()
+    delete_requested = QtCore.Signal()
+    rename_requested = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -345,6 +379,14 @@ class AssetView(QtWidgets.QListView):
                 self.selectionModel().hasSelection():
             event.accept()
             self.import_requested.emit()
+            return
+        if event.key() == Qt.Key.Key_Delete and self.selectionModel().hasSelection():
+            event.accept()
+            self.delete_requested.emit()
+            return
+        if event.key() == Qt.Key.Key_F2 and self.selectionModel().hasSelection():
+            event.accept()
+            self.rename_requested.emit()
             return
         super().keyPressEvent(event)
 

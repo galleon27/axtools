@@ -41,8 +41,19 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
     `_normal`, `_height`, ...). Scan IDs like Megascans' are replaced by the folder name.
   * HDR files with a 2:1 aspect become HDRIs; other images become image assets.
   * A preview image (`rock_preview.png`, `preview.jpg`) becomes the thumbnail.
-* Search with words or fields: `type:mat`, `tag:rock`, `cat:trees`, `fmt:abc`, `-tag:wip`,
-  `broken`.
+* Right-click an asset to add it to favorites, rename it (F2), move it to another category,
+  or delete it (Del). Deleted assets go to the `.trash` folder in the library root; delete
+  them there to free the space. Drag assets onto a category in the sidebar to move them.
+  Renaming or moving relinks the nodes in the open scene; other .hip files that load the
+  asset by path need relinking.
+* The sidebar lists __Favorites__, __Recently used__ (your imports), __Recently added__ (last
+  14 days) and __In this scene__. A green dot on a thumbnail means the asset has nodes in the
+  open scene, an orange dot that some of them use an older version. Click __Update__ in the
+  details pane to point them at the current version.
+* Edit an asset's tags and notes in the details pane and click __Save tags__. Favorites and
+  recent imports are stored per user, not in the library.
+* Search with words or fields: `type:mat`, `tag:rock`, `cat:trees`, `fmt:abc`, `fav:1`,
+  `-tag:wip`, `broken`.
 * F5 rescans the library. Shift-click the Rescan button to clear the cache first.
 
 After editing the code, run `ax_asset_library.dev_reload()` and reopen the panel.

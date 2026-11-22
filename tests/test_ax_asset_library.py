@@ -11,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
 
-from ax_asset_library import karma, library, prefs, schema, textures  # noqa: E402
+from ax_asset_library import karma, library, manage, prefs, schema, textures  # noqa: E402
 
 try:
     import pxr  # noqa: F401
@@ -383,6 +383,91 @@ class StageTests(unittest.TestCase):
             self.assertTrue(dome.GetTextureFileAttr().Get().path.endswith("sky.hdr"))
             self.assertTrue(dome.GetPrim().GetAttribute("karma:light:renderlightgeo").Get())
             self.assertTrue(st.GetPrimAtPath("/AXThumb/chrome"))
+
+
+class ManageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "lib")
+        self.root2 = os.path.join(self.tmp.name, "lib2")
+        self.asset, _ = make_asset(self.root, "geometry", "rocks/big", "Boulder", tags=["rock"])
+        make_asset(self.root, "geometry", "rocks", "Pebble")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def scan(self, *roots):
+        recs, _ = library.scan_roots(list(roots or [self.root]), os.path.join(self.tmp.name, "c"),
+                                     use_cache=False)
+        return {r.name: r for r in recs}
+
+    def test_meta(self):
+        manage.set_meta(self.asset, "Granite, rock", "  big one ")
+        rec = self.scan()["Boulder"]
+        self.assertEqual(rec.tags, ["granite", "rock"])
+        self.assertEqual(rec.description, "big one")
+        manage.set_meta(self.asset, description="")
+        self.assertEqual(self.scan()["Boulder"].tags, ["granite", "rock"])
+
+    def test_rename(self):
+        new = manage.rename(self.asset, "Big Boulder")
+        self.assertEqual(os.path.basename(new), "Big_Boulder")
+        recs = self.scan()
+        self.assertIn("Big_Boulder", recs)
+        self.assertFalse(recs["Big_Boulder"].missing)       # relative paths still resolve
+        with self.assertRaises(manage.ManageError):
+            manage.rename(new, "   ")                          # empty name
+        rec = library.load_record(new, self.root)
+        self.assertEqual((rec.name, rec.category), ("Big_Boulder", "rocks/big"))
+
+    def test_rename_conflict_and_case(self):
+        pebble = os.path.join(self.root, "geometry", "rocks", "Pebble")
+        other = manage.move(pebble, "geometry", self.root, self.root, "rocks/big")
+        with self.assertRaises(manage.ManageError):
+            manage.rename(other, "Boulder")
+        new = manage.rename(self.asset, "boulder")           # case-only rename
+        self.assertEqual(os.path.basename(new), "boulder")
+        self.assertEqual(schema.load(os.path.join(new, "asset.json"))["name"], "boulder")
+
+    def test_move_and_prune(self):
+        new = manage.move(self.asset, "geometry", self.root, self.root, "stones")
+        rec = self.scan()["Boulder"]
+        self.assertEqual(rec.category, "stones")
+        self.assertEqual(schema.load(os.path.join(new, "asset.json"))["category"], "stones")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "geometry", "rocks", "big")))
+        self.assertTrue(os.path.exists(os.path.join(self.root, "geometry", "rocks")))  # Pebble
+        self.assertEqual(manage.move(new, "geometry", self.root, self.root, "stones"), new)
+        other = manage.move(new, "geometry", self.root, self.root2, "")
+        self.assertEqual(self.scan(self.root2)["Boulder"].category, "")
+        self.assertTrue(os.path.isdir(other))
+
+    def test_trash(self):
+        dst = manage.trash(self.asset, self.root, "geometry")
+        self.assertTrue(dst.startswith(os.path.join(self.root, ".trash")))
+        self.assertNotIn("Boulder", self.scan())
+        # A second asset with the same name gets its own trash folder.
+        again, _ = make_asset(self.root, "geometry", "rocks", "Boulder")
+        self.assertNotEqual(manage.trash(again, self.root, "geometry"), dst)
+
+
+class CollectionTests(unittest.TestCase):
+    def test_favorites_recent_query(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = prefs.Prefs(os.path.join(d, "p.json"))
+            prefs.set_favorite(s, ["a", "b"], True)
+            prefs.set_favorite(s, ["a"], False)
+            self.assertEqual(prefs.favorites(s), {"b"})
+            s.set("recent_limit", 2)
+            prefs.add_recent(s, ["x"], "2026-01-01")
+            prefs.add_recent(s, ["y"], "2026-01-02")
+            prefs.add_recent(s, ["x"], "2026-01-03")
+            prefs.add_recent(s, ["z"], "2026-01-04")
+            self.assertEqual(prefs.recent(s), {"z": "2026-01-04", "x": "2026-01-03"})
+            recs = [library.AssetRecord(id="b", name="B"), library.AssetRecord(id="c", name="C")]
+            q = library.Query("fav:1", prefs.favorites(s))
+            self.assertEqual([r.name for r in recs if q.matches(r)], ["B"])
+            q = library.Query("-fav:1", prefs.favorites(s))
+            self.assertEqual([r.name for r in recs if q.matches(r)], ["C"])
 
 
 class QueryTests(unittest.TestCase):
