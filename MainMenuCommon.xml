@@ -25,6 +25,14 @@ if pane:
         ]]></scriptCode>
       </scriptItem>
 
+      <scriptItem id="h.axassetlibrary">
+        <label>AX Asset Library</label>
+        <scriptCode><![CDATA[
+import ax_asset_library
+ax_asset_library.open_floating_panel()
+        ]]></scriptCode>
+      </scriptItem>
+
       <scriptItem id="h.axnotes">
         <label>AX Notes</label>
         <scriptCode><![CDATA[
