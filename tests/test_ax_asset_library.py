@@ -238,8 +238,8 @@ class KarmaTests(unittest.TestCase):
         dist = sum((eye[i] - center[i]) ** 2 for i in range(3)) ** 0.5
         import math
         half_fov = math.atan(karma.APERTURE / 2 / karma.FOCAL)
-        self.assertGreaterEqual(math.asin(radius / dist), 0)
-        self.assertLess(math.asin(radius / dist), half_fov)   # sphere inside the frame
+        # The sphere's silhouette is cropped by `margin` (0.85): about the frame size.
+        self.assertAlmostEqual(radius / dist, math.sin(half_fov) / 0.85, places=6)
         self.assertGreater(eye[1], center[1])                 # looking down a bit
         self.assertTrue(0 < near < dist - radius < dist + radius < far)
 
@@ -272,8 +272,10 @@ class KarmaTests(unittest.TestCase):
             self.assertEqual(stage.GetMetadata("renderSettingsPrimPath"), karma.SETTINGS_PATH)
             self.assertEqual(settings.GetPrim().GetAttribute(
                 "karma:global:pathtracedsamples").Get(), 8)
-            product = UsdRender.Product(stage.GetPrimAtPath("/Render/Products/thumb"))
-            self.assertEqual(product.GetProductNameAttr().Get(), image.replace("\\", "/"))
+            # No render products: husk refuses vars without its aov tokens and writes its
+            # default beauty to --output instead.
+            self.assertFalse(settings.GetProductsRel().GetTargets())
+            self.assertFalse([p for p in stage.Traverse() if p.IsA(UsdRender.Var)])
             cam = UsdGeom.Camera(stage.GetPrimAtPath("/AXThumb/cam"))
             # The camera looks at the bounds center: center projects to the middle of the frame.
             xf = cam.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()

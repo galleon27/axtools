@@ -24,11 +24,12 @@ def _vlen(a):
     return math.sqrt(sum(c * c for c in a))
 
 
-def frame_camera(bounds, azimuth=35.0, elevation=22.0, margin=1.12):
+def frame_camera(bounds, azimuth=35.0, elevation=22.0, margin=0.85):
     """Camera that fits a bounding box: returns (eye, center, near, far).
 
     bounds = [[xmin, ymin, zmin], [xmax, ymax, zmax]], Y up. The bounding sphere is fitted
-    into the field of view, so the asset fills most of the frame at any rotation.
+    into the field of view; margin < 1 crops into the sphere, because the asset itself is
+    smaller than its bounding sphere.
     """
     lo, hi = bounds
     center = tuple((lo[i] + hi[i]) * 0.5 for i in range(3))
@@ -81,16 +82,11 @@ def write_stage(stage_path, layer_path, bounds, image_path, resolution=512, samp
         mesh.CreateDisplayColorAttr([Gf.Vec3f(0.18, 0.18, 0.18)])
         mesh.CreateExtentAttr([Gf.Vec3f(cx - size, y, cz - size), Gf.Vec3f(cx + size, y, cz + size)])
 
-    var = UsdRender.Var.Define(stage, "/Render/Products/Vars/C")
-    var.CreateSourceNameAttr("C")
-    var.CreateDataTypeAttr("color4f")
-    product = UsdRender.Product.Define(stage, "/Render/Products/thumb")
-    product.CreateProductNameAttr(image_path.replace("\\", "/"))
-    product.CreateOrderedVarsRel().SetTargets([var.GetPath()])
+    # No RenderProduct/RenderVar: husk rejects vars without its driver:parameters:aov:*
+    # tokens, and with none defined it writes its default beauty image to --output.
     settings = UsdRender.Settings.Define(stage, SETTINGS_PATH)
     settings.CreateResolutionAttr(Gf.Vec2i(int(resolution), int(resolution)))
     settings.CreateCameraRel().SetTargets([cam.GetPath()])
-    settings.CreateProductsRel().SetTargets([product.GetPath()])
     settings.GetPrim().CreateAttribute("karma:global:pathtracedsamples",
                                        Sdf.ValueTypeNames.Int).Set(int(samples))
     stage.SetMetadata("renderSettingsPrimPath", SETTINGS_PATH)

@@ -592,7 +592,12 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._on_selection_changed()
 
     def _on_render_finished(self, asset_dir, ok, message):
-        self._message(message, warning=not ok)
+        first, _sep, details = message.partition("\n\n")
+        self._message(first, warning=not ok)
+        if not ok and self.isVisible():
+            hou.ui.displayMessage("Thumbnail render failed. " + first,
+                                  severity=hou.severityType.Warning, details=details or None,
+                                  details_expanded=bool(details), title="AX Asset Library")
         self.rescan()
 
     # ---- publish -------------------------------------------------------------------------------

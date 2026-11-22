@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 
 from PySide6 import QtCore, QtGui
 
@@ -109,6 +110,38 @@ def store_thumbnail(asset_dir, image_path, method):
 
 
 # --- Karma render queue -------------------------------------------------------------------
+LOG_NAME = "render.log"
+LAST_LOG = "last_thumbnail_render.log"
+# Startup chatter from renderer plugins, left out of error messages (still in the log).
+_NOISE = ("[Redshift]", "[Octane]")
+
+
+def log_tail(path, lines=12):
+    """Last meaningful lines of a husk log, without renderer plugin start-up lines."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read().splitlines()
+    except OSError:
+        return ""
+    keep = [ln for ln in text if ln.strip() and not ln.lstrip().startswith(_NOISE)]
+    return "\n".join(keep[-lines:])
+
+
+def find_output(workdir, expected):
+    """The rendered image: `expected`, or else any image husk wrote in the work folder
+    (covers frame-numbered names such as thumb.0001.png)."""
+    if os.path.isfile(expected):
+        return expected
+    try:
+        names = sorted(os.listdir(workdir))
+    except OSError:
+        return None
+    for n in names:
+        if schema.is_image(n):
+            return os.path.join(workdir, n)
+    return None
+
+
 class _Job:
     __slots__ = ("asset_dir", "name", "workdir", "stage", "image")
 
@@ -116,25 +149,34 @@ class _Job:
         self.asset_dir, self.name, self.workdir = asset_dir, name, workdir
         self.stage, self.image = stage, image
 
+    @property
+    def log(self):
+        return os.path.join(self.workdir, LOG_NAME)
+
 
 class KarmaQueue(QtCore.QObject):
-    """Renders thumbnails one at a time with husk in a QProcess, so Houdini stays responsive.
+    """Renders thumbnails one at a time with husk, so Houdini stays responsive.
 
-    Lives at module level: renders started from a panel finish even if the panel closes.
+    husk runs through subprocess.Popen (no console window on Windows, output to a log file
+    in the work folder), polled by a timer. Lives at module level: renders started from a
+    panel finish even if the panel closes. A failed render keeps its work folder, and the
+    log is copied to last_thumbnail_render.log in the library's pref folder.
     """
 
     changed = QtCore.Signal()                       # queue grew or shrank
     finished = QtCore.Signal(str, bool, str)        # asset_dir, ok, message
+    POLL_MS = 250
 
     def __init__(self):
         super().__init__()
         self._jobs = collections.deque()
         self._current = None
         self._proc = None
-        self._timer = QtCore.QTimer(self)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self._on_timeout)
-        self._timed_out = False
+        self._log_file = None
+        self._started = 0.0
+        self._poll = QtCore.QTimer(self)
+        self._poll.setInterval(self.POLL_MS)
+        self._poll.timeout.connect(self._check)
         self.renderer, self.timeout_s = "BRAY_HdKarma", 300
 
     def pending(self):
@@ -169,67 +211,98 @@ class KarmaQueue(QtCore.QObject):
         self.changed.emit()
 
     def _next(self):
-        if self._current is not None or not self._jobs:
+        while self._current is None and self._jobs:
+            husk = find_tool("husk")
+            if husk is None:
+                while self._jobs:
+                    self._finish(self._jobs.popleft(), False, "husk not found in $HFS/bin")
+                return
+            job = self._jobs.popleft()
+            kw = {"creationflags": _CREATE_NO_WINDOW} if os.name == "nt" else {}
+            try:
+                self._log_file = open(job.log, "wb")
+                self._proc = subprocess.Popen(
+                    [husk] + karma.husk_args(job.stage, job.image, self.renderer),
+                    cwd=job.workdir, stdin=subprocess.DEVNULL, stdout=self._log_file,
+                    stderr=subprocess.STDOUT, **kw)
+            except OSError as e:
+                self._close_log()
+                self._finish(job, False, "husk failed to start: %s" % e)
+                continue
+            self._current = job
+            self._started = time.time()
+            self._poll.start()
+
+    def _close_log(self):
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
+
+    def _check(self):
+        proc, job = self._proc, self._current
+        if proc is None or job is None:
+            self._poll.stop()
             return
-        husk = find_tool("husk")
-        if husk is None:
-            while self._jobs:
-                self._finish(self._jobs.popleft(), False, "husk not found in $HFS/bin")
-            return
-        job = self._jobs.popleft()
-        self._current = job
-        self._timed_out = False
-        proc = QtCore.QProcess(self)
-        proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
-        proc.setWorkingDirectory(job.workdir)
-        proc.finished.connect(self._on_finished)
-        proc.errorOccurred.connect(self._on_error)
-        self._proc = proc
-        proc.start(husk, karma.husk_args(job.stage, job.image, self.renderer))
-        self._timer.start(int(self.timeout_s * 1000))
+        code = proc.poll()
+        timed_out = False
+        if code is None:
+            if time.time() - self._started < self.timeout_s:
+                return
+            proc.kill()
+            code = proc.wait()
+            timed_out = True
+        self._poll.stop()
+        self._close_log()
+        self._proc, self._current = None, None
 
-    def _output(self):
-        if self._proc is None:
-            return ""
-        text = bytes(self._proc.readAll()).decode(errors="replace").strip()
-        return text[-600:]
-
-    def _on_timeout(self):
-        if self._proc is not None:
-            self._timed_out = True
-            self._proc.kill()  # _on_finished/_on_error reports it
-
-    def _on_error(self, error):
-        if error == QtCore.QProcess.ProcessError.FailedToStart and self._current is not None:
-            self._done(False, "husk failed to start")
-
-    def _on_finished(self, code, _status):
-        if self._current is None:
-            return
-        ok = code == 0 and os.path.isfile(self._current.image)
-        msg = "" if ok else ("husk exited with code %s. %s" % (code, self._output()))
-        if self._timed_out:
+        image = find_output(job.workdir, job.image)
+        ok = code == 0 and image is not None and not timed_out
+        if timed_out:
             msg = "render timed out after %ds" % self.timeout_s
-        self._done(ok, msg)
-
-    def _done(self, ok, msg):
-        self._timer.stop()
-        job, self._current = self._current, None
-        if self._proc is not None:
-            self._proc.deleteLater()
-            self._proc = None
-        self._finish(job, ok, msg)
+        elif code != 0:
+            msg = "husk exited with code %s" % code
+        elif image is None:
+            msg = "husk finished but wrote no image"
+        else:
+            msg = ""
+        self._finish(job, ok, msg, image)
         self._next()
 
-    def _finish(self, job, ok, msg):
+    def _finish(self, job, ok, msg, image=None):
         if ok:
             try:
-                store_thumbnail(job.asset_dir, job.image, "karma")
+                store_thumbnail(job.asset_dir, image, "karma")
             except (ThumbnailError, schema.SidecarError, OSError) as e:
-                ok, msg = False, str(e)
-        shutil.rmtree(job.workdir, ignore_errors=True)
-        self.finished.emit(job.asset_dir, ok, msg or "%s: thumbnail rendered" % job.name)
+                ok, msg = False, "could not store thumbnail: %s" % e
+        if ok:
+            shutil.rmtree(job.workdir, ignore_errors=True)
+            msg = "%s: thumbnail rendered" % job.name
+        else:
+            msg = "%s: %s" % (job.name, msg)
+            tail = log_tail(job.log)
+            if tail:
+                msg += "\n\n" + tail
+            saved = self._save_log(job)
+            if saved:
+                msg += "\n\nFull log: %s\nRender files kept in: %s" % (saved, job.workdir)
+        self.finished.emit(job.asset_dir, ok, msg)
         self.changed.emit()
+
+    @staticmethod
+    def _save_log(job):
+        if not os.path.isfile(job.log):
+            return ""
+        from . import prefs
+        dst = os.path.join(prefs.cache_dir(), LAST_LOG)
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(job.log, dst)
+        except OSError:
+            return job.log
+        return dst
 
 
 _QUEUE = None
