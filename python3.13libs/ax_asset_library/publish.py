@@ -8,7 +8,7 @@ import tempfile
 
 import hou
 
-from . import karma, schema, textures, thumbnails
+from . import karma, megascans, schema, textures, thumbnails
 
 # Files copied along with a geometry file of the same name (OBJ materials).
 COMPANION_EXTS = {".obj": (".mtl",)}
@@ -147,13 +147,17 @@ def geometry_info(path):
 class IngestItem:
     """One asset to create: type, name, {key: source file}, optional thumbnail source."""
 
-    def __init__(self, asset_type, name, files, thumb=None, extra=(), info=None):
+    def __init__(self, asset_type, name, files, thumb=None, extra=(), info=None,
+                 category="", tags=(), source=None):
         self.type = asset_type
         self.name = schema.sanitize_name(name)
         self.files = dict(files)
         self.thumb = thumb
         self.extra = list(extra)        # copied along, not recorded as version files
         self.info = dict(info or {})
+        self.category = category        # sub-category under the one chosen in the dialog
+        self.tags = list(tags)
+        self.source = dict(source or {"kind": "ingest"})
 
     @property
     def first(self):
@@ -167,6 +171,7 @@ class IngestPlan:
     def __init__(self):
         self.items = []
         self.skipped = []   # (path, reason)
+        self.megascans = 0  # number of Megascans asset folders found
 
     def by_type(self, asset_type):
         return [i for i in self.items if i.type == asset_type]
@@ -195,6 +200,19 @@ def plan_ingest(paths):
     Preview images become thumbnails instead of assets.
     """
     plan = IngestPlan()
+    ms_assets, paths = megascans.find_assets(paths)
+    plan.megascans = len(ms_assets)
+    for asset in ms_assets:
+        made = megascans.plan(asset)
+        if not made:
+            plan.skipped.append((asset.folder, "Megascans %s asset: nothing to import"
+                                 % (asset.kind or "unknown")))
+        for asset_type, name, files, info, extra in made:
+            plan.items.append(IngestItem(
+                asset_type, name, files, asset.preview, extra=extra, info=info,
+                category=asset.category, tags=asset.tags,
+                source={"kind": "megascans", "megascans_id": asset.id,
+                        "origin_path": asset.folder.replace("\\", "/")}))
     geo, images, other = collect(paths)
     companions = {os.path.normcase(os.path.splitext(os.path.abspath(g))[0] + ext)
                   for g in geo for ext in COMPANION_EXTS.get(schema.file_ext(g), ())}
@@ -237,6 +255,7 @@ def plan_ingest(paths):
 
 # --- writing assets ---------------------------------------------------------------------
 def _write_asset(root, category, item, tags, copy, read_info, report):
+    category = "/".join(c for c in (category, clean_category(item.category)) if c)
     asset_dir = asset_dir_for(root, item.type, category, item.name)
     if os.path.exists(asset_dir):
         report.skipped.append((item.first, "%s already exists in the library" % item.name))
@@ -269,8 +288,10 @@ def _copy_into(vdir, src, used):
 def _fill_asset(asset_dir, category, item, tags, copy, read_info, report):
     vdir = os.path.join(asset_dir, schema.version_label(1))
     os.makedirs(vdir)
-    data = schema.new_asset(item.name, item.type, category=category, tags=tags, author=author())
-    data["source"].update(kind="ingest", origin_path=item.first.replace("\\", "/"))
+    data = schema.new_asset(item.name, item.type, category=category,
+                            tags=list(tags) + item.tags, author=author())
+    data["source"].update(origin_path=item.first.replace("\\", "/"))
+    data["source"].update(item.source)
 
     version_files, sizes, used = {}, {}, set()
     for key, f in item.files.items():
@@ -298,6 +319,8 @@ def _fill_asset(asset_dir, category, item, tags, copy, read_info, report):
     if item.type == "geometry" and read_info:
         try:
             data["info"].update(geometry_info(item.first))
+            if "import_scale" in data["info"]:
+                data["info"]["import_scale"] = megascans.check_scale(data["info"])
         except hou.Error as e:
             report.warn("%s: could not read geometry info (%s)" % (item.name, e.instanceMessage()))
     elif item.type == "material":

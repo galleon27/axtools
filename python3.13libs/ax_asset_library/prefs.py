@@ -29,6 +29,9 @@ DEFAULTS = {
     "copy_on_ingest": True,
     "read_geo_info": True,
     "ingest_render": False,
+    "megascans_copy": False,       # Megascans textures are large: reference in place by default
+    "megascans_dir": "",
+    "list_mode": False,
     "material_renderer": "karma",  # last renderer picked for a material import
     # per-user collections (asset ids), kept here so a shared library never gets write conflicts
     "favorites": [],

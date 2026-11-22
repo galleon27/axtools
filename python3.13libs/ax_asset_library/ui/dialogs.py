@@ -70,10 +70,19 @@ class IngestDialog(QtWidgets.QDialog):
         form.addRow("Tags", self.tags_edit)
 
         self.copy_check = QtWidgets.QCheckBox("Copy files into the library")
-        self.copy_check.setChecked(settings.get("copy_on_ingest"))
+        self.copy_check.setChecked(settings.get("megascans_copy" if plan.megascans
+                                                else "copy_on_ingest"))
         self.copy_check.setToolTip("On: files are copied into the asset folder (v001/).\n"
                                    "Off: the asset points at the files where they are now.")
         form.addRow("", self.copy_check)
+        if plan.megascans:
+            ms = QtWidgets.QLabel(
+                "%d Megascans asset(s): names, tags and categories come from their .json "
+                "files, and categories go under the one above. Megascans textures are large, "
+                "so files stay where they are unless you tick Copy." % plan.megascans)
+            ms.setWordWrap(True)
+            ms.setStyleSheet("color: #9aa0a8;")
+            form.addRow("", ms)
 
         self.info_check = QtWidgets.QCheckBox("Read bounds and point/prim counts")
         self.info_check.setChecked(settings.get("read_geo_info"))

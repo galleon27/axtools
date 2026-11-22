@@ -84,7 +84,8 @@ def _rank(path, channel):
         score += 0 if ext in (".exr", ".tif", ".tiff") else 2   # high bit depth first
     elif ext == ".exr":
         score += 1
-    return (score, low)
+    res = max([int(w[:-1]) for w in words if re.fullmatch(r"\d+k", w)] or [0])
+    return (score, -res, low)            # then highest resolution (8K before 2K)
 
 
 class TextureSet:
@@ -153,7 +154,9 @@ def group(files):
         local = [p for p in previews if os.path.normcase(os.path.dirname(os.path.abspath(p)))
                  == os.path.normcase(ts.folder)]
         named = [p for p in local if ts.name.lower() in schema.strip_ext(p).lower()]
-        ts.preview = (named or (local if per_folder[os.path.normcase(ts.folder)] == 1 else [None]))[0]
+        single = per_folder[os.path.normcase(ts.folder)] == 1
+        candidates = named or (local if single else [])
+        ts.preview = candidates[0] if candidates else None
     used = {os.path.normcase(ts.preview) for ts in sets if ts.preview}
     previews = [p for p in previews if os.path.normcase(p) not in used]
     sets.sort(key=lambda s: (s.folder.lower(), s.name.lower()))
@@ -201,10 +204,14 @@ def _find_key(obj, key):
 def megascans_height(folder):
     """Displacement height in scene units from a Megascans .json in `folder`, or None.
 
-    Megascans stores it as {"key": "height", "value": "0.02 m"} (same lookup as the
-    Quick Material builders).
+    Megascans stores it as {"key": "height", "value": "0.02 m"}. For a recognized Megascans
+    asset only surfaces count: on 3D assets "height" is the object size.
     """
     import json
+    from . import megascans
+    asset = megascans.read_asset(folder)
+    if asset is not None:
+        return asset.displacement_scale
     try:
         names = [n for n in os.listdir(folder) if n.lower().endswith(".json")]
     except OSError:

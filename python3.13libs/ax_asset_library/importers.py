@@ -174,21 +174,48 @@ def _wire_lop(node, anchor):
             node.setDisplayFlag(True)
 
 
+def _import_scale(rec):
+    try:
+        scale = float((rec.info or {}).get("import_scale") or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    return scale if scale > 0 else 1.0
+
+
+def _sop_scale(parent, loader, rec):
+    """Transform SOP after the loader when the asset has an import scale (Megascans FBX
+    are in centimeters). Returns the last node of the chain."""
+    scale = _import_scale(rec)
+    if scale == 1.0:
+        return loader
+    xf = parent.createNode("xform", unique_name(parent, rec.name + "_scale"))
+    xf.parm("scale").set(scale)
+    xf.setInput(0, loader)
+    xf.setComment("import scale %g" % scale)
+    xf.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+    return xf
+
+
 def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     path, value = file_for(rec, settings, version)
     if ctx == "sop":
         node = _sop_loader(network, rec, path, value)
         node.setPosition(pos)
         _tag_node(node, rec, settings, version)
-        return node
+        last = _sop_scale(network, node, rec)
+        if last is not node:
+            last.setPosition(pos + hou.Vector2(0, -1))
+        return last
 
     if ctx == "obj":
         geo = network.createNode("geo", unique_name(network, rec.name))
         for child in geo.children():  # some setups add a default File SOP
             child.destroy()
         loader = _sop_loader(geo, rec, path, value)
-        loader.setDisplayFlag(True)
-        loader.setRenderFlag(True)
+        last = _sop_scale(geo, loader, rec)
+        last.setDisplayFlag(True)
+        last.setRenderFlag(True)
+        geo.layoutChildren()
         geo.setPosition(pos)
         _tag_node(geo, rec, settings, version)
         _tag_node(loader, rec, settings, version)
@@ -198,10 +225,23 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     ref = network.createNode(_lop_type(LOP_REFERENCE_TYPES), unique_name(network, rec.name))
     if _set_first(ref, ("filepath1", "filepath"), value) is None:
         raise AssetImportError("%s has no file path parameter." % ref.type().name())
-    _set_first(ref, ("primpath1", "primpath"), "/assets/" + schema.sanitize_name(rec.name))
+    prim = "/assets/" + schema.sanitize_name(rec.name)
+    _set_first(ref, ("primpath1", "primpath"), prim)
     _wire_lop(ref, anchor)
     ref.setPosition(pos)
     _tag_node(ref, rec, settings, version)
+    scale = _import_scale(rec)
+    if scale != 1.0:
+        xf = network.createNode("xform", unique_name(network, rec.name + "_scale"))
+        xf.parm("primpattern").set(prim)
+        xf.parm("scale").set(scale)
+        xf.setInput(0, ref)
+        xf.setPosition(pos + hou.Vector2(0, -1))
+        xf.setComment("import scale %g" % scale)
+        xf.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+        if ref.isDisplayFlagSet():
+            xf.setDisplayFlag(True)
+        return xf
     return ref
 
 

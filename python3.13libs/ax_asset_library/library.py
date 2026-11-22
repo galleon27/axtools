@@ -405,7 +405,12 @@ class Query:
 def sort_records(records, mode="name"):
     """Sort by name, or newest first by "added"/"modified" (ties stay in name order)."""
     out = sorted(records, key=lambda r: (r.name.lower(), r.category.lower()))
-    if mode == "added":
+    if mode == "type":
+        order = {t: i for i, t in enumerate(schema.ASSET_TYPES)}
+        out.sort(key=lambda r: order.get(r.type, 99))
+    elif mode == "category":
+        out.sort(key=lambda r: (r.category == "", r.category.lower()))
+    elif mode == "added":
         out.sort(key=lambda r: r.created or "", reverse=True)
     elif mode == "modified":
         out.sort(key=lambda r: r.modified or "", reverse=True)

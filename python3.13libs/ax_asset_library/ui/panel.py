@@ -14,7 +14,8 @@ ScopeRole = Qt.ItemDataRole.UserRole + 10
 RESCAN_AFTER_S = 60  # rescan when the panel is shown again after this long
 RECENTLY_ADDED_DAYS = 14
 
-SORT_MODES = (("name", "Name"), ("added", "Newest"), ("modified", "Recently changed"))
+SORT_MODES = (("name", "Name"), ("type", "Type"), ("category", "Category"),
+              ("added", "Newest"), ("modified", "Recently changed"))
 IMAGE_FILTER = "Images (*.jpg *.jpeg *.png *.tga *.tif *.tiff *.bmp *.webp *.exr *.hdr *.rat)"
 GEO_FILTER = "Geometry (%s)" % " ".join("*" + e for e in sorted(schema.GEO_EXTS))
 ASSET_FILTER = "Geometry and images (%s)" % " ".join(
@@ -178,6 +179,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.size_slider.valueChanged.connect(self._on_size_changed)
         bar.addWidget(self.size_slider)
 
+        self.btn_list = QtWidgets.QToolButton()
+        self.btn_list.setText("List")
+        self.btn_list.setCheckable(True)
+        self.btn_list.setToolTip("Show assets as a list with details instead of a thumbnail grid.")
+        self.btn_list.toggled.connect(self._on_list_toggled)
+        bar.addWidget(self.btn_list)
+
         self.btn_publish = QtWidgets.QToolButton()
         self.btn_publish.setText("Save selection")
         self.btn_publish.setIcon(icon("BUTTONS_save"))
@@ -190,9 +198,14 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.btn_add = QtWidgets.QToolButton()
         self.btn_add.setText("Add")  # shown if the icon is missing
         self.btn_add.setIcon(icon("BUTTONS_list_add"))
-        self.btn_add.setToolTip("Add geometry files to the library. You can also drop files or "
-                                "folders onto the panel.")
-        self.btn_add.clicked.connect(self._add_files)
+        self.btn_add.setToolTip("Add files, a folder or a Megascans library. You can also drop "
+                                "files or folders onto the panel.")
+        add_menu = QtWidgets.QMenu(self.btn_add)
+        add_menu.addAction("Add files...", self._add_files)
+        add_menu.addAction("Add folder...", self._add_folder)
+        add_menu.addAction("Import Megascans library...", self._add_megascans)
+        self.btn_add.setMenu(add_menu)
+        self.btn_add.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         bar.addWidget(self.btn_add)
 
         self.btn_rescan = QtWidgets.QToolButton()
@@ -226,6 +239,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.view.import_requested.connect(self._import_selected)
         self.view.delete_requested.connect(self._trash_selected)
         self.view.rename_requested.connect(self._rename_selected)
+        self.view.copy_requested.connect(self._copy_paths)
+        self.view.favorite_requested.connect(self._toggle_favorite_selected)
         self.view.customContextMenuRequested.connect(self._context_menu)
         self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.stack.addWidget(self.view)
@@ -279,6 +294,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         size = s.get("thumb_size")
         self.size_slider.setValue(size)
         self.view.set_thumb_size(size)
+        self.btn_list.setChecked(bool(s.get("list_mode")))
         idx = self.sort_combo.findData(s.get("sort"))
         self.sort_combo.setCurrentIndex(max(0, idx))
         for t in s.get("type_filter"):
@@ -292,6 +308,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
     def _save_state(self):
         s = self.settings
         s.set("thumb_size", self.size_slider.value(), save=False)
+        s.set("list_mode", self.btn_list.isChecked(), save=False)
         s.set("sort", self.sort_combo.currentData(), save=False)
         s.set("type_filter", [t for t, b in self.type_buttons.items() if b.isChecked()], save=False)
         s.set("splitter", self.splitter.sizes(), save=False)
@@ -419,6 +436,10 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     def _on_size_changed(self, value):
         self.view.set_thumb_size(value)
+
+    def _on_list_toggled(self, on):
+        self.view.set_list_mode(on)
+        self.size_slider.setEnabled(not on)
 
     def _apply_filter(self):
         scope = self._current_scope() or ("all",)
@@ -726,6 +747,12 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 pass
             self._hip_callback = None
 
+    def _toggle_favorite_selected(self):
+        recs = [r for r in self.view.selected_records() if r.id]
+        if recs:
+            favs = _prefs.favorites(self.settings)
+            self._set_favorite(recs, not all(r.id in favs for r in recs))
+
     def _set_favorite(self, recs, on):
         _prefs.set_favorite(self.settings, [r.id for r in recs if r.id], on)
         self._rebuild_tree()
@@ -999,12 +1026,35 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             self.settings.set("last_ingest_dir", os.path.dirname(paths[0]))
             self._ingest(paths)
 
-    def _ingest(self, paths):
+    def _add_folder(self):
+        start = self.settings.get("last_ingest_dir") or hou.text.expandString("$HIP")
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Add folder to library", start)
+        if d:
+            self.settings.set("last_ingest_dir", d)
+            self._ingest([d])
+
+    def _add_megascans(self):
+        start = self.settings.get("megascans_dir") or os.environ.get("MEGASCANS", "")
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Megascans library (the Downloaded folder, or any folder inside it)", start)
+        if not d:
+            return
+        self.settings.set("megascans_dir", d)
+        plan = publish.plan_ingest([d])
+        if not plan.megascans:
+            hou.ui.displayMessage(
+                "No Megascans assets found in %s.\n\nPick the Bridge download folder "
+                "(usually 'Downloaded'): each asset folder in it has an <id>.json file." % d,
+                severity=hou.severityType.Message, title="AX Asset Library")
+            return
+        self._ingest([d], plan)
+
+    def _ingest(self, paths, plan=None):
         if not self.settings.writable_roots():
             hou.ui.displayMessage("Add a library folder that is not read-only in Settings first.",
                                   severity=hou.severityType.Warning, title="AX Asset Library")
             return
-        plan = publish.plan_ingest(paths)
+        plan = plan or publish.plan_ingest(paths)
         if not plan.items:
             hou.ui.displayMessage(
                 "No geometry or image files found.", severity=hou.severityType.Message,
@@ -1015,7 +1065,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             return
         v = dlg.values()
         self.settings.set("last_category", v["category"], save=False)
-        self.settings.set("copy_on_ingest", v["copy"], save=False)
+        self.settings.set("megascans_copy" if plan.megascans else "copy_on_ingest", v["copy"],
+                          save=False)
         self.settings.set("read_geo_info", v["read_info"], save=False)
         self.settings.set("ingest_render", v["render"])
         try:

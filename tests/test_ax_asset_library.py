@@ -11,7 +11,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
 
-from ax_asset_library import karma, library, manage, prefs, schema, textures  # noqa: E402
+from ax_asset_library import (karma, library, manage, megascans, prefs, schema,  # noqa: E402
+                              textures)
 
 try:
     import pxr  # noqa: F401
@@ -338,6 +339,13 @@ class TextureTests(unittest.TestCase):
             self.assertEqual(names, ["onlyao_ao.png", "photo.jpg", "sky.hdr"])
             self.assertEqual(previews, [])
 
+    def test_single_set_without_preview(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = self._touch(d, "bark/bark_Albedo.jpg", "bark/bark_Normal.jpg")
+            sets, _left, _prev = textures.group(files)
+            self.assertEqual(len(sets), 1)
+            self.assertIsNone(sets[0].preview)
+
     def test_hdri_and_height(self):
         self.assertTrue(textures.looks_like_hdri("a.hdr"))
         self.assertTrue(textures.looks_like_hdri("a.exr", (4096, 2048)))
@@ -383,6 +391,99 @@ class StageTests(unittest.TestCase):
             self.assertTrue(dome.GetTextureFileAttr().Get().path.endswith("sky.hdr"))
             self.assertTrue(dome.GetPrim().GetAttribute("karma:light:renderlightgeo").Get())
             self.assertTrue(st.GetPrimAtPath("/AXThumb/chrome"))
+
+
+class MegascansTests(unittest.TestCase):
+    """Fake Bridge download with the folder layout and JSON keys of real Megascans assets."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dl = os.path.join(self.tmp.name, "Downloaded")
+
+        def asset(rel, aid, name, cats, meta, files):
+            d = os.path.join(self.dl, rel)
+            os.makedirs(d)
+            with open(os.path.join(d, aid + ".json"), "w") as f:
+                json.dump({"id": aid, "name": name, "tags": ["rock", "Beach"], "categories": cats,
+                           "meta": [{"key": k, "value": v} for k, v in meta.items()]}, f)
+            for fn in files:
+                p = os.path.join(d, fn)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "w").close()
+            return d
+
+        asset("surface/rock_cliff_wdeledb", "wdeledb", "Beach Cliff", ["surface", "Rock", "cliff"],
+              {"height": "0.094 m", "scanArea": "2x2 m"},
+              ["wdeledb_4K_Albedo.jpg", "wdeledb_2K_Albedo.jpg", "wdeledb_4K_Normal.jpg",
+               "wdeledb_4K_Roughness.jpg", "wdeledb_4K_Displacement.exr", "wdeledb_Preview.png",
+               "Thumbs/1k/wdeledb_1K_Albedo.jpg"])
+        asset("3d/nature_tree_wgqvdhf", "wgqvdhf", "Broken Tree Branch", ["3d", "nature", "tree"],
+              {"length": "1.02m", "width": "0.34m", "height": "0.21m"},
+              ["wgqvdhf_LOD0.fbx", "wgqvdhf_LOD3.fbx", "wgqvdhf_8K_Albedo.jpg",
+               "wgqvdhf_8K_Normal_LOD0.jpg", "wgqvdhf_8K_Normal_LOD2.jpg", "wgqvdhf_Preview.png"])
+        asset("3dplant/plant_xefmcgrqx", "xefmcgrqx", "Small Balsam", ["3dplant", "ground cover"],
+              {"dimensions": [{"variation": 1, "length": "0.26m", "width": "0.24m", "height": "0.1m"}]},
+              ["Var1/Var1_LOD0.fbx", "Var1/Var1_LOD1.fbx", "Var2/Var2_LOD0.fbx",
+               "Textures/Atlas/xefmcgrqx_8K_Albedo.jpg", "Textures/Atlas/xefmcgrqx_8K_Normal.jpg",
+               "Textures/Billboard/Billboard_8K_Albedo.jpg", "xefmcgrqx_Preview.png"])
+        asset("brush/brush_xyz", "xyzbrush", "Brush", ["brush"], {}, ["xyzbrush_Brush.png"])
+        os.makedirs(os.path.join(self.tmp.name, "other"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_find_and_plan(self):
+        other_dir = os.path.join(self.tmp.name, "other")
+        assets, other = megascans.find_assets([self.dl, other_dir])
+        self.assertEqual(other, [other_dir])
+        by = {a.id: a for a in assets}
+        self.assertEqual(sorted(by), ["wdeledb", "wgqvdhf", "xefmcgrqx", "xyzbrush"])
+
+        surf = by["wdeledb"]
+        self.assertEqual(surf.library_name, "Beach_Cliff_wdeledb")
+        self.assertEqual(surf.category, "rock/cliff")             # lower case
+        self.assertEqual(surf.displacement_scale, 0.094)
+        self.assertTrue(surf.preview.endswith("wdeledb_Preview.png"))
+        (kind, name, files, info, _extra), = megascans.plan(surf)
+        self.assertEqual(kind, "material")
+        self.assertTrue(files["basecolor"].endswith("4K_Albedo.jpg"))   # highest resolution
+        self.assertTrue(files["displacement"].endswith(".exr"))
+        self.assertEqual(info["displacement_scale"], 0.094)
+
+        mesh = by["wgqvdhf"]
+        self.assertIsNone(mesh.displacement_scale)                # object height, not displacement
+        made = {k: (f, i) for k, _n, f, i, _e in megascans.plan(mesh)}
+        self.assertTrue(made["geometry"][0]["fbx"].endswith("LOD0.fbx"))
+        self.assertEqual(made["geometry"][1]["import_scale"], 0.01)
+        self.assertEqual(made["geometry"][1]["megascans_size_m"], 1.02)
+        self.assertTrue(made["material"][0]["normal"].endswith("Normal_LOD0.jpg"))
+
+        plant = megascans.plan(by["xefmcgrqx"])
+        names = [(k, n) for k, n, _f, _i, _e in plant]
+        self.assertEqual(names, [("geometry", "Small_Balsam_xefmcgrqx_Var1"),
+                                 ("geometry", "Small_Balsam_xefmcgrqx_Var2"),
+                                 ("material", "Small_Balsam_xefmcgrqx")])
+        self.assertEqual(plant[0][3]["megascans_size_m"], 0.26)
+        self.assertNotIn("Billboard", plant[2][2]["basecolor"])  # atlas, not billboard
+        self.assertEqual(megascans.plan(by["xyzbrush"]), [])
+
+    def test_check_scale_and_height(self):
+        info = {"import_scale": 0.01, "megascans_size_m": 1.02,
+                "bounds": [[-50.8, -5.7, -14.8], [50.9, 15.0, 19.2]]}
+        self.assertEqual(megascans.check_scale(info), 0.01)       # cm file
+        info["bounds"] = [[-0.5, 0, -0.1], [0.52, 0.2, 0.2]]
+        self.assertEqual(megascans.check_scale(info), 1.0)        # already meters
+        self.assertEqual(textures.megascans_height(
+            os.path.join(self.dl, "3d", "nature_tree_wgqvdhf")), None)
+        self.assertEqual(textures.megascans_height(
+            os.path.join(self.dl, "surface", "rock_cliff_wdeledb")), 0.094)
+
+    def test_sort_modes(self):
+        recs = [library.AssetRecord(name="b", type="material", category="x"),
+                library.AssetRecord(name="a", type="hdri", category=""),
+                library.AssetRecord(name="c", type="geometry", category="a")]
+        self.assertEqual([r.name for r in library.sort_records(recs, "type")], ["c", "b", "a"])
+        self.assertEqual([r.name for r in library.sort_records(recs, "category")], ["c", "b", "a"])
 
 
 class ManageTests(unittest.TestCase):
