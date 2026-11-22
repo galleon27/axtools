@@ -14,25 +14,58 @@ def createInterface():
     <includeInPaneTabMenu menu_position="422" create_separator="false"/>
     <help><![CDATA[= AX Asset Library =
 
-Browse a folder library of assets and load them into SOP, OBJ or LOP networks.
+Browse a folder library of geometry, materials, HDRIs and images, and load them into SOP, OBJ or LOP networks.
 
 Set the `AX_ASSET_LIB` environment variable to the library folder, or add folders in Settings.
-Each asset is a folder with an `asset.json` file:
-`<root>/geometry/<category>/<asset>/asset.json`.
+Each asset is a folder with an `asset.json` file, under a folder for its type:
+`<root>/geometry|materials|hdri|images/<category>/<asset>/asset.json`.
 
 * Double-click or press Enter to import the selected assets into the network shown in the
-  network editor. SOP gets a File or Alembic SOP, OBJ a Geometry node, LOP a Reference LOP.
-* Drag an asset onto a parameter field to paste its path.
+  network editor:
+  * Geometry: SOP gets a File or Alembic SOP, OBJ a Geometry node, LOP a Reference LOP.
+  * Materials: a menu asks for Karma, Octane or Redshift. SOP and OBJ get the material in
+    `/mat`, LOP gets a Material Library LOP. The material is not assigned to anything.
+  * HDRIs: OBJ gets an Environment Light, LOP a Dome Light.
+  * Images have no node; use __Copy path__ or drag them onto a parameter.
+* Drag an asset onto a parameter field to paste its path. A material gives its texture folder.
 * __Save selection__ writes the selected SOP node or Geometry object to the library as
   bgeo.sc (plus USD or Alembic if ticked). Saving under an existing name in the same
   category adds a new version. Pick a version in the details pane to import it, or click
   __Make current__ to make it the default.
-* __Render thumbnail__ renders a Karma thumbnail with husk in the background. Renderer,
+* __Render thumbnail__ renders a Karma thumbnail with husk in the background: the model for
+  geometry, a shader ball for materials, a chrome and a grey sphere for HDRIs. Renderer,
   samples and size are in Settings.
-* Drop geometry files or folders onto the panel to add them to the library. An image next to
-  a file with the same name (`rock.jpg`, `rock_preview.png`) becomes its thumbnail.
-* Search with words or fields: `type:geo`, `tag:rock`, `cat:trees`, `fmt:abc`, `-tag:wip`,
-  `broken`.
+* Drop files or folders onto the panel to add them to the library:
+  * Geometry files with the same name in one folder (`rock.abc`, `rock.bgeo.sc`) become one asset.
+  * Texture files are grouped into materials by their channel names (`_albedo`, `_roughness`,
+    `_normal`, `_height`, ...). Scan IDs like Megascans' are replaced by the folder name.
+  * HDR files with a 2:1 aspect become HDRIs; other images become image assets.
+  * A preview image (`rock_preview.png`, `preview.jpg`) becomes the thumbnail.
+* Right-click an asset to add it to favorites, rename it (F2), move it to another category,
+  or delete it (Del). Deleted assets go to the `.trash` folder in the library root; delete
+  them there to free the space. Drag assets onto a category in the sidebar to move them.
+  Renaming or moving relinks the nodes in the open scene; other .hip files that load the
+  asset by path need relinking.
+* The sidebar lists __Favorites__, __Recently used__ (your imports), __Recently added__ (last
+  14 days) and __In this scene__. A green dot on a thumbnail means the asset has nodes in the
+  open scene, an orange dot that some of them use an older version. Click __Update__ in the
+  details pane to point them at the current version.
+* Edit an asset's tags and notes in the details pane and click __Save tags__. Favorites and
+  recent imports are stored per user, not in the library.
+* __Add__ > __Import Megascans library...__ reads a Quixel Bridge download folder (usually
+  `Downloaded`). Each asset's `.json` gives its name, tags and category; the name gets the
+  Megascans ID appended (`Beach_Cliff_wdeledb`). Surfaces become materials, 3D assets a
+  geometry asset (most detailed LOD) plus a material, plants one geometry asset per
+  variation plus the atlas material. Files stay where they are unless you tick __Copy files
+  into the library__. Dropping a Megascans folder onto the panel does the same.
+* Megascans FBX files are in centimeters. Imports add a Transform node with scale 0.01 so the
+  asset matches the size in its metadata.
+* __List__ shows assets as rows with type, category, formats and resolution. Sort by name,
+  type, category, newest or recently changed.
+* Shortcuts in the grid: Enter imports, F2 renames, Del moves to trash, F toggles favorite,
+  Ctrl+C copies the path. Ctrl+F jumps to the search field, F5 rescans.
+* Search with words or fields: `type:mat`, `tag:rock`, `cat:trees`, `fmt:abc`, `fav:1`,
+  `-tag:wip`, `broken`.
 * F5 rescans the library. Shift-click the Rescan button to clear the cache first.
 
 After editing the code, run `ax_asset_library.dev_reload()` and reopen the panel.

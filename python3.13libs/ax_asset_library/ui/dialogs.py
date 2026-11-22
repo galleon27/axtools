@@ -9,21 +9,42 @@ Qt = QtCore.Qt
 
 
 class IngestDialog(QtWidgets.QDialog):
-    """Options for adding geometry files: target root, category, tags, copy or reference."""
+    """Options for adding files: which asset types, target root, category, tags, copy or
+    reference, and Karma thumbnails."""
 
-    def __init__(self, groups, settings, records, parent=None):
+    def __init__(self, plan, settings, records, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Add geometry to library")
+        self.setWindowTitle("Add to library")
         self.settings = settings
         self.records = records
         self.roots = settings.writable_roots()
 
         lay = QtWidgets.QVBoxLayout(self)
-        names = [g[0] for g in groups]
-        head = QtWidgets.QLabel("<b>%d asset(s)</b>: %s%s" % (
-            len(names), ", ".join(names[:8]), " ..." if len(names) > 8 else ""))
-        head.setWordWrap(True)
-        lay.addWidget(head)
+        counts = plan.counts()
+        self.type_checks = {}
+        box = QtWidgets.QGroupBox("Found")
+        grid = QtWidgets.QGridLayout(box)
+        for row, t in enumerate(t for t in schema.ASSET_TYPES if counts.get(t)):
+            items = plan.by_type(t)
+            c = QtWidgets.QCheckBox("%d %s" % (len(items), schema.TYPE_LABELS[t].lower() +
+                                               ("" if len(items) == 1 else "s")))
+            c.setChecked(True)
+            c.setToolTip("Untick to leave these out of this batch.")
+            names = ", ".join(i.name for i in items[:6]) + (" ..." if len(items) > 6 else "")
+            label = QtWidgets.QLabel(names)
+            label.setStyleSheet("color: #9aa0a8;")
+            label.setToolTip("\n".join(i.name for i in items[:60]))
+            grid.addWidget(c, row, 0)
+            grid.addWidget(label, row, 1)
+            self.type_checks[t] = c
+        grid.setColumnStretch(1, 1)
+        lay.addWidget(box)
+        if plan.skipped:
+            skipped = QtWidgets.QLabel("%d file(s) will be skipped (not geometry or images, or "
+                                       "unused previews)." % len(plan.skipped))
+            skipped.setStyleSheet("color: #9aa0a8;")
+            skipped.setToolTip("\n".join(p for p, _r in plan.skipped[:40]))
+            lay.addWidget(skipped)
 
         form = QtWidgets.QFormLayout()
         self.root_combo = QtWidgets.QComboBox()
@@ -38,8 +59,9 @@ class IngestDialog(QtWidgets.QDialog):
         self.cat_combo = QtWidgets.QComboBox()
         self.cat_combo.setEditable(True)
         self.cat_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-        self.cat_combo.setToolTip("Folder under geometry/. Use '/' for sub-folders, "
-                                  "e.g. trees/oak. Leave empty for none.")
+        self.cat_combo.setToolTip("Folder under each type folder (geometry/, materials/, hdri/, "
+                                  "images/). Use '/' for sub-folders, e.g. trees/oak. Leave "
+                                  "empty for none.")
         form.addRow("Category", self.cat_combo)
 
         self.tags_edit = QtWidgets.QLineEdit()
@@ -48,43 +70,60 @@ class IngestDialog(QtWidgets.QDialog):
         form.addRow("Tags", self.tags_edit)
 
         self.copy_check = QtWidgets.QCheckBox("Copy files into the library")
-        self.copy_check.setChecked(settings.get("copy_on_ingest"))
+        self.copy_check.setChecked(settings.get("megascans_copy" if plan.megascans
+                                                else "copy_on_ingest"))
         self.copy_check.setToolTip("On: files are copied into the asset folder (v001/).\n"
                                    "Off: the asset points at the files where they are now.")
         form.addRow("", self.copy_check)
+        if plan.megascans:
+            ms = QtWidgets.QLabel(
+                "%d Megascans asset(s): names, tags and categories come from their .json "
+                "files, and categories go under the one above. Megascans textures are large, "
+                "so files stay where they are unless you tick Copy." % plan.megascans)
+            ms.setWordWrap(True)
+            ms.setStyleSheet("color: #9aa0a8;")
+            form.addRow("", ms)
 
         self.info_check = QtWidgets.QCheckBox("Read bounds and point/prim counts")
         self.info_check.setChecked(settings.get("read_geo_info"))
-        self.info_check.setToolTip("Loads each file once to store its size and counts. "
+        self.info_check.setToolTip("Loads each geometry file once to store its size and counts. "
                                    "Slower for large files.")
+        self.info_check.setVisible(bool(counts.get("geometry")))
         form.addRow("", self.info_check)
 
-        self.render_check = QtWidgets.QCheckBox("Render missing thumbnails with Karma")
+        self.render_check = QtWidgets.QCheckBox("Render thumbnails with Karma")
         self.render_check.setChecked(settings.get("ingest_render"))
-        self.render_check.setToolTip("Assets without a matching preview image get a Karma "
-                                     "thumbnail, rendered in the background.")
+        self.render_check.setToolTip("Renders in the background: geometry and materials without "
+                                     "a preview image get one, HDRIs get a preview with a "
+                                     "chrome and a grey sphere.")
         form.addRow("", self.render_check)
         lay.addLayout(form)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
                                              QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Add")
+        self.ok = buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        self.ok.setText("Add")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
+        for c in self.type_checks.values():
+            c.toggled.connect(lambda _on: self.ok.setEnabled(bool(self.types())))
 
         self.root_combo.currentIndexChanged.connect(self._fill_categories)
         self._fill_categories()
         self.cat_combo.setEditText(settings.get("last_category"))
-        self.resize(460, self.sizeHint().height())
+        self.resize(520, self.sizeHint().height())
 
     def _fill_categories(self):
         root = self.root_combo.currentData()
         text = self.cat_combo.currentText()
         self.cat_combo.clear()
         if root:
-            self.cat_combo.addItems(library.categories(self.records, root["expanded"], "geometry"))
+            self.cat_combo.addItems(library.categories(self.records, root["expanded"]))
         self.cat_combo.setEditText(text)
+
+    def types(self):
+        return {t for t, c in self.type_checks.items() if c.isChecked()}
 
     def values(self):
         return {
@@ -94,6 +133,7 @@ class IngestDialog(QtWidgets.QDialog):
             "copy": self.copy_check.isChecked(),
             "read_info": self.info_check.isChecked(),
             "render": self.render_check.isChecked(),
+            "types": self.types(),
         }
 
 
@@ -465,3 +505,60 @@ class PublishDialog(QtWidgets.QDialog):
             "thumbnail": thumb,
             "image": self.image_edit.text() if thumb == "image" else "",
         }
+
+
+class MoveDialog(QtWidgets.QDialog):
+    """Pick a library root and category to move assets to."""
+
+    def __init__(self, records, settings, all_records, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Move %s" % (records[0].name if len(records) == 1
+                                         else "%d assets" % len(records)))
+        self.all_records = all_records
+        self.types = {r.type for r in records}
+        lay = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self.root_combo = QtWidgets.QComboBox()
+        for r in settings.writable_roots():
+            self.root_combo.addItem(r["path"], r)
+        idx = self.root_combo.findText((settings.root_for(records[0].root) or {}).get("path", ""))
+        self.root_combo.setCurrentIndex(max(0, idx))
+        self.root_combo.setToolTip("Library root to move to. Read-only roots are not listed.")
+        form.addRow("Library", self.root_combo)
+        self.cat_combo = QtWidgets.QComboBox()
+        self.cat_combo.setEditable(True)
+        self.cat_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.cat_combo.setToolTip("Category folder. Use '/' for sub-folders; leave empty for "
+                                  "none. Assets stay under their own type folder.")
+        form.addRow("Category", self.cat_combo)
+        lay.addLayout(form)
+        note = QtWidgets.QLabel("Nodes in this scene that load these assets are relinked. "
+                                "Other .hip files that load them by path need relinking "
+                                "(for example with the Asset Manager).")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #9aa0a8;")
+        lay.addWidget(note)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                             QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Move")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.root_combo.currentIndexChanged.connect(self._fill)
+        self._fill()
+        self.cat_combo.setEditText(records[0].category)
+        self.resize(460, self.sizeHint().height())
+
+    def _fill(self):
+        root = self.root_combo.currentData()
+        text = self.cat_combo.currentText()
+        self.cat_combo.clear()
+        if root:
+            cats = set()
+            for t in self.types:
+                cats.update(library.categories(self.all_records, root["expanded"], t))
+            self.cat_combo.addItems(sorted(cats, key=str.lower))
+        self.cat_combo.setEditText(text)
+
+    def values(self):
+        return self.root_combo.currentData(), self.cat_combo.currentText().strip()

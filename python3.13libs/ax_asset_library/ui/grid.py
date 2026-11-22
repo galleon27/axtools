@@ -17,6 +17,9 @@ TYPE_COLORS = {
 }
 TYPE_LETTERS = {"geometry": "G", "material": "M", "hdri": "H", "image": "I"}
 WARN_COLOR = QtGui.QColor(220, 70, 60)
+FAV_COLOR = QtGui.QColor(240, 200, 60)
+SCENE_COLOR = QtGui.QColor(90, 190, 110)
+OUTDATED_COLOR = QtGui.QColor(230, 150, 40)
 SELECT_COLOR = QtGui.QColor("#33AADD")
 
 
@@ -124,8 +127,12 @@ def tooltip(rec):
     if "polycount" in info:
         lines.append("%s prims, %s points" % (format(info["polycount"], ","),
                                               format(info.get("pointcount", 0), ",")))
+    res = info.get("resolution")
+    if isinstance(res, list) and len(res) == 2:
+        lines.append("%d x %d" % tuple(res))
     if rec.files:
-        lines.append("Formats: " + ", ".join(sorted(rec.files)))
+        lines.append(("Channels: " if rec.type == "material" else "Formats: ") +
+                     ", ".join(sorted(rec.files)))
     for p in rec.problems:
         lines.append("<span style='color:#dc463c'>%s</span>" % p)
     if rec.missing:
@@ -186,19 +193,56 @@ class AssetModel(QtCore.QAbstractListModel):
 
 
 # --- delegate --------------------------------------------------------------------------
+def _star(rect):
+    """Five-point star polygon inside rect."""
+    import math
+    cx, cy = rect.center().x() + 0.5, rect.center().y() + 0.5
+    r_out, r_in = rect.width() * 0.5, rect.width() * 0.22
+    pts = []
+    for i in range(10):
+        r = r_out if i % 2 == 0 else r_in
+        a = math.radians(-90 + i * 36)
+        pts.append(QtCore.QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
+    return QtGui.QPolygonF(pts)
+
+
 class AssetDelegate(QtWidgets.QStyledItemDelegate):
     PAD = 6
     GAP = 4
+    LIST_THUMB = 44
 
     def __init__(self, view):
         super().__init__(view)
         self.view = view
         self.size = 128
+        self.favorites = set()   # asset ids
+        self.scene = {}          # record key -> True when outdated, False when current
+        self.list_mode = False
 
     def sizeHint(self, option, index):
         fm = option.fontMetrics
+        if self.list_mode:
+            width = max(200, self.view.viewport().width() - 4)
+            return QtCore.QSize(width, self.LIST_THUMB + 8)
         return QtCore.QSize(self.size + 2 * self.PAD,
                             self.size + 2 * self.PAD + self.GAP + fm.height())
+
+    @staticmethod
+    def _detail_line(rec):
+        parts = [schema.TYPE_LABELS.get(rec.type, rec.type)]
+        if rec.category:
+            parts.append(rec.category)
+        if rec.files:
+            parts.append(", ".join(sorted(rec.files)))
+        info = rec.info or {}
+        if "polycount" in info:
+            parts.append("%s prims" % format(info["polycount"], ","))
+        res = info.get("resolution")
+        if isinstance(res, list) and len(res) == 2:
+            parts.append("%d x %d" % tuple(res))
+        if len(rec.versions) > 1:
+            parts.append(schema.version_label(rec.current))
+        return "  \u00b7  ".join(parts)
 
     def paint(self, painter, option, index):
         rec = index.data(RecordRole)
@@ -207,7 +251,9 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         cell = option.rect
-        box = QtCore.QRect(cell.x() + self.PAD, cell.y() + self.PAD, self.size, self.size)
+        size = self.LIST_THUMB if self.list_mode else self.size
+        pad = 4 if self.list_mode else self.PAD
+        box = QtCore.QRect(cell.x() + pad, cell.y() + pad, size, size)
         selected = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
         hover = bool(option.state & QtWidgets.QStyle.StateFlag.State_MouseOver)
 
@@ -217,7 +263,7 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
             bg.setAlpha(60 if selected else 40)
             painter.fillRect(cell.adjusted(1, 1, -1, -1), bg)
 
-        pix = thumb_cache().pixmap(rec.thumb, rec.thumb_mtime, self.size)
+        pix = thumb_cache().pixmap(rec.thumb, rec.thumb_mtime, size)
         painter.fillRect(box, QtGui.QColor(30, 30, 30))
         if pix is not None:
             x = box.x() + (box.width() - pix.width()) // 2
@@ -240,8 +286,28 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
         painter.drawRect(box.adjusted(0, 0, -1, -1))
 
         fm = option.fontMetrics
+        text_color = option.palette.color(QtGui.QPalette.ColorRole.Text)
+        if self.list_mode:
+            x = box.right() + 10
+            w = cell.right() - x - 4
+            line = fm.height()
+            top = cell.y() + (cell.height() - 2 * line - 2) // 2
+            f = QtGui.QFont(option.font)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(text_color)
+            painter.drawText(QtCore.QRect(x, top, w, line), Qt.AlignmentFlag.AlignVCenter,
+                             QtGui.QFontMetrics(f).elidedText(rec.name, Qt.TextElideMode.ElideMiddle, w))
+            painter.setFont(option.font)
+            dim = QtGui.QColor(text_color)
+            dim.setAlpha(150)
+            painter.setPen(dim)
+            painter.drawText(QtCore.QRect(x, top + line + 2, w, line), Qt.AlignmentFlag.AlignVCenter,
+                             fm.elidedText(self._detail_line(rec), Qt.TextElideMode.ElideRight, w))
+            painter.restore()
+            return
         text_rect = QtCore.QRect(cell.x() + 2, box.bottom() + self.GAP, cell.width() - 4, fm.height())
-        painter.setPen(option.palette.color(QtGui.QPalette.ColorRole.Text))
+        painter.setPen(text_color)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                          fm.elidedText(rec.name, Qt.TextElideMode.ElideMiddle, text_rect.width()))
         painter.restore()
@@ -250,7 +316,7 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
         color = QtGui.QColor(TYPE_COLORS.get(rec.type, QtGui.QColor(120, 120, 120)))
         color.setAlpha(90)
         f = QtGui.QFont(painter.font())
-        f.setPixelSize(max(12, self.size // 3))
+        f.setPixelSize(max(12, box.height() // 3))
         f.setBold(True)
         painter.setFont(f)
         painter.setPen(color)
@@ -284,6 +350,20 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
             painter.setPen(QtGui.QColor(230, 230, 230))
             painter.drawText(vr, Qt.AlignmentFlag.AlignCenter, label)
 
+        # Favorite star and in-scene dot, bottom left.
+        x = box.x() + 3
+        if rec.id and rec.id in self.favorites:
+            star = QtCore.QRect(x, box.bottom() - 3 - h, h, h)
+            painter.setPen(QtGui.QColor(0, 0, 0, 160))
+            painter.setBrush(FAV_COLOR)
+            painter.drawPolygon(_star(star))
+            x += h + 3
+        if rec.key in self.scene:
+            dot = QtCore.QRect(x, box.bottom() - 3 - h, h, h).adjusted(2, 2, -2, -2)
+            painter.setPen(QtGui.QColor(0, 0, 0, 160))
+            painter.setBrush(OUTDATED_COLOR if self.scene[rec.key] else SCENE_COLOR)
+            painter.drawEllipse(dot)
+
         # Warning, bottom right.
         if rec.broken or rec.missing:
             wr = QtCore.QRect(box.right() - 3 - h, box.bottom() - 3 - h, h, h)
@@ -296,6 +376,15 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
 
 # --- view ------------------------------------------------------------------------------
 class AssetView(QtWidgets.QListView):
+    """Thumbnail grid. Import is double-click or Enter only: Houdini's style turns on
+    single-click activation, so QAbstractItemView.activated can't be used for it."""
+
+    import_requested = QtCore.Signal()
+    delete_requested = QtCore.Signal()
+    rename_requested = QtCore.Signal()
+    copy_requested = QtCore.Signal()
+    favorite_requested = QtCore.Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
@@ -318,10 +407,64 @@ class AssetView(QtWidgets.QListView):
 
     def set_thumb_size(self, size):
         self.delegate.size = int(size)
-        opt = QtWidgets.QStyleOptionViewItem()
-        opt.initFrom(self)
-        self.setGridSize(self.delegate.sizeHint(opt, QtCore.QModelIndex()))
+        self._relayout()
+
+    def set_list_mode(self, on):
+        self.delegate.list_mode = bool(on)
+        self.setViewMode(QtWidgets.QListView.ViewMode.ListMode if on
+                         else QtWidgets.QListView.ViewMode.IconMode)
+        self.setWrapping(not on)
+        self.setMovement(QtWidgets.QListView.Movement.Static)
+        self.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+        self.setSpacing(0 if on else 2)
+        self._relayout()
+
+    def _relayout(self):
+        if self.delegate.list_mode:
+            self.setGridSize(QtCore.QSize())
+        else:
+            opt = QtWidgets.QStyleOptionViewItem()
+            opt.initFrom(self)
+            self.setGridSize(self.delegate.sizeHint(opt, QtCore.QModelIndex()))
         self.doItemsLayout()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.delegate.list_mode:   # rows follow the view width
+            self.doItemsLayout()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and \
+                self.indexAt(event.position().toPoint()).isValid():
+            event.accept()
+            self.import_requested.emit()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and \
+                self.selectionModel().hasSelection():
+            event.accept()
+            self.import_requested.emit()
+            return
+        if event.key() == Qt.Key.Key_Delete and self.selectionModel().hasSelection():
+            event.accept()
+            self.delete_requested.emit()
+            return
+        if event.key() == Qt.Key.Key_F2 and self.selectionModel().hasSelection():
+            event.accept()
+            self.rename_requested.emit()
+            return
+        if event.matches(QtGui.QKeySequence.StandardKey.Copy) and self.selectionModel().hasSelection():
+            event.accept()
+            self.copy_requested.emit()
+            return
+        if event.key() == Qt.Key.Key_F and not event.modifiers() and \
+                self.selectionModel().hasSelection():
+            event.accept()
+            self.favorite_requested.emit()
+            return
+        super().keyPressEvent(event)
 
     def selected_records(self):
         rows = sorted(i.row() for i in self.selectionModel().selectedIndexes())

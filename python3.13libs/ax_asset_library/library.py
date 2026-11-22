@@ -137,6 +137,18 @@ def _refresh_dynamic(rec):
         rec.thumb_mtime = None
 
 
+def load_record(asset_dir, root):
+    """AssetRecord for one asset folder inside `root`, read straight from its asset.json."""
+    rel = os.path.relpath(asset_dir, root).replace("\\", "/").split("/")
+    folder_type = schema.FOLDER_TYPES.get(rel[0], "") if rel else ""
+    category = "/".join(rel[1:-1])
+    sidecar = os.path.join(asset_dir, schema.SIDECAR)
+    mtime = os.path.getmtime(sidecar)
+    rec = _record_from_sidecar(schema.load(sidecar), asset_dir, root, category, folder_type, mtime)
+    _refresh_dynamic(rec)
+    return rec
+
+
 def scan_root(root, cached=None):
     """Scan one root. `cached` is {key: {"mtime", "record"}} from a previous scan.
 
@@ -301,7 +313,8 @@ TYPE_ALIASES = {
     "hdri": "hdri", "hdr": "hdri", "env": "hdri",
     "img": "image", "image": "image",
 }
-QUERY_FIELDS = ("type", "tag", "cat", "name", "fmt")
+QUERY_FIELDS = ("type", "tag", "cat", "name", "fmt", "fav")
+_YES = ("1", "yes", "y", "true", "on")
 
 _TOKEN = re.compile(r'(-)?(?:([A-Za-z]+):)?(?:"([^"]*)"?|(\S+))')
 
@@ -311,12 +324,14 @@ class Query:
 
     Free words must all match (name, tags, category or description). Field tokens:
         type:hdri   tag:rock   cat:trees   name:oak   fmt:abc
+    fav:1 keeps favorites (asset ids in `favorites`).
     A leading '-' excludes: -tag:wip, -broken. Quotes group words: tag:"red oak".
     Several values for the same field are OR-ed (type:geo type:hdri).
     """
 
-    def __init__(self, text=""):
+    def __init__(self, text="", favorites=None):
         self.text = text
+        self.favorites = favorites or set()
         self.terms, self.neg_terms = [], []
         self.fields, self.neg_fields = {}, {}
         for m in _TOKEN.finditer(text or ""):
@@ -342,8 +357,9 @@ class Query:
     def empty(self):
         return not (self.terms or self.neg_terms or self.fields or self.neg_fields)
 
-    @staticmethod
-    def _field_match(rec, field, value):
+    def _field_match(self, rec, field, value):
+        if field == "fav":
+            return (rec.id in self.favorites) == (value in _YES)
         if field == "type":
             return rec.type == value
         if field == "tag":
@@ -389,7 +405,12 @@ class Query:
 def sort_records(records, mode="name"):
     """Sort by name, or newest first by "added"/"modified" (ties stay in name order)."""
     out = sorted(records, key=lambda r: (r.name.lower(), r.category.lower()))
-    if mode == "added":
+    if mode == "type":
+        order = {t: i for i, t in enumerate(schema.ASSET_TYPES)}
+        out.sort(key=lambda r: order.get(r.type, 99))
+    elif mode == "category":
+        out.sort(key=lambda r: (r.category == "", r.category.lower()))
+    elif mode == "added":
         out.sort(key=lambda r: r.created or "", reverse=True)
     elif mode == "modified":
         out.sort(key=lambda r: r.modified or "", reverse=True)

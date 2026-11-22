@@ -29,6 +29,14 @@ DEFAULTS = {
     "copy_on_ingest": True,
     "read_geo_info": True,
     "ingest_render": False,
+    "megascans_copy": False,       # Megascans textures are large: reference in place by default
+    "megascans_dir": "",
+    "list_mode": False,
+    "material_renderer": "karma",  # last renderer picked for a material import
+    # per-user collections (asset ids), kept here so a shared library never gets write conflicts
+    "favorites": [],
+    "recent": [],                  # [[asset id, iso time], ...], newest first
+    "recent_limit": 50,
     "last_ingest_dir": "",
     "last_category": "",
     # publish
@@ -135,6 +143,32 @@ class Prefs:
     def writable_roots(self):
         return [r for r in self.roots() if not r["read_only"]]
 
+
+# --- favorites / recently used -------------------------------------------------------------
+def favorites(settings):
+    return set(settings.get("favorites"))
+
+
+def set_favorite(settings, asset_ids, on):
+    favs = [f for f in settings.get("favorites") if f not in asset_ids]
+    if on:
+        favs.extend(asset_ids)
+    settings.set("favorites", favs)
+
+
+def recent(settings):
+    """{asset id: iso time} of recently imported assets."""
+    out = {}
+    for item in settings.get("recent"):
+        if isinstance(item, list) and len(item) == 2 and item[0] not in out:
+            out[item[0]] = item[1]
+    return out
+
+
+def add_recent(settings, asset_ids, when):
+    keep = [i for i in settings.get("recent") if isinstance(i, list) and i and i[0] not in asset_ids]
+    items = [[a, when] for a in asset_ids] + keep
+    settings.set("recent", items[:max(1, int(settings.get("recent_limit")))])
 
 def parm_path(abs_path, root, path_mode="token"):
     """Path to write into a node parm.

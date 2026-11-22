@@ -11,7 +11,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
 
-from ax_asset_library import karma, library, prefs, schema  # noqa: E402
+from ax_asset_library import (karma, library, manage, megascans, prefs, schema,  # noqa: E402
+                              textures)
 
 try:
     import pxr  # noqa: F401
@@ -238,8 +239,8 @@ class KarmaTests(unittest.TestCase):
         dist = sum((eye[i] - center[i]) ** 2 for i in range(3)) ** 0.5
         import math
         half_fov = math.atan(karma.APERTURE / 2 / karma.FOCAL)
-        self.assertGreaterEqual(math.asin(radius / dist), 0)
-        self.assertLess(math.asin(radius / dist), half_fov)   # sphere inside the frame
+        # The sphere's silhouette is cropped by `margin` (0.85): about the frame size.
+        self.assertAlmostEqual(radius / dist, math.sin(half_fov) / 0.85, places=6)
         self.assertGreater(eye[1], center[1])                 # looking down a bit
         self.assertTrue(0 < near < dist - radius < dist + radius < far)
 
@@ -272,8 +273,10 @@ class KarmaTests(unittest.TestCase):
             self.assertEqual(stage.GetMetadata("renderSettingsPrimPath"), karma.SETTINGS_PATH)
             self.assertEqual(settings.GetPrim().GetAttribute(
                 "karma:global:pathtracedsamples").Get(), 8)
-            product = UsdRender.Product(stage.GetPrimAtPath("/Render/Products/thumb"))
-            self.assertEqual(product.GetProductNameAttr().Get(), image.replace("\\", "/"))
+            # No render products: husk refuses vars without its aov tokens and writes its
+            # default beauty to --output instead.
+            self.assertFalse(settings.GetProductsRel().GetTargets())
+            self.assertFalse([p for p in stage.Traverse() if p.IsA(UsdRender.Var)])
             cam = UsdGeom.Camera(stage.GetPrimAtPath("/AXThumb/cam"))
             # The camera looks at the bounds center: center projects to the middle of the frame.
             xf = cam.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
@@ -281,6 +284,291 @@ class KarmaTests(unittest.TestCase):
             self.assertAlmostEqual(p[0], 0, places=6)
             self.assertAlmostEqual(p[1], 0, places=6)
             self.assertLess(p[2], 0)                                    # in front (-Z)
+
+
+class TextureTests(unittest.TestCase):
+    def test_classify(self):
+        c = textures.classify
+        self.assertEqual(c("Rock_Wall_2K_Roughness.jpg"), ("Rock_Wall", "roughness"))
+        self.assertEqual(c("rock_wall_diff_2k.jpg"), ("rock_wall", "basecolor"))
+        self.assertEqual(c("rock_wall_nor_gl_4k.exr"), ("rock_wall", "normal"))
+        self.assertEqual(c("Metal_Plate_BaseColor.png"), ("Metal_Plate", "basecolor"))
+        self.assertEqual(c("Metal_Plate_Base_Color.png"), ("Metal_Plate", "basecolor"))
+        self.assertEqual(c("Metal_Plate_Roughness.png"), ("Metal_Plate", "roughness"))
+        self.assertEqual(c("vgvlbhqn_2K_Normal_LOD0.jpg"), ("vgvlbhqn", "normal"))
+        self.assertEqual(c("bricks_ambient_occlusion.png"), ("bricks", "ao"))
+        self.assertEqual(c("bricks_Cavity.jpg"), ("bricks", "other"))
+        self.assertEqual(c("holiday_photo.jpg"), (None, None))
+        self.assertTrue(textures.is_preview("vgvlbhqn_Preview.png"))
+        self.assertFalse(textures.is_preview("bricks_albedo.png"))
+
+    def _touch(self, d, *names):
+        for n in names:
+            p = os.path.join(d, n)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").close()
+        return [os.path.join(d, n) for n in names]
+
+    def test_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = self._touch(
+                d,
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Albedo.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Normal_LOD0.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Normal_LOD2.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Displacement.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Displacement.exr",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_2K_Cavity.jpg",
+                "rock_cliff_vgvlbhqn/vgvlbhqn_Preview.png",
+                "mixed/wood_diff_2k.jpg", "mixed/wood_rough_2k.jpg",
+                "mixed/wood_nor_dx_2k.jpg", "mixed/wood_nor_gl_2k.jpg",
+                "mixed/metal_BaseColor.png", "mixed/metal_Metallic.png",
+                "mixed/onlyao_ao.png",
+                "mixed/photo.jpg", "mixed/sky.hdr", "mixed/notes.txt")
+            sets, leftovers, previews = textures.group(files)
+            by_name = {s.name: s for s in sets}
+            self.assertEqual(sorted(by_name), ["metal", "rock_cliff_vgvlbhqn", "wood"])
+            ms = by_name["rock_cliff_vgvlbhqn"]           # scan ID -> folder name
+            self.assertTrue(ms.channels["normal"].endswith("Normal_LOD0.jpg"))
+            self.assertTrue(ms.channels["displacement"].endswith(".exr"))
+            self.assertTrue(ms.preview.endswith("Preview.png"))
+            self.assertEqual(len(ms.extra), 3)             # LOD2, jpg disp, cavity
+            self.assertTrue(by_name["wood"].channels["normal"].endswith("nor_gl_2k.jpg"))
+            self.assertIsNone(by_name["wood"].preview)      # two sets in mixed/, no named preview
+            names = sorted(os.path.basename(p) for p in leftovers)
+            self.assertEqual(names, ["onlyao_ao.png", "photo.jpg", "sky.hdr"])
+            self.assertEqual(previews, [])
+
+    def test_single_set_without_preview(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = self._touch(d, "bark/bark_Albedo.jpg", "bark/bark_Normal.jpg")
+            sets, _left, _prev = textures.group(files)
+            self.assertEqual(len(sets), 1)
+            self.assertIsNone(sets[0].preview)
+
+    def test_hdri_and_height(self):
+        self.assertTrue(textures.looks_like_hdri("a.hdr"))
+        self.assertTrue(textures.looks_like_hdri("a.exr", (4096, 2048)))
+        self.assertFalse(textures.looks_like_hdri("a.exr", (1024, 1024)))
+        self.assertFalse(textures.looks_like_hdri("a.jpg", (4096, 2048)))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(textures.megascans_height(d))
+            with open(os.path.join(d, "x.json"), "w") as f:
+                json.dump({"meta": [{"key": "height", "value": "0.02 m"}]}, f)
+            self.assertEqual(textures.megascans_height(d), 0.02)
+
+
+class StageTests(unittest.TestCase):
+    @unittest.skipUnless(HAVE_PXR, "pxr not available")
+    def test_material_and_hdri_stages(self):
+        from pxr import Usd, UsdGeom, UsdLux, UsdShade
+        with tempfile.TemporaryDirectory() as d:
+            stage_path, image = karma.work_paths(d)
+            maps = {"basecolor": os.path.join(d, "a_albedo.png"),
+                    "normal": os.path.join(d, "a_normal.png"),
+                    "roughness": os.path.join(d, "a_rough.png")}
+            karma.write_material_stage(stage_path, maps, image, 128, 4)
+            st = Usd.Stage.Open(stage_path)
+            ball = st.GetPrimAtPath("/AXThumb/ball")
+            self.assertTrue(UsdGeom.PrimvarsAPI(ball).GetPrimvar("st").IsDefined())
+            mat, _rel = UsdShade.MaterialBindingAPI(ball).ComputeBoundMaterial()
+            self.assertEqual(mat.GetPath().pathString, "/AXThumb/materials/asset")
+            surf = mat.ComputeSurfaceSource("mtlx")[0]
+            self.assertEqual(surf.GetIdAttr().Get(), "ND_standard_surface_surfaceshader")
+            src = surf.GetInput("base_color").GetConnectedSources()[0][0].source
+            tex = UsdShade.Shader(src.GetPrim())
+            self.assertEqual(tex.GetIdAttr().Get(), "ND_tiledimage_color3")
+            self.assertEqual(tex.GetInput("file").GetAttr().GetColorSpace(), "srgb_texture")
+            nsrc = surf.GetInput("normal").GetConnectedSources()[0][0].source
+            self.assertEqual(UsdShade.Shader(nsrc.GetPrim()).GetIdAttr().Get(), "ND_normalmap_float")
+
+            hdir = os.path.join(d, "hdri")  # one work folder per render, as in the queue
+            os.makedirs(hdir)
+            stage_path, image = karma.work_paths(hdir)
+            karma.write_hdri_stage(stage_path, os.path.join(d, "sky.hdr"), image, 128, 4)
+            st = Usd.Stage.Open(stage_path)
+            dome = UsdLux.DomeLight(st.GetPrimAtPath("/AXThumb/dome"))
+            self.assertTrue(dome.GetTextureFileAttr().Get().path.endswith("sky.hdr"))
+            self.assertTrue(dome.GetPrim().GetAttribute("karma:light:renderlightgeo").Get())
+            self.assertTrue(st.GetPrimAtPath("/AXThumb/chrome"))
+
+
+class MegascansTests(unittest.TestCase):
+    """Fake Bridge download with the folder layout and JSON keys of real Megascans assets."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dl = os.path.join(self.tmp.name, "Downloaded")
+
+        def asset(rel, aid, name, cats, meta, files):
+            d = os.path.join(self.dl, rel)
+            os.makedirs(d)
+            with open(os.path.join(d, aid + ".json"), "w") as f:
+                json.dump({"id": aid, "name": name, "tags": ["rock", "Beach"], "categories": cats,
+                           "meta": [{"key": k, "value": v} for k, v in meta.items()]}, f)
+            for fn in files:
+                p = os.path.join(d, fn)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "w").close()
+            return d
+
+        asset("surface/rock_cliff_wdeledb", "wdeledb", "Beach Cliff", ["surface", "Rock", "cliff"],
+              {"height": "0.094 m", "scanArea": "2x2 m"},
+              ["wdeledb_4K_Albedo.jpg", "wdeledb_2K_Albedo.jpg", "wdeledb_4K_Normal.jpg",
+               "wdeledb_4K_Roughness.jpg", "wdeledb_4K_Displacement.exr", "wdeledb_Preview.png",
+               "Thumbs/1k/wdeledb_1K_Albedo.jpg"])
+        asset("3d/nature_tree_wgqvdhf", "wgqvdhf", "Broken Tree Branch", ["3d", "nature", "tree"],
+              {"length": "1.02m", "width": "0.34m", "height": "0.21m"},
+              ["wgqvdhf_LOD0.fbx", "wgqvdhf_LOD3.fbx", "wgqvdhf_8K_Albedo.jpg",
+               "wgqvdhf_8K_Normal_LOD0.jpg", "wgqvdhf_8K_Normal_LOD2.jpg", "wgqvdhf_Preview.png"])
+        asset("3dplant/plant_xefmcgrqx", "xefmcgrqx", "Small Balsam", ["3dplant", "ground cover"],
+              {"dimensions": [{"variation": 1, "length": "0.26m", "width": "0.24m", "height": "0.1m"}]},
+              ["Var1/Var1_LOD0.fbx", "Var1/Var1_LOD1.fbx", "Var2/Var2_LOD0.fbx",
+               "Textures/Atlas/xefmcgrqx_8K_Albedo.jpg", "Textures/Atlas/xefmcgrqx_8K_Normal.jpg",
+               "Textures/Billboard/Billboard_8K_Albedo.jpg", "xefmcgrqx_Preview.png"])
+        asset("brush/brush_xyz", "xyzbrush", "Brush", ["brush"], {}, ["xyzbrush_Brush.png"])
+        os.makedirs(os.path.join(self.tmp.name, "other"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_find_and_plan(self):
+        other_dir = os.path.join(self.tmp.name, "other")
+        assets, other = megascans.find_assets([self.dl, other_dir])
+        self.assertEqual(other, [other_dir])
+        by = {a.id: a for a in assets}
+        self.assertEqual(sorted(by), ["wdeledb", "wgqvdhf", "xefmcgrqx", "xyzbrush"])
+
+        surf = by["wdeledb"]
+        self.assertEqual(surf.library_name, "Beach_Cliff_wdeledb")
+        self.assertEqual(surf.category, "rock/cliff")             # lower case
+        self.assertEqual(surf.displacement_scale, 0.094)
+        self.assertTrue(surf.preview.endswith("wdeledb_Preview.png"))
+        (kind, name, files, info, _extra), = megascans.plan(surf)
+        self.assertEqual(kind, "material")
+        self.assertTrue(files["basecolor"].endswith("4K_Albedo.jpg"))   # highest resolution
+        self.assertTrue(files["displacement"].endswith(".exr"))
+        self.assertEqual(info["displacement_scale"], 0.094)
+
+        mesh = by["wgqvdhf"]
+        self.assertIsNone(mesh.displacement_scale)                # object height, not displacement
+        made = {k: (f, i) for k, _n, f, i, _e in megascans.plan(mesh)}
+        self.assertTrue(made["geometry"][0]["fbx"].endswith("LOD0.fbx"))
+        self.assertEqual(made["geometry"][1]["import_scale"], 0.01)
+        self.assertEqual(made["geometry"][1]["megascans_size_m"], 1.02)
+        self.assertTrue(made["material"][0]["normal"].endswith("Normal_LOD0.jpg"))
+
+        plant = megascans.plan(by["xefmcgrqx"])
+        names = [(k, n) for k, n, _f, _i, _e in plant]
+        self.assertEqual(names, [("geometry", "Small_Balsam_xefmcgrqx_Var1"),
+                                 ("geometry", "Small_Balsam_xefmcgrqx_Var2"),
+                                 ("material", "Small_Balsam_xefmcgrqx")])
+        self.assertEqual(plant[0][3]["megascans_size_m"], 0.26)
+        self.assertNotIn("Billboard", plant[2][2]["basecolor"])  # atlas, not billboard
+        self.assertEqual(megascans.plan(by["xyzbrush"]), [])
+
+    def test_check_scale_and_height(self):
+        info = {"import_scale": 0.01, "megascans_size_m": 1.02,
+                "bounds": [[-50.8, -5.7, -14.8], [50.9, 15.0, 19.2]]}
+        self.assertEqual(megascans.check_scale(info), 0.01)       # cm file
+        info["bounds"] = [[-0.5, 0, -0.1], [0.52, 0.2, 0.2]]
+        self.assertEqual(megascans.check_scale(info), 1.0)        # already meters
+        self.assertEqual(textures.megascans_height(
+            os.path.join(self.dl, "3d", "nature_tree_wgqvdhf")), None)
+        self.assertEqual(textures.megascans_height(
+            os.path.join(self.dl, "surface", "rock_cliff_wdeledb")), 0.094)
+
+    def test_sort_modes(self):
+        recs = [library.AssetRecord(name="b", type="material", category="x"),
+                library.AssetRecord(name="a", type="hdri", category=""),
+                library.AssetRecord(name="c", type="geometry", category="a")]
+        self.assertEqual([r.name for r in library.sort_records(recs, "type")], ["c", "b", "a"])
+        self.assertEqual([r.name for r in library.sort_records(recs, "category")], ["c", "b", "a"])
+
+
+class ManageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "lib")
+        self.root2 = os.path.join(self.tmp.name, "lib2")
+        self.asset, _ = make_asset(self.root, "geometry", "rocks/big", "Boulder", tags=["rock"])
+        make_asset(self.root, "geometry", "rocks", "Pebble")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def scan(self, *roots):
+        recs, _ = library.scan_roots(list(roots or [self.root]), os.path.join(self.tmp.name, "c"),
+                                     use_cache=False)
+        return {r.name: r for r in recs}
+
+    def test_meta(self):
+        manage.set_meta(self.asset, "Granite, rock", "  big one ")
+        rec = self.scan()["Boulder"]
+        self.assertEqual(rec.tags, ["granite", "rock"])
+        self.assertEqual(rec.description, "big one")
+        manage.set_meta(self.asset, description="")
+        self.assertEqual(self.scan()["Boulder"].tags, ["granite", "rock"])
+
+    def test_rename(self):
+        new = manage.rename(self.asset, "Big Boulder")
+        self.assertEqual(os.path.basename(new), "Big_Boulder")
+        recs = self.scan()
+        self.assertIn("Big_Boulder", recs)
+        self.assertFalse(recs["Big_Boulder"].missing)       # relative paths still resolve
+        with self.assertRaises(manage.ManageError):
+            manage.rename(new, "   ")                          # empty name
+        rec = library.load_record(new, self.root)
+        self.assertEqual((rec.name, rec.category), ("Big_Boulder", "rocks/big"))
+
+    def test_rename_conflict_and_case(self):
+        pebble = os.path.join(self.root, "geometry", "rocks", "Pebble")
+        other = manage.move(pebble, "geometry", self.root, self.root, "rocks/big")
+        with self.assertRaises(manage.ManageError):
+            manage.rename(other, "Boulder")
+        new = manage.rename(self.asset, "boulder")           # case-only rename
+        self.assertEqual(os.path.basename(new), "boulder")
+        self.assertEqual(schema.load(os.path.join(new, "asset.json"))["name"], "boulder")
+
+    def test_move_and_prune(self):
+        new = manage.move(self.asset, "geometry", self.root, self.root, "stones")
+        rec = self.scan()["Boulder"]
+        self.assertEqual(rec.category, "stones")
+        self.assertEqual(schema.load(os.path.join(new, "asset.json"))["category"], "stones")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "geometry", "rocks", "big")))
+        self.assertTrue(os.path.exists(os.path.join(self.root, "geometry", "rocks")))  # Pebble
+        self.assertEqual(manage.move(new, "geometry", self.root, self.root, "stones"), new)
+        other = manage.move(new, "geometry", self.root, self.root2, "")
+        self.assertEqual(self.scan(self.root2)["Boulder"].category, "")
+        self.assertTrue(os.path.isdir(other))
+
+    def test_trash(self):
+        dst = manage.trash(self.asset, self.root, "geometry")
+        self.assertTrue(dst.startswith(os.path.join(self.root, ".trash")))
+        self.assertNotIn("Boulder", self.scan())
+        # A second asset with the same name gets its own trash folder.
+        again, _ = make_asset(self.root, "geometry", "rocks", "Boulder")
+        self.assertNotEqual(manage.trash(again, self.root, "geometry"), dst)
+
+
+class CollectionTests(unittest.TestCase):
+    def test_favorites_recent_query(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = prefs.Prefs(os.path.join(d, "p.json"))
+            prefs.set_favorite(s, ["a", "b"], True)
+            prefs.set_favorite(s, ["a"], False)
+            self.assertEqual(prefs.favorites(s), {"b"})
+            s.set("recent_limit", 2)
+            prefs.add_recent(s, ["x"], "2026-01-01")
+            prefs.add_recent(s, ["y"], "2026-01-02")
+            prefs.add_recent(s, ["x"], "2026-01-03")
+            prefs.add_recent(s, ["z"], "2026-01-04")
+            self.assertEqual(prefs.recent(s), {"z": "2026-01-04", "x": "2026-01-03"})
+            recs = [library.AssetRecord(id="b", name="B"), library.AssetRecord(id="c", name="C")]
+            q = library.Query("fav:1", prefs.favorites(s))
+            self.assertEqual([r.name for r in recs if q.matches(r)], ["B"])
+            q = library.Query("-fav:1", prefs.favorites(s))
+            self.assertEqual([r.name for r in recs if q.matches(r)], ["C"])
 
 
 class QueryTests(unittest.TestCase):
