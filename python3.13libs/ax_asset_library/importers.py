@@ -24,7 +24,23 @@ LOP_DOME_TYPES = ("domelight::3.0", "domelight::2.0", "domelight")
 DOME_TEXTURE_PARMS = ("xn__inputstexturefile_r3ah", "texture_file")
 TYPE_KEYS = {"hdri": ["hdri"], "image": ["image"]}
 
-CONTEXT_LABELS = {"sop": "SOP", "obj": "OBJ", "lop": "LOP"}
+CONTEXT_LABELS = {"sop": "SOP", "obj": "OBJ", "lop": "LOP", "vop": "material network",
+                  None: "/mat"}
+# Node types whose child network holds materials. /mat itself has type "mat".
+MATERIAL_CONTAINERS = ("matnet", "mat", "materiallibrary")
+# Where each asset type can be imported; ctx None = any other context (materials go to /mat).
+ALLOWED_CONTEXTS = {
+    "geometry": ("sop", "obj", "lop"),
+    "hdri": ("obj", "lop"),
+    "material": ("sop", "obj", "lop", "vop", None),
+    "image": (),
+}
+TYPE_WHERE = {
+    "geometry": "a SOP, OBJ or LOP network",
+    "hdri": "an OBJ network (Environment Light) or a LOP network (Dome Light)",
+    "material": "any network",
+    "image": "no network (use Copy path, or drag the image onto a parameter)",
+}
 
 
 class AssetImportError(Exception):
@@ -48,7 +64,24 @@ def target_editor():
     return editors[0] if editors else None
 
 
+def material_container(network):
+    """The material network `network` is in: itself when it is /mat, a Material Network or a
+    Material Library LOP, else the nearest such parent while still inside VOP networks
+    (e.g. from inside a Karma Material Builder). None when there is none."""
+    node = network
+    while node is not None:
+        if node.path() == "/mat" or node.type().name() in MATERIAL_CONTAINERS:
+            return node
+        if node.childTypeCategory() != hou.vopNodeTypeCategory():
+            return None
+        node = node.parent()
+    return None
+
+
 def context_of(network):
+    """"sop", "obj", "lop", "vop" (in a material network) or None (any other context)."""
+    if material_container(network) is not None:
+        return "vop"
     cat = network.childTypeCategory()
     if cat == hou.sopNodeTypeCategory():
         return "sop"
@@ -60,17 +93,30 @@ def context_of(network):
 
 
 def check_target(editor, network):
-    """Context of `network`, or raise AssetImportError with a readable reason.
+    """Context of `network` (see context_of). `editor` may be None (a drop names its network).
 
-    `editor` may be None (a drop can name its network without a pane)."""
-    ctx = context_of(network)
-    if ctx is None:
-        raise AssetImportError(
-            "The network editor shows %s. Go to a SOP, OBJ or LOP network to import assets."
-            % network.path())
-    if network.isInsideLockedHDA():
-        raise AssetImportError("%s is inside a locked HDA." % network.path())
-    return ctx
+    A locked HDA is checked in import_records: a material from inside one still goes to
+    /mat or a material network above, so the network alone doesn't block an import."""
+    return context_of(network)
+
+
+def is_locked(network):
+    """True when nodes can't be created in `network`: it is a locked HDA (the network editor
+    shows its inside) or sits inside one."""
+    try:
+        return network.isLockedHDA() or network.isInsideLockedHDA()
+    except AttributeError:   # nodes without HDA methods
+        return network.isInsideLockedHDA()
+
+
+def creates_in_network(rec_type, network, ctx):
+    """True when importing a `rec_type` asset with context `ctx` creates nodes in `network`
+    itself (rather than in /mat or a material network above it)."""
+    if rec_type in ("geometry", "hdri"):
+        return True
+    if rec_type == "material":
+        return ctx == "lop" or (ctx == "vop" and material_container(network) == network)
+    return False
 
 
 def current_target():
@@ -204,6 +250,8 @@ def _sop_scale(parent, loader, rec):
 
 
 def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
+    if ctx not in ALLOWED_CONTEXTS["geometry"]:
+        raise AssetImportError("geometry imports into %s." % TYPE_WHERE["geometry"])
     path, value = file_for(rec, settings, version)
     if ctx == "sop":
         node = _sop_loader(network, rec, path, value)
@@ -270,12 +318,24 @@ def _import_material(rec, network, ctx, pos, anchor, settings, version, opts):
             _tag_node(lib, rec, settings, version)
             _tag_node(mat, rec, settings, version)
             return lib
-        matnet = hou.node("/mat")
-        if matnet is None:
+        if ctx == "vop":
+            parent = material_container(network)
+            in_place = parent == network      # else: we're inside a material, go up
+        else:
+            parent = hou.node("/mat")
+            in_place = False
+        if parent is None:
             raise AssetImportError("/mat not found.")
-        mat = materials.build(matnet, unique_name(matnet, rec.name), maps, renderer,
-                              disp_scale=disp)
-        mat.moveToGoodPosition()
+        if is_locked(parent):
+            raise AssetImportError("%s is inside a locked HDA." % parent.path())
+        # Inside a Material Library LOP the Redshift material must be the USD builder.
+        usd = parent.type().name() == "materiallibrary"
+        mat = materials.build(parent, unique_name(parent, rec.name), maps, renderer,
+                              lop=usd, disp_scale=disp)
+        if in_place:
+            mat.setPosition(pos)
+        else:
+            mat.moveToGoodPosition()
         _tag_node(mat, rec, settings, version)
         return mat
     except materials.MaterialError as e:
@@ -285,9 +345,8 @@ def _import_material(rec, network, ctx, pos, anchor, settings, version, opts):
 # --- HDRIs / images ---------------------------------------------------------------------
 def _import_hdri(rec, network, ctx, pos, anchor, settings, version, opts):
     _path, value = file_for(rec, settings, version)
-    if ctx == "sop":
-        raise AssetImportError("HDRIs import into an OBJ network (Environment Light) or a "
-                               "LOP network (Dome Light).")
+    if ctx not in ALLOWED_CONTEXTS["hdri"]:
+        raise AssetImportError("HDRIs import into %s." % TYPE_WHERE["hdri"])
     if ctx == "obj":
         light = network.createNode("envlight", unique_name(network, rec.name))
         if _set_first(light, ("env_map",), value) is None:
@@ -338,12 +397,15 @@ def import_records(records, settings, version=None, renderer=None, target=None,
     if unsupported and len(unsupported) == len({r.type for r in records}):
         raise AssetImportError("Import for %s assets is not available yet."
                                % ", ".join(unsupported))
-    if all(r.type == "image" for r in records):
-        raise AssetImportError("Images have no node to create. Use Copy path, or drag the "
-                               "image onto a parameter.")
-    if ctx == "sop" and all(r.type == "hdri" for r in records):
-        raise AssetImportError("HDRIs import into an OBJ network (Environment Light) or a "
-                               "LOP network (Dome Light).")
+    if not any(ctx in ALLOWED_CONTEXTS.get(r.type, ()) for r in records):
+        where = "; ".join("%s: %s" % (schema.TYPE_LABELS.get(t, t), TYPE_WHERE[t])
+                          for t in sorted({r.type for r in records}) if t in TYPE_WHERE)
+        raise AssetImportError("These assets can't be imported into %s. %s."
+                               % (network.path(), where))
+    if is_locked(network) and any(
+            ctx in ALLOWED_CONTEXTS.get(r.type, ()) and creates_in_network(r.type, network, ctx)
+            for r in records):
+        raise AssetImportError("%s is inside a locked HDA." % network.path())
     opts = {"renderer": renderer}
 
     # A drop has its own position: don't wire to whatever node happens to be selected.

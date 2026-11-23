@@ -708,17 +708,23 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         recs = self.view.selected_records()
         menu = QtWidgets.QMenu(self)
         if recs:
+            possible = True
             try:
-                _e, _n, ctx = importers.current_target()
-                label = "Import into %s" % importers.CONTEXT_LABELS[ctx]
+                _e, network, ctx = importers.current_target()
+                label = "Import into %s" % importers.CONTEXT_LABELS.get(ctx, "this network")
+                # Don't offer a place the selection can't go (e.g. geometry from /out).
+                if not any(ctx in importers.ALLOWED_CONTEXTS.get(r.type, ()) for r in recs):
+                    label = "Import (not possible in %s)" % network.path()
+                    possible = False
             except importers.AssetImportError:
                 label = "Import"
-            if any(r.type == "material" for r in recs):
+            if possible and any(r.type == "material" for r in recs):
                 for key, rlabel in materials.available_renderers():
                     menu.addAction("%s as %s material" % (label, rlabel),
                                    lambda k=key: self._import_selected(k))
             else:
-                menu.addAction(label, lambda: self._import_selected())
+                act = menu.addAction(label, lambda: self._import_selected())
+                act.setEnabled(possible)
             menu.addAction("Copy path", self._copy_paths)
             if len(recs) == 1:
                 menu.addAction("Show in folder", self._reveal_selected)

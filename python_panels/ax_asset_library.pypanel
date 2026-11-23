@@ -24,7 +24,11 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
   network editor:
   * Geometry: SOP gets a File or Alembic SOP, OBJ a Geometry node, LOP a Reference LOP.
   * Materials: a menu asks for Karma, Octane or Redshift. SOP and OBJ get the material in
-    `/mat`, LOP gets a Material Library LOP. The material is not assigned to anything.
+    `/mat`, LOP gets a Material Library LOP. When the network editor shows a material network
+    (`/mat`, a Material Network, or the inside of a Material Library LOP), the material is
+    created there; dragging puts it at the drop point. From inside a material it goes into
+    the material network above, and from any other context into `/mat`. The material is not
+    assigned to anything.
   * HDRIs: OBJ gets an Environment Light, LOP a Dome Light.
   * Images have no node; use __Copy path__ or drag them onto a parameter.
 * Drag an asset onto a network editor to import it where you drop it. A material asks which
