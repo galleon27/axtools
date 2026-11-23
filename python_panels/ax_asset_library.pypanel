@@ -51,8 +51,9 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
   category adds a new version. Pick a version in the details pane to import it, or click
   __Make current__ to make it the default.
 * __Render thumbnail__ renders a Karma thumbnail with husk in the background: the model for
-  geometry, a shader ball for materials, a chrome and a grey sphere for HDRIs. Renderer,
-  samples and size are in Settings.
+  geometry, a shader ball for materials, a chrome and a grey sphere for HDRIs. A model with a
+  linked material (Megascans, Greyscalegorilla) renders with its textures, at 2K when that
+  resolution exists. Renderer, samples and size are in Settings.
 * Drop files or folders onto the panel to add them to the library:
   * Geometry files with the same name in one folder (`rock.abc`, `rock.bgeo.sc`) become one asset.
   * Texture files are grouped into materials by their channel names (`_albedo`, `_roughness`,
@@ -85,10 +86,14 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
   and imports work. The first scan of a large library takes a few minutes in the background,
   later rescans a few seconds. Without preview images the thumbnails show the type letter
   until you render them; rendered thumbnails are stored in your prefs folder.
+  Categories come from each asset's Bridge metadata, not from the folders on disk. A 3D asset
+  or plant is listed once, under Geometry: its textures are not listed as a separate material,
+  and importing the geometry builds the material from them.
 * Greyscalegorilla libraries can be browsed in place too: add the library folder in
   __Settings__ and set its __Type__ to Greyscalegorilla (it is picked automatically when the
   folder is recognized). HDRIs, materials, gobo textures (image assets) and models are read;
-  names and types come from each asset's `.gsga`/`.gsgm` file. Materials use the base color,
+  names, types and categories (the subtype) come from each asset's `.gsga`/`.gsgm` file. A
+  model is listed under Geometry only; its material is built when you import it. Materials use the base color,
   roughness, normal and height maps; extra maps such as sheen or anisotropy are kept with the
   asset but not wired. The GSG preview images are the thumbnails, and nothing is written into
   the library.

@@ -145,10 +145,50 @@ def _settings(stage, cam, resolution, samples):
     stage.SetMetadata("renderSettingsPrimPath", SETTINGS_PATH)
 
 
+OWN_PRIMS = ("AXThumb", "Render")
+MATERIAL_PATH = "/AXThumb/materials/asset"
+
+
+def _uv_primvar(prims):
+    """"st" or "uv": the UV primvar of the first mesh below `prims` ("st" when none has one)."""
+    from pxr import Usd, UsdGeom
+    for prim in prims:
+        for p in Usd.PrimRange(prim):
+            if p.IsA(UsdGeom.Mesh):
+                api = UsdGeom.PrimvarsAPI(p)
+                if api.HasPrimvar("st"):
+                    return "st"
+                if api.HasPrimvar("uv"):
+                    return "uv"
+                return "st"
+    return "st"
+
+
+def bind_asset_material(stage_path, maps):
+    """Bind a MaterialX material made from `maps` ({channel: file}) on every renderable prim
+    the asset layer adds at the top (not /AXThumb, /Render, or info prims such as
+    /HoudiniLayerInfo). Returns the bound prim paths."""
+    from pxr import Usd, UsdGeom, UsdShade
+    stage = Usd.Stage.Open(stage_path)
+    prims = [p for p in stage.GetPseudoRoot().GetChildren()
+             if p.GetName() not in OWN_PRIMS and (p.IsA(UsdGeom.Imageable) or not p.GetTypeName())]
+    if not prims:
+        return []
+    stage.SetEditTarget(stage.GetRootLayer())
+    mat = _mtlx_material(stage, MATERIAL_PATH, maps, uv_tiling=(1.0, 1.0),
+                         texcoord=_uv_primvar(prims))
+    for prim in prims:
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+            mat, bindingStrength=UsdShade.Tokens.strongerThanDescendants)
+    stage.GetRootLayer().Save()
+    return [str(p.GetPath()) for p in prims]
+
+
 def write_stage(stage_path, layer_path, bounds, image_path, resolution=512, samples=16,
-                ground=True):
+                ground=True, maps=None):
     """Geometry thumbnail stage. `layer_path` is the asset file, `image_path` the render output.
-    `ground` adds the studio backdrop (floor and wall behind the asset)."""
+    `ground` adds the studio backdrop (floor and wall behind the asset). `maps`
+    ({channel: file}) is the asset's material, bound on the asset's prims."""
     from pxr import Sdf, Usd, UsdGeom
 
     stage = Usd.Stage.CreateNew(stage_path)
@@ -163,6 +203,9 @@ def write_stage(stage_path, layer_path, bounds, image_path, resolution=512, samp
     layer = Sdf.Layer.FindOrOpen(stage_path)
     layer.subLayerPaths.append(layer_path.replace("\\", "/"))
     layer.Save()
+    if maps:
+        # Composing the stage loads the asset file once, to find its prims and UV primvar.
+        bind_asset_material(stage_path, maps)
     return stage_path
 
 
@@ -205,8 +248,11 @@ def _uv_sphere(stage, path, center, radius, rings=48, segments=96):
     return mesh
 
 
-def _mtlx_material(stage, path, maps=None, constants=None):
-    """MaterialX standard_surface material. `maps` = {channel: file}, `constants` = {input: value}."""
+def _mtlx_material(stage, path, maps=None, constants=None, uv_tiling=UV_TILING, texcoord="st"):
+    """MaterialX standard_surface material. `maps` = {channel: file}, `constants` = {input: value}.
+
+    `texcoord`: the UV primvar the images read; MaterialX reads "st" by default, other names
+    go through a geompropvalue node."""
     from pxr import Gf, Sdf, UsdShade
     maps = maps or {}
     mat = UsdShade.Material.Define(stage, path)
@@ -217,6 +263,12 @@ def _mtlx_material(stage, path, maps=None, constants=None):
             surf.CreateInput(name, Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*value))
         else:
             surf.CreateInput(name, Sdf.ValueTypeNames.Float).Set(float(value))
+    uv = None
+    if maps and texcoord and texcoord != "st":
+        uv = UsdShade.Shader.Define(stage, path + "/texcoord")
+        uv.CreateIdAttr("ND_geompropvalue_vector2")
+        uv.CreateInput("geomprop", Sdf.ValueTypeNames.String).Set(texcoord)
+        uv.CreateOutput("out", Sdf.ValueTypeNames.Float2)
 
     def image(channel, kind, colorspace):
         tex = UsdShade.Shader.Define(stage, "%s/%s_tex" % (path, channel))
@@ -224,7 +276,10 @@ def _mtlx_material(stage, path, maps=None, constants=None):
         f = tex.CreateInput("file", Sdf.ValueTypeNames.Asset)
         f.Set(Sdf.AssetPath(maps[channel].replace("\\", "/")))
         f.GetAttr().SetColorSpace(colorspace)
-        tex.CreateInput("uvtiling", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(*UV_TILING))
+        tex.CreateInput("uvtiling", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(*uv_tiling))
+        if uv is not None:
+            tex.CreateInput("texcoord", Sdf.ValueTypeNames.Float2).ConnectToSource(
+                uv.ConnectableAPI(), "out")
         out_type = {"color3": Sdf.ValueTypeNames.Color3f, "float": Sdf.ValueTypeNames.Float,
                     "vector3": Sdf.ValueTypeNames.Float3}[kind]
         tex.CreateOutput("out", out_type)

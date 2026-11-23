@@ -126,6 +126,17 @@ class AssetTree(QtWidgets.QTreeWidget):
 
 # --- panel -----------------------------------------------------------------------------------
 class AssetLibraryPanel(QtWidgets.QWidget):
+    @property
+    def records(self):
+        """Every scanned record (imports, linked materials and scene usage need them all)."""
+        return self._records
+
+    @records.setter
+    def records(self, records):
+        self._records = records
+        # What the sidebar and grid list: vendor materials of a 3D asset or plant are left out.
+        self.shown_records = library.browsable(records)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings = _prefs.Prefs()
@@ -417,8 +428,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         prev = self._current_scope()
         self.tree.blockSignals(True)
         self.tree.clear()
-        counts = library.tree_counts(self.records)
-        bad = sum(1 for r in self.records if r.broken or r.missing)
+        counts = library.tree_counts(self.shown_records)
+        bad = sum(1 for r in self.shown_records if r.broken or r.missing)
 
         def add(parent, text, scope, tip=""):
             it = QtWidgets.QTreeWidgetItem([text])
@@ -428,23 +439,24 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             (parent.addChild if parent is not None else self.tree.addTopLevelItem)(it)
             return it
 
-        add(None, "All assets (%d)" % len(self.records), ("all",))
+        add(None, "All assets (%d)" % len(self.shown_records), ("all",))
         favs = _prefs.favorites(self.settings)
         recent = _prefs.recent(self.settings)
-        n_fav = sum(1 for r in self.records if r.id in favs)
-        n_recent = sum(1 for r in self.records if r.id in recent)
-        n_added = sum(1 for r in self.records if self._recently_added(r))
+        n_fav = sum(1 for r in self.shown_records if r.id in favs)
+        n_recent = sum(1 for r in self.shown_records if r.id in recent)
+        n_added = sum(1 for r in self.shown_records if self._recently_added(r))
         add(None, "Favorites (%d)" % n_fav, ("favorites",),
             "Assets marked with a star (right-click > Add to favorites). Stored per user.")
         add(None, "Recently used (%d)" % n_recent, ("recent",),
             "Assets you imported lately, newest first.")
         add(None, "Recently added (%d)" % n_added, ("added",),
             "Assets added to the library in the last %d days." % RECENTLY_ADDED_DAYS)
-        add(None, "In this scene (%d)" % len(self._usage), ("scene",),
+        n_scene = sum(1 for r in self.shown_records if r.key in self._usage)
+        add(None, "In this scene (%d)" % n_scene, ("scene",),
             "Assets with nodes in the open scene. Orange dot: a node uses an older version.")
         labels = _prefs.color_labels(self.settings)
         label_counts = {}
-        for rec in self.records:
+        for rec in self.shown_records:
             key = labels.get(rec.id or "")
             if key:
                 label_counts[key] = label_counts.get(key, 0) + 1
@@ -486,7 +498,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                     continue
                 ti = add(ri, "%s (%d)" % (schema.TYPE_LABELS[t], n), ("scope", root, t, ""))
                 nodes = {"": ti}
-                for cat in library.categories(self.records, root, t):
+                for cat in library.categories(self.shown_records, root, t):
                     parent_cat = cat.rsplit("/", 1)[0] if "/" in cat else ""
                     nodes[cat] = add(nodes.get(parent_cat, ti), "%s (%d)" % (
                         cat.rsplit("/", 1)[-1], counts.get((root, t, cat), 0)),
@@ -605,7 +617,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         labels = _prefs.color_labels(self.settings)
         query = library.Query(self.search.text(), favs, labels)
         out = []
-        for r in self.records:
+        for r in self.shown_records:
             if scope[0] == "broken" and not (r.broken or r.missing):
                 continue
             if scope[0] == "favorites" and r.id not in favs:
@@ -665,8 +677,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     def _update_status(self, shown=None):
         shown = self.model.rowCount() if shown is None else shown
-        parts = ["%d assets" % len(self.records)]
-        if shown != len(self.records):
+        parts = ["%d assets" % len(self.shown_records)]
+        if shown != len(self.shown_records):
             parts.append("%d shown" % shown)
         if self._scanning:
             parts.append("scanning...")
@@ -1203,7 +1215,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         queued, problems = 0, []
         for rec in recs:
             try:
-                if publish.render_record_thumbnail(rec, self.settings):
+                if publish.render_record_thumbnail(rec, self.settings, self.records):
                     queued += 1
             except (hou.Error, OSError, ImportError) as e:
                 msg = e.instanceMessage() if isinstance(e, hou.Error) else str(e)

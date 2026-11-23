@@ -329,6 +329,27 @@ def in_scope(rec, root=None, asset_type=None, category=None):
     return True
 
 
+def _vendor_prefix(rec):
+    return tuple(rec.id.split(":")[:2]) if rec.id else None
+
+
+def companion_keys(records):
+    """Keys of vendor material records that belong to a geometry record of the same asset
+    (a Megascans 3D asset's or plant's textures, a GSG model's material). Imports use them
+    through variants.linked_material(); the panel does not list them."""
+    geo = {_vendor_prefix(r) for r in records
+           if r.type == "geometry" and r.source_kind in schema.VENDOR_KINDS and r.id}
+    return {r.key for r in records
+            if r.type == "material" and r.source_kind in schema.VENDOR_KINDS and r.id
+            and _vendor_prefix(r) in geo}
+
+
+def browsable(records):
+    """Records the panel lists: all but companion_keys()."""
+    hidden = companion_keys(records)
+    return [r for r in records if r.key not in hidden] if hidden else list(records)
+
+
 def tree_counts(records):
     """{(root, type, category prefix): count}; type None = whole root, category "" = whole type."""
     counts = {}
