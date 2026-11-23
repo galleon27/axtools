@@ -326,6 +326,25 @@ class VariantsTests(unittest.TestCase):
         rec.files = {"basecolor": "a.jpg"}
         self.assertFalse(variants.is_atlas(rec))
 
+    def test_companion_materials_hidden(self):
+        def rec(key, rid, atype, kind="megascans"):
+            return library.AssetRecord(key=key, id=rid, name=key, type=atype, source_kind=kind)
+        rock_geo = rec("rg", "megascans:rock1:geometry", "geometry")
+        rock_mat = rec("rm", "megascans:rock1:material", "material")
+        plant_var = rec("pv", "megascans:fern1:geometry:Var1", "geometry")
+        plant_atlas = rec("pa", "megascans:fern1:material", "material")
+        surface = rec("sf", "megascans:sand1:material", "material")
+        gsg_geo = rec("gg", "gsg:chair1:geometry", "geometry", "gsg")
+        gsg_mat = rec("gm", "gsg:chair1:material", "material", "gsg")
+        lib_geo = rec("lg", "abc", "geometry", "")
+        lib_mat = rec("lm", "abc", "material", "")
+        records = [rock_geo, rock_mat, plant_var, plant_atlas, surface, gsg_geo, gsg_mat,
+                   lib_geo, lib_mat]
+        self.assertEqual(library.companion_keys(records), {"rm", "pa", "gm"})
+        self.assertEqual([r.key for r in library.browsable(records)],
+                         ["rg", "pv", "sf", "gg", "lg", "lm"])
+        self.assertIs(variants.linked_material(rock_geo, records), rock_mat)  # still linked
+
 
 class KarmaTests(unittest.TestCase):
     def test_frame_camera_fits_bounds(self):
@@ -528,6 +547,39 @@ class StageTests(unittest.TestCase):
             self.assertTrue(dome.GetTextureFileAttr().Get().path.endswith("sky.hdr"))
             self.assertTrue(dome.GetPrim().GetAttribute("karma:light:renderlightgeo").Get())
             self.assertTrue(st.GetPrimAtPath("/AXThumb/chrome"))
+
+    @unittest.skipUnless(HAVE_PXR, "pxr not available")
+    def test_geometry_stage_binds_material(self):
+        from pxr import Sdf, Usd, UsdGeom, UsdShade
+        for primvar in ("st", "uv"):
+            with tempfile.TemporaryDirectory() as d:
+                layer = os.path.join(d, "asset.usda")
+                st = Usd.Stage.CreateNew(layer)
+                mesh = UsdGeom.Mesh.Define(st, "/Rock/mesh")
+                UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+                    primvar, Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+                st.DefinePrim("/HoudiniLayerInfo", "HoudiniLayerInfo")
+                st.GetRootLayer().Save()
+                del st
+                stage_path, image = karma.work_paths(d)
+                maps = {"basecolor": os.path.join(d, "rock_albedo.png")}
+                karma.write_stage(stage_path, layer, [[-1, -1, -1], [1, 1, 1]], image, 64, 1,
+                                  maps=maps)
+                stage = Usd.Stage.Open(stage_path)
+                rock = stage.GetPrimAtPath("/Rock/mesh")
+                mat, _rel = UsdShade.MaterialBindingAPI(rock).ComputeBoundMaterial()
+                self.assertEqual(mat.GetPath().pathString, karma.MATERIAL_PATH)
+                self.assertFalse(stage.GetPrimAtPath("/HoudiniLayerInfo")
+                                 .HasAPI(UsdShade.MaterialBindingAPI))
+                tex = UsdShade.Shader(stage.GetPrimAtPath(karma.MATERIAL_PATH + "/basecolor_tex"))
+                self.assertEqual(tuple(tex.GetInput("uvtiling").Get()), (1.0, 1.0))
+                reader = stage.GetPrimAtPath(karma.MATERIAL_PATH + "/texcoord")
+                if primvar == "st":
+                    self.assertFalse(reader.IsValid())
+                else:
+                    self.assertEqual(UsdShade.Shader(reader).GetInput("geomprop").Get(), "uv")
+                    self.assertTrue(tex.GetInput("texcoord").HasConnectedSource())
+                del stage
 
 
 class MegascansTests(unittest.TestCase):

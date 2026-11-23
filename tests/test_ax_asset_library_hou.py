@@ -242,6 +242,19 @@ class ImportFeatureTests(unittest.TestCase):
     def _rec(self, asset_type):
         return next(r for r in self.records if r.type == asset_type)
 
+    def test_thumbnail_material_maps(self):
+        from ax_asset_library import publish
+        geo = self._rec("geometry")
+        maps = publish.linked_material_maps(geo, self.records)
+        self.assertEqual(set(maps), {"basecolor", "normal", "roughness"})
+        self.assertTrue(all("_2K_" in os.path.basename(p) for p in maps.values()), maps)
+        self.assertEqual(publish.linked_material_maps(geo, []), {})
+        files = dict(maps, displacement=maps["basecolor"],
+                     metallic=os.path.join(self.tmp.name, "missing.png"))
+        self.assertEqual(set(publish._thumb_maps(files)), {"basecolor", "normal", "roughness"})
+        # The material is hidden from browsing but stays linked for imports.
+        self.assertEqual([r.type for r in library.browsable(self.records)], ["geometry"])
+
     def test_model_with_material_sop(self):
         geo = hou.node("/obj").createNode("geo", "geo1")
         nodes, warnings = importers.import_records(

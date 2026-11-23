@@ -8,7 +8,7 @@ import tempfile
 
 import hou
 
-from . import gsg, karma, library, megascans, schema, textures, thumbnails
+from . import gsg, karma, library, megascans, schema, textures, thumbnails, variants
 
 # Files copied along with a geometry file of the same name (OBJ materials).
 COMPANION_EXTS = {".obj": (".mtl",)}
@@ -596,12 +596,36 @@ def megascans_thumb(rec):
     return megascans.thumb_path(library.megascans_thumb_dir(prefs.cache_dir()), rec.id)
 
 
-def render_thumbnail(asset_dir, name, geo_file, bounds, settings, key=None, target=None):
+THUMB_RESOLUTION = "2K"    # texture set used when a thumbnail shows a material on geometry
+
+
+def _thumb_maps(maps):
+    """The channels a thumbnail material wires (no displacement), with existing files."""
+    return {k: v for k, v in (maps or {}).items()
+            if k in textures.WIRED and k != "displacement" and v and os.path.isfile(v)}
+
+
+def linked_material_maps(rec, records):
+    """{channel: file} of the material linked to a geometry record, at THUMB_RESOLUTION (or
+    the nearest lower set), or {} when it has none."""
+    mrec = variants.linked_material(rec, records or [])
+    if mrec is None:
+        return {}
+    channels = mrec.files_for(mrec.current)
+    sets = variants.resolution_sets(channels)
+    picked = variants.pick_resolution(list(sets), THUMB_RESOLUTION)
+    return _thumb_maps(sets[picked] if picked is not None else channels)
+
+
+def render_thumbnail(asset_dir, name, geo_file, bounds, settings, key=None, target=None,
+                     maps=None):
     """Queue a Karma thumbnail render for a geometry file. Returns True when queued.
 
     Formats husk can't read as a layer (obj, fbx, ply) are converted to bgeo.sc first,
-    and bounds are read from the file when the sidecar has none.
+    and bounds are read from the file when the sidecar has none. `maps` ({channel: file})
+    is the material shown on the geometry.
     """
+    maps = _thumb_maps(maps)
     workdir = tempfile.mkdtemp(prefix="ax_thumb_")
     try:
         layer = geo_file
@@ -616,7 +640,8 @@ def render_thumbnail(asset_dir, name, geo_file, bounds, settings, key=None, targ
         if not karma.is_renderable(bounds):
             raise hou.OperationFailed("%s has no geometry to render." % name)
         return _queue(asset_dir, name, workdir,
-                      lambda st, im, r, sm: karma.write_stage(st, layer, bounds, im, r, sm),
+                      lambda st, im, r, sm: karma.write_stage(st, layer, bounds, im, r, sm,
+                                                              maps=maps),
                       settings, key, target)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -625,7 +650,7 @@ def render_thumbnail(asset_dir, name, geo_file, bounds, settings, key=None, targ
 
 def render_material_thumbnail(asset_dir, name, maps, settings, key=None, target=None):
     """Queue a shader-ball render. `maps` = {channel: absolute file}."""
-    maps = {k: v for k, v in maps.items() if k in textures.WIRED and k != "displacement"}
+    maps = _thumb_maps(maps)
     if not maps:
         raise hou.OperationFailed("%s has no texture channels to render." % name)
     workdir = tempfile.mkdtemp(prefix="ax_thumb_")
@@ -650,8 +675,9 @@ def render_hdri_thumbnail(asset_dir, name, hdri_file, settings, key=None, target
 
 
 def render_asset_thumbnail(asset_type, asset_dir, name, files, info, settings, key=None,
-                           target=None):
-    """Queue the Karma thumbnail that fits the asset type. `files` = {key: absolute path}."""
+                           target=None, material_maps=None):
+    """Queue the Karma thumbnail that fits the asset type. `files` = {key: absolute path};
+    `material_maps` ({channel: file}) is shown on geometry."""
     missing = [k for k, p in files.items() if not os.path.isfile(p)]
     if asset_type == "geometry":
         order = [f for f in settings.get("geo_format_order") if f in karma.LAYER_FORMATS]
@@ -660,7 +686,7 @@ def render_asset_thumbnail(asset_type, asset_dir, name, files, info, settings, k
         if not fkey:
             raise hou.OperationFailed("%s: geometry file not found." % name)
         return render_thumbnail(asset_dir, name, files[fkey], (info or {}).get("bounds"),
-                                settings, key, target)
+                                settings, key, target, maps=material_maps)
     if asset_type == "material":
         return render_material_thumbnail(
             asset_dir, name, {k: p for k, p in files.items() if k not in missing}, settings,
@@ -673,13 +699,16 @@ def render_asset_thumbnail(asset_type, asset_dir, name, files, info, settings, k
                               "images use the image itself." % name)
 
 
-def render_record_thumbnail(rec, settings):
+def render_record_thumbnail(rec, settings, records=None):
+    """Queue a record's thumbnail. Geometry shows its linked material, looked up in
+    `records` (the panel's records)."""
     target = megascans_thumb(rec)   # Megascans roots: thumbnail goes to the prefs cache
     root = settings.root_for(rec.root)
     if target is None and root and root["read_only"]:
         raise hou.OperationFailed("%s is in a read-only library root." % rec.name)
+    maps = linked_material_maps(rec, records) if rec.type == "geometry" else None
     return render_asset_thumbnail(rec.type, rec.asset_dir, rec.name, rec.files, rec.info,
-                                  settings, key=rec.key, target=target)
+                                  settings, key=rec.key, target=target, material_maps=maps)
 
 
 def render_created(report, settings, only_missing=True):
@@ -688,17 +717,42 @@ def render_created(report, settings, only_missing=True):
     Geometry and materials without a thumbnail get one; HDRIs always do (their ingest
     thumbnail is only a crop of the map). Problems are added to the report.
     """
+    loaded = []
     for name, asset_dir in report.created:
         asset_type = report.created_types.get(asset_dir)
         if asset_type not in RENDERABLE_TYPES:
             continue
         try:
             data = schema.load(os.path.join(asset_dir, schema.SIDECAR))
-            if only_missing and asset_type != "hdri" and data["thumbnail"].get("file"):
-                continue
             files = {k: schema.resolve(asset_dir, p)
                      for k, p in schema.current_version(data)["files"].items()}
-            render_asset_thumbnail(asset_type, asset_dir, name, files, data["info"], settings)
+        except (schema.SidecarError, OSError, KeyError, TypeError) as e:
+            report.warn("%s: thumbnail render not started (%s)" % (name, e))
+            continue
+        loaded.append((name, asset_dir, asset_type, data, files))
+
+    # Geometry shows the material created with it (same Megascans or GSG id).
+    by_vendor_id = {}
+    for _name, _dir, asset_type, data, files in loaded:
+        info = data.get("info") or {}
+        for k in ("megascans_id", "gsg_id"):
+            if asset_type == "material" and info.get(k):
+                sets = variants.resolution_sets(files)
+                picked = variants.pick_resolution(list(sets), THUMB_RESOLUTION)
+                by_vendor_id.setdefault((k, info[k]),
+                                        sets[picked] if picked is not None else files)
+
+    for name, asset_dir, asset_type, data, files in loaded:
+        if only_missing and asset_type != "hdri" and (data.get("thumbnail") or {}).get("file"):
+            continue
+        maps = None
+        if asset_type == "geometry":
+            info = data.get("info") or {}
+            maps = next((by_vendor_id[(k, info[k])] for k in ("megascans_id", "gsg_id")
+                         if info.get(k) and (k, info[k]) in by_vendor_id), None)
+        try:
+            render_asset_thumbnail(asset_type, asset_dir, name, files, data["info"], settings,
+                                   material_maps=maps)
         except (hou.Error, schema.SidecarError, OSError, ImportError, KeyError, TypeError) as e:
             report.warn("%s: thumbnail render not started (%s)" % (
                 name, e.instanceMessage() if isinstance(e, hou.Error) else e))
