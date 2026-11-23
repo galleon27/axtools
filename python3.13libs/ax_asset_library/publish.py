@@ -8,7 +8,7 @@ import tempfile
 
 import hou
 
-from . import karma, megascans, schema, textures, thumbnails
+from . import karma, library, megascans, schema, textures, thumbnails
 
 # Files copied along with a geometry file of the same name (OBJ materials).
 COMPANION_EXTS = {".obj": (".mtl",)}
@@ -373,6 +373,14 @@ def ingest_geometry(paths, root, category="", tags=None, copy=True, read_info=Tr
 
 def set_thumbnail(rec, image_path, read_only=False):
     """Replace an asset's thumbnail with a square crop of `image_path`."""
+    target = megascans_thumb(rec)
+    if target is not None:
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            thumbnails.make_thumbnail(image_path, target)
+        except (thumbnails.ThumbnailError, OSError) as e:
+            raise hou.OperationFailed(str(e))
+        return
     if read_only:
         raise hou.OperationFailed("%s is in a read-only library root." % rec.name)
     try:
@@ -555,16 +563,25 @@ def publish_node(node, root, name, category="", tags=None, description="", note=
 RENDERABLE_TYPES = schema.RENDERABLE_TYPES
 
 
-def _queue(asset_dir, name, workdir, writer, settings):
+def _queue(asset_dir, name, workdir, writer, settings, key=None, target=None):
     queue = thumbnails.karma_queue()
     queue.renderer = settings.get("thumb_renderer")
     queue.timeout_s = settings.get("thumb_timeout")
     res, samples = settings.get("thumb_resolution"), settings.get("thumb_samples")
-    return queue.add(asset_dir, name, workdir,
-                     lambda stage, image: writer(stage, image, res, samples))
+    key = key or library.norm_path(os.path.join(asset_dir, schema.SIDECAR))
+    return queue.add(key, name, workdir, lambda stage, image: writer(stage, image, res, samples),
+                     asset_dir=None if target else asset_dir, target=target)
 
 
-def render_thumbnail(asset_dir, name, geo_file, bounds, settings):
+def megascans_thumb(rec):
+    """Thumbnail file of a record from a Megascans root (in the prefs cache), else None."""
+    if rec.source_kind != "megascans" or not rec.id or not rec.id.startswith("megascans:"):
+        return None
+    from . import prefs
+    return megascans.thumb_path(library.megascans_thumb_dir(prefs.cache_dir()), rec.id)
+
+
+def render_thumbnail(asset_dir, name, geo_file, bounds, settings, key=None, target=None):
     """Queue a Karma thumbnail render for a geometry file. Returns True when queued.
 
     Formats husk can't read as a layer (obj, fbx, ply) are converted to bgeo.sc first,
@@ -585,13 +602,13 @@ def render_thumbnail(asset_dir, name, geo_file, bounds, settings):
             raise hou.OperationFailed("%s has no geometry to render." % name)
         return _queue(asset_dir, name, workdir,
                       lambda st, im, r, sm: karma.write_stage(st, layer, bounds, im, r, sm),
-                      settings)
+                      settings, key, target)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
 
 
-def render_material_thumbnail(asset_dir, name, maps, settings):
+def render_material_thumbnail(asset_dir, name, maps, settings, key=None, target=None):
     """Queue a shader-ball render. `maps` = {channel: absolute file}."""
     maps = {k: v for k, v in maps.items() if k in textures.WIRED and k != "displacement"}
     if not maps:
@@ -600,50 +617,54 @@ def render_material_thumbnail(asset_dir, name, maps, settings):
     try:
         return _queue(asset_dir, name, workdir,
                       lambda st, im, r, sm: karma.write_material_stage(st, maps, im, r, sm),
-                      settings)
+                      settings, key, target)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
 
 
-def render_hdri_thumbnail(asset_dir, name, hdri_file, settings):
+def render_hdri_thumbnail(asset_dir, name, hdri_file, settings, key=None, target=None):
     workdir = tempfile.mkdtemp(prefix="ax_thumb_")
     try:
         return _queue(asset_dir, name, workdir,
                       lambda st, im, r, sm: karma.write_hdri_stage(st, hdri_file, im, r, sm),
-                      settings)
+                      settings, key, target)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
 
 
-def render_asset_thumbnail(asset_type, asset_dir, name, files, info, settings):
+def render_asset_thumbnail(asset_type, asset_dir, name, files, info, settings, key=None,
+                           target=None):
     """Queue the Karma thumbnail that fits the asset type. `files` = {key: absolute path}."""
     missing = [k for k, p in files.items() if not os.path.isfile(p)]
     if asset_type == "geometry":
         order = [f for f in settings.get("geo_format_order") if f in karma.LAYER_FORMATS]
-        key = schema.pick_file({k: p for k, p in files.items() if k not in missing},
-                               order + list(settings.get("geo_format_order")))
-        if not key:
+        fkey = schema.pick_file({k: p for k, p in files.items() if k not in missing},
+                                order + list(settings.get("geo_format_order")))
+        if not fkey:
             raise hou.OperationFailed("%s: geometry file not found." % name)
-        return render_thumbnail(asset_dir, name, files[key], (info or {}).get("bounds"), settings)
+        return render_thumbnail(asset_dir, name, files[fkey], (info or {}).get("bounds"),
+                                settings, key, target)
     if asset_type == "material":
         return render_material_thumbnail(
-            asset_dir, name, {k: p for k, p in files.items() if k not in missing}, settings)
+            asset_dir, name, {k: p for k, p in files.items() if k not in missing}, settings,
+            key, target)
     if asset_type == "hdri":
         if "hdri" in missing or "hdri" not in files:
             raise hou.OperationFailed("%s: HDRI file not found." % name)
-        return render_hdri_thumbnail(asset_dir, name, files["hdri"], settings)
+        return render_hdri_thumbnail(asset_dir, name, files["hdri"], settings, key, target)
     raise hou.OperationFailed("%s: Karma thumbnails are for geometry, materials and HDRIs; "
                               "images use the image itself." % name)
 
 
 def render_record_thumbnail(rec, settings):
+    target = megascans_thumb(rec)   # Megascans roots: thumbnail goes to the prefs cache
     root = settings.root_for(rec.root)
-    if root and root["read_only"]:
+    if target is None and root and root["read_only"]:
         raise hou.OperationFailed("%s is in a read-only library root." % rec.name)
     return render_asset_thumbnail(rec.type, rec.asset_dir, rec.name, rec.files, rec.info,
-                                  settings)
+                                  settings, key=rec.key, target=target)
 
 
 def render_created(report, settings, only_missing=True):

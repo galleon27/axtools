@@ -1,13 +1,21 @@
-"""Megascans (Quixel Bridge) downloads: find asset folders and read their metadata.
+"""Megascans downloads: find asset folders, read their metadata, browse them in place.
 
-No hou or Qt imports, so it is tested with plain Python. publish.plan_ingest turns the
-result into library assets.
+No hou or Qt imports, so it is tested with plain Python.
 
-A Megascans asset folder holds <id>.json next to its files:
+Two layouts are recognized. Quixel Bridge, with full metadata in <id>.json:
     Downloaded/surface/rock_cliff_wdeledb/wdeledb.json, wdeledb_4K_Albedo.jpg, ...
     Downloaded/3d/nature_tree_wgqvdhf/wgqvdhf.json, wgqvdhf_LOD0.fbx, textures ...
     Downloaded/3dplant/<name>_xefmcgrqx/xefmcgrqx.json, Var1/..LOD0.fbx, Textures/Atlas/...
+and downloader folders whose <id>.json holds only {"assetID": ...}; the name is in the
+folder name and the kind in the parent folder:
+    megascans_dl/3d/vcsaeeyfa_Burnt Log/vcsaeeyfa.json, vcsaeeyfa_LOD0.fbx, ...
+    megascans_dl/surfaces/uhpjdeyn_Fresh Windswept Snow/uhpjdeyn.json, ...
+
+publish.plan_ingest turns assets into library assets (batch import). scan_root turns a
+whole Megascans folder into AssetRecords without writing anything into it (a "Megascans
+root" in the settings); thumbnails for those go to a cache folder in the user prefs.
 """
+import datetime
 import json
 import os
 import re
@@ -19,21 +27,84 @@ SURFACE_KINDS = {"surface", "atlas", "decal", "imperfection", "displacement"}
 MESH_KINDS = {"3d"}
 PLANT_KINDS = {"3dplant"}
 SKIP_DIRS = {"thumbs", "previews", "billboard"}
+KIND_ALIASES = {
+    "3d": "3d", "3dasset": "3d", "3dassets": "3d", "models": "3d",
+    "3dplant": "3dplant", "3dplants": "3dplant", "plant": "3dplant", "plants": "3dplant",
+    "surface": "surface", "surfaces": "surface",
+    "atlas": "atlas", "atlases": "atlas",
+    "decal": "decal", "decals": "decal",
+    "imperfection": "imperfection", "imperfections": "imperfection",
+    "displacement": "displacement", "displacements": "displacement",
+    "brush": "brush", "brushes": "brush",
+}
+META_KEYS = ("height", "length", "width", "dimensions")
+FBX_CM_SCALE = 0.01  # Megascans FBX/OBJ files are in centimeters
+MAX_DEPTH = 4        # how deep scan_root looks for asset folders below the root
+CACHE_VERSION = 2    # bump when plan()/records_for() change: cached records are rebuilt
+
+
+def _norm(path):
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def _in_skip_dir(rel):
+    parts = rel.replace("\\", "/").lower().split("/")[:-1]
+    return any(p in SKIP_DIRS for p in parts)
 
 
 class MegascansAsset:
-    def __init__(self, folder, data):
+    def __init__(self, folder, data, json_stem="", files=None, kind_hint=""):
         self.folder = folder
         self.data = data
-        self.id = str(data.get("id") or "")
-        self.name = str(data.get("name") or (data.get("semanticTags") or {}).get("name") or self.id)
+        self.id = str(data.get("id") or data.get("assetID") or json_stem or "")
+        self._files = files            # absolute paths, every file in the asset folder
+        base = os.path.basename(folder.rstrip("/\\"))
+        name = data.get("name") or (data.get("semanticTags") or {}).get("name")
+        if not name:
+            if self.id and base.startswith(self.id + "_"):
+                name = base[len(self.id) + 1:]          # "vcsaeeyfa_Burnt Log"
+            elif self.id and base.endswith("_" + self.id):
+                name = base[:-len(self.id) - 1]          # "rock_cliff_wdeledb"
+            else:
+                name = base
+        self.name = str(name)
         cats = [str(c) for c in data.get("categories") or []]
-        self.kind = cats[0].lower() if cats else ""
+        self.kind = KIND_ALIASES.get(cats[0].lower(), cats[0].lower()) if cats else kind_hint
         self.categories = cats[1:]
         self.tags = [str(t) for t in data.get("tags") or []]
-        self.meta = {m.get("key"): m.get("value") for m in data.get("meta") or []
-                     if isinstance(m, dict) and m.get("key")}
+        meta = data.get("meta") or []
+        if isinstance(meta, dict):     # the trimmed form kept in the scan cache
+            self.meta = dict(meta)
+        else:
+            self.meta = {m.get("key"): m.get("value") for m in meta
+                         if isinstance(m, dict) and m.get("key")}
+        if not self.kind:
+            self.kind = self._infer_kind()
 
+    # ---- files -------------------------------------------------------------------------------
+    @property
+    def files(self):
+        if self._files is None:
+            self._files = list_files(self.folder)
+        return self._files
+
+    def rel(self, path):
+        return os.path.relpath(path, self.folder).replace("\\", "/")
+
+    @property
+    def content(self):
+        """Files outside Thumbs/previews/Billboard folders."""
+        return [f for f in self.files if not _in_skip_dir(self.rel(f))]
+
+    def _infer_kind(self):
+        """Kind for assets in folders like 'unknown': meshes -> 3d, texture set -> surface."""
+        if any(schema.is_geometry(f) for f in self.content):
+            return "3d"
+        if texture_set(self.content, "x") is not None:
+            return "surface"
+        return ""
+
+    # ---- metadata ------------------------------------------------------------------------------
     @property
     def library_name(self):
         """Readable and unique: 'Rotten Tree Stump' + id -> Rotten_Tree_Stump_wgspfio."""
@@ -41,7 +112,7 @@ class MegascansAsset:
 
     @property
     def category(self):
-        """Lower case: Megascans mixes 'Nature/Rock' and 'nature/rock'."""
+        """Bridge categories in lower case (Megascans mixes 'Nature/Rock' and 'nature/rock')."""
         return "/".join(schema.sanitize_name(c.lower()) for c in self.categories if c.strip())
 
     def size_m(self, variation=None):
@@ -72,38 +143,89 @@ class MegascansAsset:
 
     @property
     def preview(self):
-        for n in ("%s_Preview.png" % self.id, "%s_Preview.jpg" % self.id):
-            p = os.path.join(self.folder, n)
-            if os.path.isfile(p):
-                return p
-        prev = os.path.join(self.folder, "previews")
-        if os.path.isdir(prev):
-            for n in sorted(os.listdir(prev)):
-                if schema.is_image(n):
-                    return os.path.join(prev, n)
+        wanted = {("%s_preview.png" % self.id).lower(), ("%s_preview.jpg" % self.id).lower()}
+        for f in self.files:
+            if os.path.basename(f).lower() in wanted:
+                return f
+        for f in self.files:
+            if self.rel(f).lower().startswith("previews/") and schema.is_image(f):
+                return f
         return None
 
     def __repr__(self):
         return "<MegascansAsset %s %s %s>" % (self.kind, self.id, self.name)
 
 
-def read_asset(folder):
-    """MegascansAsset for a folder with a Megascans <id>.json, or None."""
+def looks_like_download(path, _depth=0):
+    """True for a Megascans download: a folder with kind folders (3d, surfaces, ...) whose
+    asset folders hold a Megascans <id>.json, or Bridge's 'Downloaded' folder.
+
+    A folder name alone isn't enough ('models' or 'plants' are common in projects), so a
+    few asset folders of up to three kind folders are checked."""
     try:
-        names = os.listdir(folder)
+        entries = [e for e in os.scandir(path) if e.is_dir()]
     except OSError:
-        return None
-    for n in names:
-        if not n.lower().endswith(".json"):
+        return False
+    if _depth == 0:
+        for e in entries:
+            if e.name.lower() == "downloaded" and looks_like_download(e.path, 1):
+                return True
+    kinds = [e for e in entries if e.name.lower() in KIND_ALIASES][:3]
+    for kind in kinds:
+        try:
+            samples = [e for e in os.scandir(kind.path) if e.is_dir()][:5]
+        except OSError:
             continue
+        for s in samples:
+            if read_asset(s.path) is not None:
+                return True
+    return False
+
+
+def list_files(folder):
+    out = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames.sort()
+        out.extend(os.path.join(dirpath, f) for f in sorted(filenames))
+    return out
+
+
+def _json_candidates(folder, names):
+    """JSON file names in an asset folder that may be its <id>.json, best first."""
+    base = os.path.basename(folder.rstrip("/\\")).lower()
+    js = [n for n in names if n.lower().endswith(".json")]
+    def score(n):
+        stem = os.path.splitext(n)[0].lower()
+        return 0 if (base.startswith(stem + "_") or base.endswith("_" + stem)) else 1
+    return sorted(js, key=score)
+
+
+def read_asset(folder, names=None, kind_hint=None):
+    """MegascansAsset for a folder with a Megascans <id>.json, or None.
+
+    kind_hint: the asset kind when the JSON has none; by default from the parent folder
+    name (3d, surfaces, atlases, ...).
+    """
+    if names is None:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return None
+    if kind_hint is None:
+        parent = os.path.basename(os.path.dirname(folder.rstrip("/\\"))).lower()
+        kind_hint = KIND_ALIASES.get(parent, "")
+    for n in _json_candidates(folder, names):
         try:
             with open(os.path.join(folder, n), "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
             continue
-        if isinstance(data, dict) and data.get("id") and data.get("categories") and \
-                os.path.splitext(n)[0] == str(data["id"]):
-            return MegascansAsset(folder, data)
+        if not isinstance(data, dict):
+            continue
+        stem = os.path.splitext(n)[0]
+        aid = str(data.get("id") or data.get("assetID") or "")
+        if aid and aid == stem and (data.get("categories") or "assetID" in data):
+            return MegascansAsset(folder, data, stem, kind_hint=kind_hint)
     return None
 
 
@@ -116,9 +238,9 @@ def find_assets(paths):
             other.append(p)
             continue
         found = []
-        for dirpath, dirnames, _files in os.walk(p):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            a = read_asset(dirpath)
+        for dirpath, dirnames, filenames in os.walk(p):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            a = read_asset(dirpath, filenames + dirnames)
             if a is not None:
                 found.append(a)
                 dirnames[:] = []          # don't descend into an asset folder
@@ -129,14 +251,7 @@ def find_assets(paths):
     return assets, other
 
 
-def _files(folder, recurse=False):
-    out = []
-    for dirpath, dirnames, filenames in os.walk(folder):
-        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS] if recurse else []
-        out.extend(os.path.join(dirpath, f) for f in sorted(filenames))
-    return out
-
-
+# --- asset -> library items -------------------------------------------------------------------
 def _lod_rank(path):
     m = re.search(r"lod(\d+)", os.path.basename(path).lower())
     return int(m.group(1)) if m else -1
@@ -165,9 +280,6 @@ def texture_set(files, name):
     return ts
 
 
-FBX_CM_SCALE = 0.01  # Megascans FBX/OBJ files are in centimeters
-
-
 def _mesh_info(info, meshes, size_m):
     out = dict(info)
     if any(k in ("fbx", "obj") for k in meshes):
@@ -175,6 +287,13 @@ def _mesh_info(info, meshes, size_m):
     if size_m:
         out["megascans_size_m"] = size_m
     return out
+
+
+def _resolution(channels):
+    """[w, h] from the '4K' word in the base color file name, if any."""
+    f = channels.get("basecolor") or next(iter(channels.values()), "")
+    m = re.search(r"(?:^|[_\-.])(\d{1,2})k(?:[_\-.]|$)", os.path.basename(f).lower())
+    return [int(m.group(1)) * 1024] * 2 if m else None
 
 
 def check_scale(info):
@@ -191,41 +310,265 @@ def check_scale(info):
     return scale
 
 
+def _material(asset, files, info):
+    ts = texture_set(files, asset.library_name)
+    if not ts:
+        return []
+    minfo = dict(info, channels=sorted(ts.channels))
+    res = _resolution(ts.channels)
+    if res:
+        minfo["resolution"] = res
+    if asset.displacement_scale is not None:
+        minfo["displacement_scale"] = asset.displacement_scale
+    return [("material", asset.library_name, ts.channels, minfo, ts.extra)]
+
+
 def plan(asset):
     """[(asset type, name, {key: file}, info, extra files)] for one Megascans asset.
 
     Surfaces: one material. 3D assets: geometry (most detailed LOD) + material. Plants:
     one geometry asset per variation + the atlas material. Other kinds: nothing.
     """
-    out = []
     info = {"megascans_id": asset.id}
+    content = asset.content
+    top = [f for f in content if "/" not in asset.rel(f)]
     if asset.kind in SURFACE_KINDS:
-        ts = texture_set(_files(asset.folder), asset.library_name)
-        if ts:
-            minfo = dict(info, channels=sorted(ts.channels))
-            if asset.displacement_scale is not None:
-                minfo["displacement_scale"] = asset.displacement_scale
-            out.append(("material", asset.library_name, ts.channels, minfo, ts.extra))
-    elif asset.kind in MESH_KINDS:
-        files = _files(asset.folder)
-        meshes = mesh_files(files)
+        return _material(asset, top, info)
+    if asset.kind in MESH_KINDS:
+        out = []
+        meshes = mesh_files(top)
         if meshes:
             out.append(("geometry", asset.library_name, meshes,
                         _mesh_info(info, meshes, asset.size_m()), []))
-        ts = texture_set(files, asset.library_name)
-        if ts:
-            out.append(("material", asset.library_name, ts.channels,
-                        dict(info, channels=sorted(ts.channels)), ts.extra))
-    elif asset.kind in PLANT_KINDS:
-        for var in sorted(d for d in os.listdir(asset.folder)
-                          if re.fullmatch(r"var\d+", d, re.IGNORECASE)):
-            meshes = mesh_files(_files(os.path.join(asset.folder, var)))
+        return out + _material(asset, top, info)
+    if asset.kind in PLANT_KINDS:
+        out, variations = [], {}
+        for f in content:
+            first = asset.rel(f).split("/")[0]
+            if re.fullmatch(r"var\d+", first, re.IGNORECASE):
+                variations.setdefault(first, []).append(f)
+        for var in sorted(variations, key=lambda v: int(re.sub(r"\D", "", v) or 0)):
+            meshes = mesh_files(variations[var])
             if meshes:
                 out.append(("geometry", "%s_%s" % (asset.library_name, var), meshes,
                             _mesh_info(dict(info, variation=var), meshes, asset.size_m(var)), []))
-        tex = os.path.join(asset.folder, "Textures", "Atlas")
-        ts = texture_set(_files(tex if os.path.isdir(tex) else asset.folder), asset.library_name)
-        if ts:
-            out.append(("material", asset.library_name, ts.channels,
-                        dict(info, channels=sorted(ts.channels)), ts.extra))
+        atlas = [f for f in content if asset.rel(f).lower().startswith("textures/atlas/")]
+        return out + _material(asset, atlas or top, info)
+    return []
+
+
+# --- browsing a Megascans folder in place ------------------------------------------------------
+def record_id(asset_id, asset_type, variation=None):
+    """Stable id for favorites, recents and scene nodes: megascans:<id>:<type>[:<var>]."""
+    return ":".join(["megascans", asset_id, asset_type] + ([variation] if variation else []))
+
+
+def thumb_path(thumb_dir, rid):
+    return os.path.join(thumb_dir, schema.sanitize_name(rid.replace(":", "_")) + ".jpg")
+
+
+def records_for(asset, root, thumb_dir, thumbs, mtime):
+    """AssetRecords for one Megascans asset. `thumbs`: {file name: mtime} in thumb_dir."""
+    from .library import AssetRecord
+    created = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ") if mtime else ""
+    preview = asset.preview
+    out = []
+    for asset_type, name, files, info, _extra in plan(asset):
+        rid = record_id(asset.id, asset_type, info.get("variation"))
+        cache = thumb_path(thumb_dir, rid)
+        cached = thumbs.get(os.path.basename(cache))
+        thumb = cache if cached or not preview else preview
+        files = dict(files)
+        if preview:
+            info = dict(info, preview=preview)  # fallback when a rendered thumbnail is deleted
+        out.append(AssetRecord(
+            key=_norm(asset.folder) + "|" + rid, id=rid, name=name, type=asset_type,
+            category=asset.category or asset.kind, tags=list(asset.tags),
+            created=created, modified=created, asset_dir=asset.folder, root=root,
+            current=1, versions=[1], files=files, missing=[], thumb=thumb,
+            thumb_mtime=cached or (mtime if preview else None), info=dict(info),
+            problems=[], sidecar_mtime=mtime, source_kind="megascans",
+            thumb_method="karma" if cached else ("image" if preview else ""),
+            version_list=[{"version": 1, "created": created, "author": "", "note": "Megascans",
+                           "files": files}]))
     return out
+
+
+def _apply_thumb(rec, thumb_dir, thumbs):
+    """Point a record at its rendered thumbnail in the cache when there is one now, else at
+    the Megascans preview image, else at nothing (type letter placeholder)."""
+    name = os.path.basename(thumb_path(thumb_dir, rec.id))
+    if name in thumbs:
+        rec.thumb = os.path.join(thumb_dir, name)
+        rec.thumb_mtime = thumbs[name]
+        rec.thumb_method = "karma"
+    elif rec.thumb_method == "karma":          # the rendered file was deleted
+        preview = (rec.info or {}).get("preview")
+        if preview:
+            rec.thumb, rec.thumb_mtime, rec.thumb_method = preview, rec.sidecar_mtime, "image"
+        else:
+            rec.thumb, rec.thumb_mtime, rec.thumb_method = os.path.join(thumb_dir, name), None, ""
+    return rec
+
+
+_DROP = ("version_list", "root", "missing", "problems", "versions", "current")
+
+
+def _pack(rec):
+    """Record dict for the cache, without fields that are the same for every Megascans asset."""
+    d = rec.to_dict()
+    for k in _DROP:
+        d.pop(k, None)
+    return d
+
+
+def _unpack(d, root):
+    from .library import AssetRecord
+    rec = AssetRecord.from_dict(d)
+    rec.root, rec.current, rec.versions = root, 1, [1]
+    rec.version_list = [{"version": 1, "created": rec.created, "author": "", "note": "Megascans",
+                         "files": rec.files}]
+    return rec
+
+
+def _entry_records(entry, root, thumb_dir, thumbs):
+    """Records of a current cache entry."""
+    return [_apply_thumb(_unpack(d, root), thumb_dir, thumbs) for d in entry["records"]]
+
+
+def content_subdirs(folder):
+    """{relative path: mtime} of the asset's content folders (Var1/, Textures/Atlas/, ...).
+
+    Adding or replacing files in a nested folder changes that folder's modification time but
+    not the asset folder's, so the scan cache compares these too. Thumbs/previews/Billboard
+    folders don't affect the records and are left out."""
+    out = {}
+    for dirpath, dirnames, _files in os.walk(folder):
+        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+        for d in dirnames:
+            p = os.path.join(dirpath, d)
+            try:
+                out[os.path.relpath(p, folder).replace("\\", "/")] = os.stat(p).st_mtime
+            except OSError:
+                pass
+    return out
+
+
+def _subdirs_unchanged(entry):
+    subdirs = entry.get("subdirs")
+    if subdirs is None:
+        # Entries from before subfolders were tracked: only plants (Var*/, Textures/Atlas/)
+        # depend on nested folders, so only those are read again.
+        return not any("variation" in (d.get("info") or {}) for d in entry["records"])
+    for rel, mtime in subdirs.items():
+        try:
+            if os.stat(os.path.join(entry["folder"], rel)).st_mtime != mtime:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _entry_current(entry, mtime=None):
+    """A cache entry is reused when its folder (and its content subfolders, when `mtime` is
+    given: the scan) are unchanged and its records are current; otherwise the folder is
+    read again (the cache keeps no file lists)."""
+    if not (entry is not None and entry.get("version") == CACHE_VERSION
+            and isinstance(entry.get("records"), list) and entry.get("folder")):
+        return False
+    if mtime is None:
+        return True
+    return entry.get("mtime") == mtime and _subdirs_unchanged(entry)
+
+
+def records_from_entries(entries, root, thumb_dir):
+    """Records straight from a scan cache, without touching the Megascans folder."""
+    thumbs = _thumb_index(thumb_dir) if thumb_dir else {}
+    out = []
+    for entry in entries.values():
+        if not _entry_current(entry):
+            continue
+        try:
+            out.extend(_entry_records(entry, root, thumb_dir, thumbs))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return out
+
+
+def _thumb_index(thumb_dir):
+    out = {}
+    try:
+        with os.scandir(thumb_dir) as it:
+            for e in it:
+                if e.is_file():
+                    out[e.name] = e.stat().st_mtime
+    except OSError:
+        pass
+    return out
+
+
+def scan_root(root, cached=None, thumb_dir=""):
+    """Records for every Megascans asset under `root`, without writing anything there.
+
+    `cached` is {folder key: entry} from a previous scan. An asset folder whose modification
+    time is unchanged is not listed again, so a rescan of a big library only reads the
+    folders above the assets. Returns (records, entries, errors).
+    """
+    cached = cached or {}
+    records, entries, errors = [], {}, []
+    if not os.path.isdir(root):
+        return records, entries, ["Megascans folder not found: %s" % root]
+    thumbs = _thumb_index(thumb_dir) if thumb_dir else {}
+
+    def visit(folder, depth, kind_hint):
+        try:
+            with os.scandir(folder) as it:
+                subdirs = [e for e in it if e.is_dir() and not e.name.startswith(".")]
+        except OSError as e:
+            errors.append(str(e))
+            return
+        for e in sorted(subdirs, key=lambda d: d.name.lower()):
+            hint = KIND_ALIASES.get(e.name.lower(), kind_hint)
+            key = _norm(e.path)
+            try:
+                mtime = e.stat().st_mtime
+            except OSError:
+                continue
+            if e.name.lower() in KIND_ALIASES:     # 3d, surfaces, ...: a kind folder, not an asset
+                if depth < MAX_DEPTH:
+                    visit(e.path, depth + 1, hint)
+                continue
+            entry = cached.get(key)
+            if _entry_current(entry, mtime):
+                entries[key] = entry
+                try:
+                    records.extend(_entry_records(entry, root, thumb_dir, thumbs))
+                except (KeyError, TypeError, ValueError, OSError) as err:
+                    errors.append("%s: %s" % (e.path, err))
+                continue
+            else:
+                try:
+                    names = os.listdir(e.path)
+                except OSError as err:
+                    errors.append(str(err))
+                    continue
+                asset = read_asset(e.path, names, hint)
+                if asset is None:
+                    if depth < MAX_DEPTH:
+                        visit(e.path, depth + 1, hint)
+                    continue
+                entry = {"mtime": mtime, "folder": e.path,
+                         "subdirs": content_subdirs(e.path)}
+            entries[key] = entry
+            try:
+                recs = records_for(asset, root, thumb_dir, thumbs, mtime)
+            except (OSError, ValueError, KeyError) as err:
+                errors.append("%s: %s" % (e.path, err))
+                continue
+            entry["version"] = CACHE_VERSION
+            entry["records"] = [_pack(r) for r in recs]
+            records.extend(recs)
+
+    visit(root, 1, "")
+    return records, entries, errors

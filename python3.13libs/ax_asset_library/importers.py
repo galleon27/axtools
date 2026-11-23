@@ -59,12 +59,10 @@ def context_of(network):
     return None
 
 
-def current_target():
-    """(editor, network, context) or raise AssetImportError with a readable reason."""
-    editor = target_editor()
-    if editor is None:
-        raise AssetImportError("Open a network editor first.")
-    network = editor.pwd()
+def check_target(editor, network):
+    """Context of `network`, or raise AssetImportError with a readable reason.
+
+    `editor` may be None (a drop can name its network without a pane)."""
     ctx = context_of(network)
     if ctx is None:
         raise AssetImportError(
@@ -72,7 +70,16 @@ def current_target():
             % network.path())
     if network.isInsideLockedHDA():
         raise AssetImportError("%s is inside a locked HDA." % network.path())
-    return editor, network, ctx
+    return ctx
+
+
+def current_target():
+    """(editor, network, context) or raise AssetImportError with a readable reason."""
+    editor = target_editor()
+    if editor is None:
+        raise AssetImportError("Open a network editor first.")
+    network = editor.pwd()
+    return editor, network, check_target(editor, network)
 
 
 # --- helpers ------------------------------------------------------------------------
@@ -304,16 +311,23 @@ IMPORTERS = {"geometry": _import_geometry, "material": _import_material,
              "hdri": _import_hdri, "image": _import_image}
 
 
-def import_records(records, settings, version=None, renderer=None):
+def import_records(records, settings, version=None, renderer=None, target=None,
+                   position=None):
     """Import records into the current network. Returns (nodes, warnings).
 
     `version` picks a version other than the current one (single record only).
     `renderer` ("karma", "octane", "redshift") is needed when materials are imported.
+    `target` = (editor, network) imports there instead of the current network; the editor
+    may be None. `position` (hou.Vector2, network units) places the first node.
 
     Raises AssetImportError when nothing can be imported (no editor, wrong context,
     unsupported type).
     """
-    editor, network, ctx = current_target()
+    if target is None:
+        editor, network, ctx = current_target()
+    else:
+        editor, network = target
+        ctx = check_target(editor, network)
     records = [r for r in records if not r.broken]
     if len(records) != 1:
         version = None
@@ -332,8 +346,9 @@ def import_records(records, settings, version=None, renderer=None):
                                "LOP network (Dome Light).")
     opts = {"renderer": renderer}
 
-    anchor = _anchor(network)
-    pos = _start_position(editor, network, anchor)
+    # A drop has its own position: don't wire to whatever node happens to be selected.
+    anchor = _anchor(network) if position is None else None
+    pos = position if position is not None else _start_position(editor, network, anchor)
     nodes, warnings = [], []
     label = records[0].name if len(records) == 1 else "%d assets" % len(records)
     with hou.undos.group("AX Asset Library: import %s" % label):

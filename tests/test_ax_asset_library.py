@@ -4,6 +4,7 @@ Run from the repo root:  python -m unittest tests.test_ax_asset_library
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -360,6 +361,46 @@ class TextureTests(unittest.TestCase):
 
 class StageTests(unittest.TestCase):
     @unittest.skipUnless(HAVE_PXR, "pxr not available")
+    def test_backdrop_and_softbox(self):
+        from pxr import Usd, UsdGeom, UsdLux
+        bounds = [[-1, 0, -1], [1, 2, 1]]
+        center = ((bounds[0][0] + bounds[1][0]) * 0.5, (bounds[0][2] + bounds[1][2]) * 0.5)
+        radius = karma._vlen(karma._vsub(bounds[1], bounds[0])) * 0.5
+
+        def check(stage_path, eye):
+            stage = Usd.Stage.Open(stage_path)
+            prim = stage.GetPrimAtPath("/AXThumb/backdrop")
+            self.assertTrue(prim.IsValid())
+            backdrop = UsdGeom.Mesh(prim)
+            self.assertTrue(backdrop.GetDoubleSidedAttr().Get())
+            points = backdrop.GetPointsAttr().Get()
+            self.assertAlmostEqual(min(p[1] for p in points), 0.0, places=6)  # floor
+            self.assertGreater(max(p[1] for p in points), eye[1])             # wall above eye
+            for p in points:
+                if p[1] > 2 * radius:  # the wall stands behind the asset, not in front
+                    dx, dz = p[0] - center[0], p[2] - center[1]
+                    self.assertLess(dx * (eye[0] - center[0]) + dz * (eye[2] - center[1]), 0)
+            self.assertTrue(stage.GetPrimAtPath("/AXThumb/softbox").IsA(UsdLux.RectLight))
+            self.assertFalse(stage.GetPrimAtPath("/AXThumb/key").IsValid())
+            self.assertFalse(stage.GetPrimAtPath("/AXThumb/ground").IsValid())
+
+        with tempfile.TemporaryDirectory() as d:
+            layer = os.path.join(d, "asset.usda")
+            st = Usd.Stage.CreateNew(layer)
+            UsdGeom.Cube.Define(st, "/rock")
+            st.GetRootLayer().Save()
+            stage_path, image = karma.work_paths(d)
+            karma.write_stage(stage_path, layer, bounds, image, 128, 4)
+            check(stage_path, karma.frame_camera(bounds)[0])
+
+            maps = {k: os.path.join(d, k + ".png") for k in ("basecolor", "normal", "roughness")}
+            mdir = os.path.join(d, "material")
+            os.makedirs(mdir)
+            stage_path, image = karma.work_paths(mdir)
+            karma.write_material_stage(stage_path, maps, image, 128, 4)
+            check(stage_path, karma.frame_camera(bounds, elevation=15.0)[0])
+
+    @unittest.skipUnless(HAVE_PXR, "pxr not available")
     def test_material_and_hdri_stages(self):
         from pxr import Usd, UsdGeom, UsdLux, UsdShade
         with tempfile.TemporaryDirectory() as d:
@@ -477,6 +518,137 @@ class MegascansTests(unittest.TestCase):
             os.path.join(self.dl, "3d", "nature_tree_wgqvdhf")), None)
         self.assertEqual(textures.megascans_height(
             os.path.join(self.dl, "surface", "rock_cliff_wdeledb")), 0.094)
+
+    def _downloader_layout(self):
+        """megascans_dl layout: <kind>/<id>_<Name>/<id>.json with only assetID."""
+        root = os.path.join(self.tmp.name, "megascans_dl")
+
+        def asset(rel, aid, files):
+            d = os.path.join(root, rel)
+            os.makedirs(d)
+            with open(os.path.join(d, aid + ".json"), "w") as f:
+                json.dump({"assetID": aid, "resolution": 8192, "exrAccess": "full"}, f)
+            for fn in files:
+                open(os.path.join(d, fn), "w").close()
+            return d
+
+        asset("3d/vcsaeeyfa_Burnt Log", "vcsaeeyfa",
+              ["vcsaeeyfa_LOD0.fbx", "vcsaeeyfa_LOD1.fbx", "vcsaeeyfa_4K_Albedo.jpg",
+               "vcsaeeyfa_4K_Normal_LOD0.jpg", "vcsaeeyfa_4K_Roughness.jpg"])
+        asset("surfaces/uhpjdeyn_Fresh Windswept Snow", "uhpjdeyn",
+              ["uhpjdeyn_4K_Albedo.jpg", "uhpjdeyn_4K_Normal.jpg", "uhpjdeyn_4K_Displacement.exr"])
+        asset("atlases/sguxbeff2_Golden Chain", "sguxbeff2",
+              ["sguxbeff2_4K_Albedo.jpg", "sguxbeff2_4K_Opacity.jpg", "sguxbeff2_4K_Normal.jpg"])
+        asset("unknown/seumefac_High Velocity Blood Spatter", "seumefac", ["seumefac_4K_Brush.jpg"])
+        asset("unknown/abcdefgh_Old Crate", "abcdefgh", ["abcdefgh_LOD0.fbx"])
+        return root
+
+    def test_downloader_layout(self):
+        root = self._downloader_layout()
+        self.assertTrue(megascans.looks_like_download(root))
+        log = megascans.read_asset(os.path.join(root, "3d", "vcsaeeyfa_Burnt Log"))
+        self.assertEqual((log.id, log.name, log.kind), ("vcsaeeyfa", "Burnt Log", "3d"))
+        self.assertEqual(log.library_name, "Burnt_Log_vcsaeeyfa")
+        assets, _other = megascans.find_assets([root])
+        kinds = {a.id: a.kind for a in assets}
+        self.assertEqual(kinds, {"vcsaeeyfa": "3d", "uhpjdeyn": "surface", "sguxbeff2": "atlas",
+                                 "seumefac": "", "abcdefgh": "3d"})   # unknown/ inferred from files
+
+    def test_scan_in_place(self):
+        root = self._downloader_layout()
+        cache = os.path.join(self.tmp.name, "cache")
+        before = sorted(os.walk(root))
+        recs, errs = library.scan_roots([(root, "megascans")], cache)
+        self.assertEqual(errs, [])
+        self.assertEqual(sorted(os.walk(root)), before)                 # nothing written there
+        got = sorted((r.type, r.name, r.category) for r in recs)
+        self.assertEqual(got, [
+            ("geometry", "Burnt_Log_vcsaeeyfa", "3d"),
+            ("geometry", "Old_Crate_abcdefgh", "3d"),
+            ("material", "Burnt_Log_vcsaeeyfa", "3d"),
+            ("material", "Fresh_Windswept_Snow_uhpjdeyn", "surface"),
+            ("material", "Golden_Chain_sguxbeff2", "atlas")])
+        log = next(r for r in recs if r.type == "geometry" and "Burnt" in r.name)
+        self.assertEqual(log.id, "megascans:vcsaeeyfa:geometry")
+        self.assertEqual(log.info["import_scale"], 0.01)
+        self.assertTrue(log.files["fbx"].endswith("vcsaeeyfa_LOD0.fbx"))
+        self.assertEqual(len({r.key for r in recs}), len(recs))
+        self.assertIsNone(log.thumb_mtime)                              # no preview, no render yet
+        snow = next(r for r in recs if "Snow" in r.name)
+        self.assertEqual(snow.info["resolution"], [4096, 4096])
+
+        # A rendered thumbnail in the cache is picked up; cached records match a fresh scan.
+        thumb = megascans.thumb_path(library.megascans_thumb_dir(cache), log.id)
+        os.makedirs(os.path.dirname(thumb), exist_ok=True)
+        open(thumb, "wb").close()
+        again, _ = library.scan_roots([(root, "megascans")], cache)
+        log2 = next(r for r in again if r.id == log.id)
+        self.assertEqual(log2.thumb, thumb)
+        self.assertIsNotNone(log2.thumb_mtime)
+        cached = library.records_from_index(cache, root, "megascans")
+        self.assertEqual(sorted(r.key for r in cached), sorted(r.key for r in again))
+
+        # A new download shows up on rescan.
+        d = os.path.join(root, "surfaces", "zzzzzzzz_New Moss")
+        os.makedirs(d)
+        with open(os.path.join(d, "zzzzzzzz.json"), "w") as f:
+            json.dump({"assetID": "zzzzzzzz"}, f)
+        open(os.path.join(d, "zzzzzzzz_2K_Albedo.jpg"), "w").close()
+        recs3, _ = library.scan_roots([(root, "megascans")], cache)
+        self.assertIn("New_Moss_zzzzzzzz", {r.name for r in recs3})
+
+    def test_looks_like_download_needs_megascans_json(self):
+        # A project folder with a "models" subfolder is not a Megascans download.
+        proj = os.path.join(self.tmp.name, "project")
+        os.makedirs(os.path.join(proj, "models", "chair"))
+        open(os.path.join(proj, "models", "chair", "chair.fbx"), "w").close()
+        self.assertFalse(megascans.looks_like_download(proj))
+        self.assertTrue(megascans.looks_like_download(self._downloader_layout()))
+        self.assertTrue(megascans.looks_like_download(self.tmp.name))   # holds "Downloaded"
+
+    def test_nested_folder_change_rescans_asset(self):
+        cache = os.path.join(self.tmp.name, "cache")
+        plant = os.path.join(self.dl, "3dplant", "plant_xefmcgrqx")
+        names = lambda recs: sorted(r.name for r in recs if "Small_Balsam" in r.name)
+        recs, _ = library.scan_roots([(self.dl, "megascans")], cache)
+        self.assertEqual(len(names(recs)), 3)
+        # Files added inside Var2/ (an existing folder) don't change the asset folder's mtime.
+        var3 = os.path.join(plant, "Var2", "Var2_LOD0.abc")
+        st = os.stat(plant).st_mtime
+        open(var3, "w").close()
+        os.utime(os.path.join(plant, "Var2"), (st + 10, st + 10))
+        os.utime(plant, (st, st))
+        recs, _ = library.scan_roots([(self.dl, "megascans")], cache)
+        var2 = next(r for r in recs if r.name.endswith("_Var2"))
+        self.assertIn("abc", var2.files)
+
+    def test_same_asset_in_two_roots_listed_once(self):
+        cache = os.path.join(self.tmp.name, "cache")
+        root2 = os.path.join(self.tmp.name, "copy")
+        shutil.copytree(os.path.join(self.dl, "surface"), os.path.join(root2, "surfaces"))
+        recs, _ = library.scan_roots([(self.dl, "megascans"), (root2, "megascans")], cache)
+        ids = [r.id for r in recs]
+        self.assertEqual(len(ids), len(set(ids)))
+        cliff = next(r for r in recs if "Beach_Cliff" in r.name)
+        self.assertEqual(cliff.root, self.dl)                     # first root wins
+
+    def test_deleted_rendered_thumbnail_falls_back(self):
+        cache = os.path.join(self.tmp.name, "cache")
+        thumb_dir = library.megascans_thumb_dir(cache)
+        recs, _ = library.scan_roots([(self.dl, "megascans")], cache)
+        cliff = next(r for r in recs if "Beach_Cliff" in r.name)
+        self.assertTrue(cliff.thumb.endswith("wdeledb_Preview.png"))
+        rendered = megascans.thumb_path(thumb_dir, cliff.id)
+        os.makedirs(thumb_dir, exist_ok=True)
+        open(rendered, "wb").close()
+        recs, _ = library.scan_roots([(self.dl, "megascans")], cache)
+        self.assertEqual(next(r for r in recs if r.id == cliff.id).thumb, rendered)
+        os.remove(rendered)                                       # cache cleared by the user
+        for again in (library.scan_roots([(self.dl, "megascans")], cache)[0],
+                      library.records_from_index(cache, self.dl, "megascans")):
+            rec = next(r for r in again if r.id == cliff.id)
+            self.assertTrue(rec.thumb.endswith("wdeledb_Preview.png"))
+            self.assertEqual(rec.thumb_method, "image")
 
     def test_sort_modes(self):
         recs = [library.AssetRecord(name="b", type="material", category="x"),

@@ -3,7 +3,7 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import karma, library, prefs as _prefs, publish, schema
+from .. import karma, library, megascans, prefs as _prefs, publish, schema
 
 Qt = QtCore.Qt
 
@@ -182,22 +182,26 @@ class SettingsDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
 
         lay.addWidget(QtWidgets.QLabel("<b>Library roots</b>"))
-        self.table = QtWidgets.QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Path", "Read-only"])
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Path", "Read-only", "Megascans"])
         self.table.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(
-            1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        for col in (1, 2):
+            self.table.horizontalHeader().setSectionResizeMode(
+                col, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setToolTip("Folders scanned for assets. A path can use variables such as "
                               "$AX_ASSET_LIB; node parms then keep the variable.\n"
-                              "Read-only roots are browsed but never written to.")
+                              "Read-only roots are browsed but never written to.\n"
+                              "Megascans: a Megascans download folder (Bridge 'Downloaded', or "
+                              "folders like 3d/ and surfaces/) browsed in place. Nothing is "
+                              "written into it; thumbnails go to your prefs folder.")
         lay.addWidget(self.table, 1)
         roots = [r for r in settings.get("roots") if isinstance(r, dict)]
         if not roots and os.environ.get(_prefs.ENV_VAR):
             roots = [{"path": "$" + _prefs.ENV_VAR, "read_only": False}]
         for r in roots:
-            self._add_row(r.get("path", ""), r.get("read_only", False))
+            self._add_row(r.get("path", ""), r.get("read_only", False), r.get("megascans", False))
 
         row = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("Add folder...")
@@ -263,21 +267,23 @@ class SettingsDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
-    def _add_row(self, path, read_only):
+    def _add_row(self, path, read_only, is_megascans=False):
         r = self.table.rowCount()
         self.table.insertRow(r)
         item = QtWidgets.QTableWidgetItem(path)
         item.setToolTip(_prefs.expand(path))
         self.table.setItem(r, 0, item)
-        chk = QtWidgets.QTableWidgetItem()
-        chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-        chk.setCheckState(Qt.CheckState.Checked if read_only else Qt.CheckState.Unchecked)
-        self.table.setItem(r, 1, chk)
+        for col, on in ((1, read_only), (2, is_megascans)):
+            chk = QtWidgets.QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+            self.table.setItem(r, col, chk)
 
     def _browse(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Library root")
         if d:
-            self._add_row(d.replace("\\", "/"), False)
+            is_ms = megascans.looks_like_download(d)
+            self._add_row(d.replace("\\", "/"), False, is_ms)  # Megascans roots are read-only anyway
 
     def _remove(self):
         for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
@@ -289,7 +295,8 @@ class SettingsDialog(QtWidgets.QDialog):
             path = (self.table.item(r, 0).text() if self.table.item(r, 0) else "").strip()
             if path:
                 ro = self.table.item(r, 1).checkState() == Qt.CheckState.Checked
-                roots.append({"path": path, "read_only": ro})
+                ms = self.table.item(r, 2).checkState() == Qt.CheckState.Checked
+                roots.append({"path": path, "read_only": ro, "megascans": ms})
         order = [f.strip().lstrip(".").lower() for f in self.formats.text().split(",") if f.strip()]
         self.settings.set("roots", roots, save=False)
         self.settings.set("path_mode", self.path_mode.currentData(), save=False)

@@ -116,6 +116,17 @@ LAST_LOG = "last_thumbnail_render.log"
 _NOISE = ("[Redshift]", "[Octane]")
 
 
+def husk_env():
+    """Environment for thumbnail renders. Karma XPU writes a mipmapped <texture>.rat next to
+    every JPG/PNG texture it reads (50-200 MB each for Megascans maps), into the asset's
+    folder. KARMA_XPU_DISABLE_MIPMAPS stops that; a 512 px thumbnail doesn't need mipmaps.
+    Karma CPU does not write them (tested with Houdini 22.0.459)."""
+    env = dict(os.environ)
+    env["KARMA_XPU_DISABLE_MIPMAPS"] = "1"
+    env["HOUDINI_AUTOCONVERT_IMAGE_FILES"] = "0"
+    return env
+
+
 def log_tail(path, lines=12):
     """Last meaningful lines of a husk log, without renderer plugin start-up lines."""
     try:
@@ -143,10 +154,11 @@ def find_output(workdir, expected):
 
 
 class _Job:
-    __slots__ = ("asset_dir", "name", "workdir", "stage", "image")
+    __slots__ = ("key", "asset_dir", "target", "name", "workdir", "stage", "image")
 
-    def __init__(self, asset_dir, name, workdir, stage, image):
-        self.asset_dir, self.name, self.workdir = asset_dir, name, workdir
+    def __init__(self, key, asset_dir, target, name, workdir, stage, image):
+        self.key, self.asset_dir, self.target = key, asset_dir, target
+        self.name, self.workdir = name, workdir
         self.stage, self.image = stage, image
 
     @property
@@ -164,7 +176,7 @@ class KarmaQueue(QtCore.QObject):
     """
 
     changed = QtCore.Signal()                       # queue grew or shrank
-    finished = QtCore.Signal(str, bool, str)        # asset_dir, ok, message
+    finished = QtCore.Signal(str, bool, str)        # record key, ok, message
     POLL_MS = 250
 
     def __init__(self):
@@ -180,28 +192,32 @@ class KarmaQueue(QtCore.QObject):
         self.renderer, self.timeout_s = "BRAY_HdKarma", 300
 
     def pending(self):
-        out = {os.path.normcase(j.asset_dir) for j in self._jobs}
+        """Keys (record keys) of queued and running renders."""
+        out = {j.key for j in self._jobs}
         if self._current is not None:
-            out.add(os.path.normcase(self._current.asset_dir))
+            out.add(self._current.key)
         return out
 
-    def is_pending(self, asset_dir):
-        return os.path.normcase(asset_dir) in self.pending()
+    def is_pending(self, key):
+        return key in self.pending()
 
     def __len__(self):
         return len(self._jobs) + (1 if self._current is not None else 0)
 
-    def add(self, asset_dir, name, workdir, write_stage):
+    def add(self, key, name, workdir, write_stage, asset_dir=None, target=None):
         """Write the stage now (main thread) and queue the render. Returns False if queued already.
 
+        key: the record key (library.norm_path of asset.json, or a Megascans record key).
         write_stage(stage_path, image_path) writes the USD stage to render (see karma.py).
+        The result goes to `target` when given (Megascans thumbnails in the prefs cache),
+        otherwise to <asset_dir>/thumb.jpg with asset.json updated.
         """
-        if self.is_pending(asset_dir):
+        if self.is_pending(key):
             shutil.rmtree(workdir, ignore_errors=True)
             return False
         stage, image = karma.work_paths(workdir)
         write_stage(stage, image)
-        self._jobs.append(_Job(asset_dir, name, workdir, stage, image))
+        self._jobs.append(_Job(key, asset_dir, target, name, workdir, stage, image))
         self.changed.emit()
         self._next()
         return True
@@ -227,7 +243,7 @@ class KarmaQueue(QtCore.QObject):
                 self._proc = subprocess.Popen(
                     [husk] + karma.husk_args(job.stage, job.image, self.renderer),
                     cwd=job.workdir, stdin=subprocess.DEVNULL, stdout=self._log_file,
-                    stderr=subprocess.STDOUT, **kw)
+                    stderr=subprocess.STDOUT, env=husk_env(), **kw)
             except OSError as e:
                 self._close_log()
                 self._finish(job, False, "husk failed to start: %s" % e)
@@ -277,7 +293,11 @@ class KarmaQueue(QtCore.QObject):
     def _finish(self, job, ok, msg, image=None):
         if ok:
             try:
-                store_thumbnail(job.asset_dir, image, "karma")
+                if job.target:
+                    os.makedirs(os.path.dirname(job.target), exist_ok=True)
+                    make_thumbnail(image, job.target)
+                else:
+                    store_thumbnail(job.asset_dir, image, "karma")
             except (ThumbnailError, schema.SidecarError, OSError) as e:
                 ok, msg = False, "could not store thumbnail: %s" % e
         if ok:
@@ -291,7 +311,7 @@ class KarmaQueue(QtCore.QObject):
             saved = self._save_log(job)
             if saved:
                 msg += "\n\nFull log: %s\nRender files kept in: %s" % (saved, job.workdir)
-        self.finished.emit(job.asset_dir, ok, msg)
+        self.finished.emit(job.key, ok, msg)
         self.changed.emit()
 
     @staticmethod

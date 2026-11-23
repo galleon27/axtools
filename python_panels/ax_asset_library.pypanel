@@ -27,6 +27,8 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
     `/mat`, LOP gets a Material Library LOP. The material is not assigned to anything.
   * HDRIs: OBJ gets an Environment Light, LOP a Dome Light.
   * Images have no node; use __Copy path__ or drag them onto a parameter.
+* Drag an asset onto a network editor to import it where you drop it. A material asks which
+  renderer to build.
 * Drag an asset onto a parameter field to paste its path. A material gives its texture folder.
 * __Save selection__ writes the selected SOP node or Geometry object to the library as
   bgeo.sc (plus USD or Alembic if ticked). Saving under an existing name in the same
@@ -58,6 +60,13 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
   geometry asset (most detailed LOD) plus a material, plants one geometry asset per
   variation plus the atlas material. Files stay where they are unless you tick __Copy files
   into the library__. Dropping a Megascans folder onto the panel does the same.
+* A Megascans download folder can also be browsed in place: add it in __Settings__ and tick
+  __Megascans__. The panel reads Bridge's `Downloaded` folder and downloader folders with
+  `3d/`, `surfaces/` and `atlases/` (name from the folder name, type from the parent folder).
+  Nothing is written into that folder. Its assets are read-only; favorites and imports work.
+  The first scan of a large library takes a few minutes in the background, later rescans a
+  few seconds. Without preview images the thumbnails show the type letter until you render
+  them; rendered thumbnails are stored in your prefs folder.
 * Megascans FBX files are in centimeters. Imports add a Transform node with scale 0.01 so the
   asset matches the size in its metadata.
 * __List__ shows assets as rows with type, category, formats and resolution. Sort by name,

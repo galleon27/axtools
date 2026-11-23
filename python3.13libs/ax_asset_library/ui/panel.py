@@ -37,17 +37,28 @@ def icon(name):
 # --- background scan -----------------------------------------------------------------------
 class _ScanSignals(QtCore.QObject):
     finished = QtCore.Signal(int, object, object)  # generation, records, errors
+    cached = QtCore.Signal(int, object)            # generation, records from the index cache
 
 
 class _ScanJob(QtCore.QRunnable):
-    """Runs library.scan_roots in a worker thread. No hou calls here."""
+    """Runs library.scan_roots in a worker thread, or with cache_only just reads the index
+    caches (a big Megascans cache takes a moment to load). No hou calls here."""
 
-    def __init__(self, generation, roots, cache_dir, use_cache, signals):
+    def __init__(self, generation, roots, cache_dir, use_cache, signals, cache_only=False):
         super().__init__()
         self.generation, self.roots, self.cache_dir = generation, roots, cache_dir
-        self.use_cache, self.signals = use_cache, signals
+        self.use_cache, self.signals, self.cache_only = use_cache, signals, cache_only
 
     def run(self):
+        if self.cache_only:
+            records = []
+            for root, kind in self.roots:
+                try:
+                    records.extend(library.records_from_index(self.cache_dir, root, kind))
+                except Exception:  # a broken cache only means no instant first paint
+                    pass
+            self.signals.cached.emit(self.generation, library.dedupe_megascans(records))
+            return
         try:
             records, errors = library.scan_roots(self.roots, self.cache_dir, self.use_cache)
         except Exception as e:  # keep the panel alive whatever the file system does
@@ -115,6 +126,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._pool.setMaxThreadCount(1)
         self._scan_signals = _ScanSignals()
         self._scan_signals.finished.connect(self._on_scan_finished)
+        self._scan_signals.cached.connect(self._on_cache_loaded)
+        self._cache_generation = 0
 
         try:
             self.setStyleSheet(hou.qt.styleSheet())
@@ -132,6 +145,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._load_cached()
         self.rescan()
         self._watch_hip()
+        from .. import dragdrop
+        dragdrop.register(self)
 
     # ---- layout -----------------------------------------------------------------------------
     def _build_ui(self):
@@ -319,15 +334,30 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         return self.settings.roots()
 
     def _load_cached(self):
-        """Show what the index cache knows straight away; the real scan follows."""
-        cache = _prefs.cache_dir()
-        recs = []
-        for r in self._roots():
-            recs.extend(library.records_from_index(cache, r["expanded"]))
-        self._set_records(recs)
+        """Show what the index cache knows as soon as it is read (in the worker thread, before
+        the scan that follows); the scan result then replaces it."""
+        self._cache_generation += 1
+        roots = [(r["expanded"], r["kind"]) for r in self._roots()]
+        if not roots:
+            self._set_records([])
+            return
+        self._pool.start(_ScanJob(self._cache_generation, roots, _prefs.cache_dir(), True,
+                                  self._scan_signals, cache_only=True))
+
+    def _on_cache_loaded(self, generation, records):
+        # Only while the scan hasn't delivered yet: never replace fresher scan results.
+        if generation == self._cache_generation and self._scanning:
+            self._set_records(records)
+
+    def _looks_like_megascans(self, root):
+        cache = self.__dict__.setdefault("_ms_guess", {})
+        if root not in cache:
+            from .. import megascans
+            cache[root] = megascans.looks_like_download(root)
+        return cache[root]
 
     def rescan(self, use_cache=True):
-        roots = [r["expanded"] for r in self._roots()]
+        roots = [(r["expanded"], r["kind"]) for r in self._roots()]
         self._scan_generation += 1
         self._last_scan = time.time()
         if not roots:
@@ -395,9 +425,19 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             add(None, "Errors / missing files (%d)" % bad, ("broken",))
         for r in self._roots():
             root = r["expanded"]
-            label = r["path"] + ("  [read-only]" if r["read_only"] else "")
-            ri = add(None, "%s (%d)" % (label, counts.get((root, None, ""), 0)),
-                     ("scope", root, None, ""), root)
+            n_root = counts.get((root, None, ""), 0)
+            tip = root
+            if r["megascans"]:
+                label = r["path"] + "  [Megascans]"
+                tip += "\nMegascans download, browsed in place (read-only)."
+            else:
+                label = r["path"] + ("  [read-only]" if r["read_only"] else "")
+                if n_root == 0 and self._looks_like_megascans(root):
+                    label += "  (Megascans folder? tick Megascans in Settings)"
+                    tip += ("\nThis folder looks like a Megascans download. Library roots "
+                            "hold asset.json files; open Settings and tick Megascans for "
+                            "this folder to browse it in place.")
+            ri = add(None, "%s (%d)" % (label, n_root), ("scope", root, None, ""), tip)
             for t in schema.ASSET_TYPES:
                 n = counts.get((root, t, ""), 0)
                 if not n:
@@ -529,7 +569,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
     # ---- selection / actions -------------------------------------------------------------
     def _on_selection_changed(self, *_):
         recs = self.view.selected_records()
-        rendering = len(recs) == 1 and thumbnails.karma_queue().is_pending(recs[0].asset_dir)
+        rendering = len(recs) == 1 and thumbnails.karma_queue().is_pending(recs[0].key)
         use = self._usage.get(recs[0].key) if len(recs) == 1 else None
         editable = len(recs) == 1 and not self._read_only(recs[0]) and not recs[0].broken
         self.details.set_records(recs, rendering, use, editable)
@@ -578,23 +618,27 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     def _import_selected(self, renderer=None):
         recs = self.view.selected_records()
-        if not recs:
-            return
+        if recs:
+            self._import_records(recs, renderer)
+
+    def _import_records(self, recs, renderer=None, target=None, position=None):
+        """Import `recs` into the current network (or `target`); returns the created nodes."""
         if renderer is None and any(r.type == "material" for r in recs):
             renderer = self._ask_renderer()
             if renderer is None:
-                return
+                return []
         try:
-            nodes, warnings = importers.import_records(recs, self.settings,
-                                                       self._picked_version(recs), renderer)
+            nodes, warnings = importers.import_records(
+                recs, self.settings, self._picked_version(recs), renderer,
+                target=target, position=position)
         except importers.AssetImportError as e:
             hou.ui.displayMessage(str(e), severity=hou.severityType.Warning,
                                   title="AX Asset Library")
-            return
+            return []
         except hou.Error as e:
             hou.ui.displayMessage("Import failed: %s" % e.instanceMessage(),
                                   severity=hou.severityType.Error, title="AX Asset Library")
-            return
+            return []
         msg = "Imported %s." % ", ".join(n.path() for n in nodes) if nodes else "Nothing imported."
         if warnings:
             msg += "  " + "  ".join(warnings)
@@ -602,6 +646,23 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         if nodes:
             _prefs.add_recent(self.settings, [r.id for r in recs if r.id], schema.now_iso())
             self._refresh_scene()
+        return nodes
+
+    def import_dropped(self, keys, editor, position, renderer):
+        """Accept dropped asset keys for `editor`'s network. False when none are known.
+
+        The import runs once Houdini has finished the drop: it can open dialogs (renderer
+        menu, errors), which must not happen inside the drop dispatch."""
+        by_key = {r.key: r for r in self.records}
+        recs = [by_key[k] for k in keys if k in by_key]
+        if not recs:
+            self._message("Dropped assets are no longer in the library list. Rescan and try "
+                          "again.", warning=True)
+            return False
+        network = editor.pwd()
+        QtCore.QTimer.singleShot(0, lambda: self._import_records(
+            recs, renderer, target=(editor, network), position=position))
+        return True
 
     def _copy_paths(self):
         _paths, text = self._drag_payload(self.view.selected_records())
@@ -954,7 +1015,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._update_status()
         self._on_selection_changed()
 
-    def _on_render_finished(self, asset_dir, ok, message):
+    def _on_render_finished(self, key, ok, message):
         first, _sep, details = message.partition("\n\n")
         self._message(first, warning=not ok)
         if not ok and self.isVisible():
@@ -1132,4 +1193,6 @@ class AssetLibraryPanel(QtWidgets.QWidget):
     def closeEvent(self, event):
         self._save_state()
         self._unwatch_hip()
+        from .. import dragdrop
+        dragdrop.remove_panel(self)
         super().closeEvent(event)
