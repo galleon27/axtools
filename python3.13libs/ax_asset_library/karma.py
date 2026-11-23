@@ -6,8 +6,8 @@ the stage layout can be tested outside Houdini.
 Geometry: the asset file is added as a sublayer, so its prims compose at their own paths
 whatever format it is (bgeo, abc and USD all load through Houdini's USD plugins).
 Materials: a textured MaterialX shader ball. HDRIs: the map as dome light and background
-with a chrome and a grey sphere. Camera, lights and helpers live under /AXThumb, render
-settings under /Render.
+with a chrome and a grey sphere. Camera, lights, the studio backdrop and helpers live under
+/AXThumb, render settings under /Render.
 """
 import math
 import os
@@ -47,6 +47,7 @@ def frame_camera(bounds, azimuth=35.0, elevation=22.0, margin=0.85):
 
 
 def _camera(stage, bounds, **frame):
+    """Camera for the render settings; returns (camera, eye position)."""
     from pxr import Gf, UsdGeom
     eye, center, near, far = frame_camera(bounds, **frame)
     cam = UsdGeom.Camera.Define(stage, "/AXThumb/cam")
@@ -56,33 +57,80 @@ def _camera(stage, bounds, **frame):
     cam.CreateClippingRangeAttr(Gf.Vec2f(near, far))
     view = Gf.Matrix4d().SetLookAt(Gf.Vec3d(*eye), Gf.Vec3d(*center), Gf.Vec3d(0, 1, 0))
     UsdGeom.Xformable(cam).AddTransformOp().Set(view.GetInverse())
-    return cam
+    return cam, eye
 
 
-def _studio_lights(stage):
-    from pxr import Gf, UsdGeom, UsdLux
+def _studio_lights(stage, bounds, eye):
+    from pxr import Gf, Sdf, UsdGeom, UsdLux
+    lo, hi = bounds
+    c = tuple((lo[i] + hi[i]) * 0.5 for i in range(3))
+    dist = _vlen(_vsub(eye, c))
+    dx, dz = eye[0] - c[0], eye[2] - c[2]
+    az = math.atan2(dx, dz) if (dx or dz) else 0.0
+
     dome = UsdLux.DomeLight.Define(stage, "/AXThumb/dome")
-    dome.CreateIntensityAttr(0.6)
+    dome.CreateIntensityAttr(0.35)  # fill only: the softbox does the modelling
     dome.CreateColorAttr(Gf.Vec3f(0.92, 0.95, 1.0))
-    key = UsdLux.DistantLight.Define(stage, "/AXThumb/key")
-    key.CreateIntensityAttr(2.2)
-    key.CreateAngleAttr(3.0)
-    UsdGeom.Xformable(key).AddRotateXYZOp().Set(Gf.Vec3f(-50.0, 35.0, 0.0))
+
+    a = az + math.radians(50.0)
+    e = math.radians(45.0)
+    d = (math.sin(a) * math.cos(e), math.sin(e), math.cos(a) * math.cos(e))
+    light_dist = 1.2 * dist
+    pos = tuple(c[i] + d[i] * light_dist for i in range(3))
+    softbox = UsdLux.RectLight.Define(stage, "/AXThumb/softbox")
+    softbox.CreateWidthAttr(0.8 * light_dist)  # scales with the scene, so the look does not
+    softbox.CreateHeightAttr(0.8 * light_dist)
+    softbox.CreateIntensityAttr(6.0)
+    softbox.CreateNormalizeAttr(False)
+    look = Gf.Matrix4d().SetLookAt(Gf.Vec3d(*pos), Gf.Vec3d(*c), Gf.Vec3d(0, 1, 0))
+    UsdGeom.Xformable(softbox).AddTransformOp().Set(look.GetInverse())
+    softbox.GetPrim().CreateAttribute("karma:light:renderlightgeo",
+                                      Sdf.ValueTypeNames.Bool).Set(False)
 
 
-def _ground(stage, bounds):
+def _backdrop(stage, bounds, eye):
+    """Cyclorama: floor curving up into a wall behind the asset, facing the camera."""
     from pxr import Gf, UsdGeom
     lo, hi = bounds
-    size = max(_vlen(_vsub(hi, lo)), 1e-3) * 30.0
-    y = lo[1]
-    cx, cz = (lo[0] + hi[0]) * 0.5, (lo[2] + hi[2]) * 0.5
-    mesh = UsdGeom.Mesh.Define(stage, "/AXThumb/ground")
-    mesh.CreatePointsAttr([Gf.Vec3f(cx - size, y, cz - size), Gf.Vec3f(cx - size, y, cz + size),
-                           Gf.Vec3f(cx + size, y, cz + size), Gf.Vec3f(cx + size, y, cz - size)])
-    mesh.CreateFaceVertexCountsAttr([4])
-    mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+    c = tuple((lo[i] + hi[i]) * 0.5 for i in range(3))
+    r = max(_vlen(_vsub(hi, lo)) * 0.5, 1e-4)
+    dist = _vlen(_vsub(eye, c))
+    floor_y = lo[1]
+    dx, dz = eye[0] - c[0], eye[2] - c[2]
+    az = math.atan2(dx, dz) if (dx or dz) else 0.0
+
+    back = 1.5 * r
+    radius = 2.0 * r
+    front = 3.0 * dist
+    top = (eye[1] - floor_y) + 2.0 * dist
+    width = 3.0 * dist
+    profile = [(front, 0.0), (-back, 0.0)]
+    profile += [(-back - radius * math.sin(t), radius - radius * math.cos(t))
+                for t in [k * (math.pi * 0.5) / 16 for k in range(1, 17)]]
+    profile.append((-back - radius, top))
+
+    ca, sa = math.cos(az), math.sin(az)
+    rows = []
+    for x in (-width, width):
+        rows.append([Gf.Vec3f(c[0] + x * ca + z * sa, floor_y + y, c[2] - x * sa + z * ca)
+                     for (z, y) in profile])
+    row_a, row_b = rows
+    n = len(profile) - 1
+    indices = []
+    for i in range(n):
+        indices += [i, n + 1 + i, n + 1 + i + 1, i + 1]
+
+    points = row_a + row_b
+    mesh = UsdGeom.Mesh.Define(stage, "/AXThumb/backdrop")
+    mesh.CreatePointsAttr(points)
+    mesh.CreateFaceVertexCountsAttr([4] * n)
+    mesh.CreateFaceVertexIndicesAttr(indices)
+    mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+    mesh.CreateDoubleSidedAttr(True)
     mesh.CreateDisplayColorAttr([Gf.Vec3f(0.18, 0.18, 0.18)])
-    mesh.CreateExtentAttr([Gf.Vec3f(cx - size, y, cz - size), Gf.Vec3f(cx + size, y, cz + size)])
+    lows = tuple(min(p[i] for p in points) for i in range(3))
+    highs = tuple(max(p[i] for p in points) for i in range(3))
+    mesh.CreateExtentAttr([Gf.Vec3f(*lows), Gf.Vec3f(*highs)])
 
 
 def _settings(stage, cam, resolution, samples):
@@ -99,15 +147,16 @@ def _settings(stage, cam, resolution, samples):
 
 def write_stage(stage_path, layer_path, bounds, image_path, resolution=512, samples=16,
                 ground=True):
-    """Geometry thumbnail stage. `layer_path` is the asset file, `image_path` the render output."""
+    """Geometry thumbnail stage. `layer_path` is the asset file, `image_path` the render output.
+    `ground` adds the studio backdrop (floor and wall behind the asset)."""
     from pxr import Sdf, Usd, UsdGeom
 
     stage = Usd.Stage.CreateNew(stage_path)
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
-    cam = _camera(stage, bounds)
-    _studio_lights(stage)
+    cam, eye = _camera(stage, bounds)
+    _studio_lights(stage, bounds, eye)
     if ground:
-        _ground(stage, bounds)
+        _backdrop(stage, bounds, eye)
     _settings(stage, cam, resolution, samples)
     stage.GetRootLayer().Save()
     del stage  # add the asset only once no stage composes this layer: nothing gets loaded here
@@ -217,9 +266,9 @@ def write_material_stage(stage_path, maps, image_path, resolution=512, samples=1
     from pxr import Usd, UsdGeom
     stage = Usd.Stage.CreateNew(stage_path)
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
-    cam = _camera(stage, BALL_BOUNDS, elevation=15.0)
-    _studio_lights(stage)
-    _ground(stage, BALL_BOUNDS)
+    cam, eye = _camera(stage, BALL_BOUNDS, elevation=15.0)
+    _studio_lights(stage, BALL_BOUNDS, eye)
+    _backdrop(stage, BALL_BOUNDS, eye)
     ball = _uv_sphere(stage, "/AXThumb/ball", (0.0, 1.0, 0.0), 1.0)
     _bind(ball, _mtlx_material(stage, "/AXThumb/materials/asset", maps))
     _settings(stage, cam, resolution, samples)
@@ -237,7 +286,7 @@ def write_hdri_stage(stage_path, hdri_path, image_path, resolution=512, samples=
     from pxr import Sdf, Usd, UsdGeom, UsdLux
     stage = Usd.Stage.CreateNew(stage_path)
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
-    cam = _camera(stage, HDRI_BOUNDS, azimuth=0.0, elevation=6.0, margin=1.0)
+    cam, _eye = _camera(stage, HDRI_BOUNDS, azimuth=0.0, elevation=6.0, margin=1.0)
     dome = UsdLux.DomeLight.Define(stage, "/AXThumb/dome")
     dome.CreateIntensityAttr(1.0)
     dome.CreateTextureFileAttr(Sdf.AssetPath(hdri_path.replace("\\", "/")))

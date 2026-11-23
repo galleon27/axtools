@@ -125,12 +125,18 @@ class Prefs:
 
     # --- roots -------------------------------------------------------------------
     def roots(self):
-        """[{"path" (as typed), "read_only", "expanded"}]. Falls back to $AX_ASSET_LIB."""
+        """[{"path" (as typed), "read_only", "megascans", "kind", "expanded"}].
+
+        Falls back to $AX_ASSET_LIB. A Megascans root (a download folder browsed in place)
+        is always read-only.
+        """
         roots = [dict(r) for r in self.get("roots") if isinstance(r, dict) and r.get("path")]
         if not roots and os.environ.get(ENV_VAR):
             roots = [{"path": "$" + ENV_VAR, "read_only": False}]
         for r in roots:
-            r["read_only"] = bool(r.get("read_only"))
+            r["megascans"] = bool(r.get("megascans"))
+            r["kind"] = "megascans" if r["megascans"] else "library"
+            r["read_only"] = bool(r.get("read_only")) or r["megascans"]
             r["expanded"] = expand(r["path"])
         return roots
 

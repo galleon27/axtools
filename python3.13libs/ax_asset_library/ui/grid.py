@@ -174,7 +174,7 @@ class AssetModel(QtCore.QAbstractListModel):
         return f
 
     def mimeTypes(self):
-        return ["text/uri-list", "text/plain", ASSET_MIME]
+        return ["text/uri-list", "text/plain", ASSET_MIME, "application/json"]
 
     def mimeData(self, indexes):
         recs = [self.records[i.row()] for i in indexes if i.isValid()]
@@ -183,6 +183,8 @@ class AssetModel(QtCore.QAbstractListModel):
         mime.setUrls([QtCore.QUrl.fromLocalFile(p) for p in paths])
         mime.setText(text)
         mime.setData(ASSET_MIME, "\n".join(r.key for r in recs).encode("utf-8"))
+        from .. import dragdrop  # lazily: this module must not import hou
+        mime.setData(dragdrop.MIME, dragdrop.payload_bytes(recs, self.parent()))
         return mime
 
     def index_of_key(self, key):
@@ -273,7 +275,7 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
             self._placeholder(painter, box, rec)
 
         self._badges(painter, box, rec)
-        if thumbnails.karma_queue().is_pending(rec.asset_dir):
+        if thumbnails.karma_queue().is_pending(rec.key):
             painter.fillRect(box, QtGui.QColor(0, 0, 0, 140))
             painter.setPen(QtGui.QColor(230, 230, 230))
             painter.drawText(box, Qt.AlignmentFlag.AlignCenter, "Rendering...")

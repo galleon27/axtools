@@ -1,5 +1,15 @@
 # axtools
 
+## Plan handoff
+Planning happens in a Claude session; implementation runs in a separate Claude Code
+session backed by DeepSeek (`dev/implement-plan.ps1`).
+- When planning: name exact files, functions and parms in every step. A different
+  model carries the plan out and has none of the planning context.
+- When implementing a plan file: do its steps in order and don't redesign them. If a
+  step doesn't match the code (missing file, renamed function, different signature),
+  stop and report the mismatch instead of improvising. All other rules in this file
+  still apply. Finish with a list of changed files and how each step was checked.
+
 ## Writing HDA help and documentation
 Any time you write or edit user-facing text for an HDA or tool, invoke the
 `avoid-ai-writing` skill (voice profile: technical) on it before finishing. This covers:

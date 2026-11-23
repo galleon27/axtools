@@ -205,12 +205,26 @@ def scan_root(root, cached=None):
     return records, entries, errors
 
 
+MEGASCANS_THUMBS = "megascans_thumbs"
+
+
+def _root_kind(root):
+    """Roots are a path (library) or (path, kind) with kind "library" or "megascans"."""
+    if isinstance(root, (tuple, list)):
+        return root[0], (root[1] or "library")
+    return root, "library"
+
+
+def megascans_thumb_dir(cache_dir):
+    return os.path.join(cache_dir, MEGASCANS_THUMBS)
+
+
 def index_path(cache_dir, root):
     digest = hashlib.sha1(_norm(root).encode("utf-8")).hexdigest()[:12]
     return os.path.join(cache_dir, "index_%s.json" % digest)
 
 
-def load_index(cache_dir, root):
+def load_index(cache_dir, root, kind="library"):
     """Cached entries for a root, or {} when there is no usable cache."""
     try:
         with open(index_path(cache_dir, root), "r", encoding="utf-8") as f:
@@ -219,25 +233,29 @@ def load_index(cache_dir, root):
         return {}
     if not isinstance(data, dict) or data.get("version") != INDEX_VERSION:
         return {}
-    if _norm(data.get("root", "")) != _norm(root):
+    if _norm(data.get("root", "")) != _norm(root) or data.get("kind", "library") != kind:
         return {}
     entries = data.get("entries")
     return entries if isinstance(entries, dict) else {}
 
 
-def save_index(cache_dir, root, entries):
+def save_index(cache_dir, root, entries, kind="library"):
     os.makedirs(cache_dir, exist_ok=True)
     path = index_path(cache_dir, root)
     tmp = "%s.tmp%d" % (path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"version": INDEX_VERSION, "root": root, "entries": entries}, f)
+        json.dump({"version": INDEX_VERSION, "root": root, "kind": kind, "entries": entries}, f)
     os.replace(tmp, path)
 
 
-def records_from_index(cache_dir, root):
+def records_from_index(cache_dir, root, kind="library"):
     """Records straight from the cache, without touching the library (instant first paint)."""
+    entries = load_index(cache_dir, root, kind)
+    if kind == "megascans":
+        from . import megascans
+        return megascans.records_from_entries(entries, root, megascans_thumb_dir(cache_dir))
     out = []
-    for entry in load_index(cache_dir, root).values():
+    for entry in entries.values():
         try:
             out.append(AssetRecord.from_dict(entry["record"]))
         except (KeyError, TypeError):
@@ -245,27 +263,51 @@ def records_from_index(cache_dir, root):
     return out
 
 
-def scan_roots(roots, cache_dir, use_cache=True):
-    """Scan every root (expanded paths) and update their index files.
+def dedupe_megascans(records):
+    """Drop Megascans records whose id an earlier root already provided.
 
-    Returns (records, errors). Safe to call from a worker thread.
+    The same Megascans asset can sit in two Megascans roots (Bridge 'Downloaded' and a
+    downloader folder). Its id (megascans:<asset id>:<type>) keys favorites, recents, scene
+    nodes and the rendered thumbnail, so only the first root's copy is listed."""
+    seen, out = set(), []
+    for r in records:
+        if r.source_kind == "megascans" and r.id:
+            if r.id in seen:
+                continue
+            seen.add(r.id)
+        out.append(r)
+    return out
+
+
+def scan_roots(roots, cache_dir, use_cache=True):
+    """Scan every root and update their index files.
+
+    `roots` holds expanded paths, or (path, kind) pairs where kind "megascans" reads a
+    Megascans download in place (see megascans.scan_root). Returns (records, errors).
+    Safe to call from a worker thread.
     """
     records, errors = [], []
-    for root in roots:
-        cached = load_index(cache_dir, root) if use_cache else {}
-        recs, entries, errs = scan_root(root, cached)
+    for item in roots:
+        root, kind = _root_kind(item)
+        cached = load_index(cache_dir, root, kind) if use_cache else {}
+        if kind == "megascans":
+            from . import megascans
+            recs, entries, errs = megascans.scan_root(root, cached, megascans_thumb_dir(cache_dir))
+        else:
+            recs, entries, errs = scan_root(root, cached)
         records.extend(recs)
         errors.extend(errs)
         if entries or cached:
             try:
-                save_index(cache_dir, root, entries)
+                save_index(cache_dir, root, entries, kind)
             except OSError as e:
                 errors.append("could not write index cache: %s" % e)
-    return records, errors
+    return dedupe_megascans(records), errors
 
 
 def clear_index(cache_dir, roots):
-    for root in roots:
+    for item in roots:
+        root, _kind = _root_kind(item)
         try:
             os.remove(index_path(cache_dir, root))
         except OSError:
