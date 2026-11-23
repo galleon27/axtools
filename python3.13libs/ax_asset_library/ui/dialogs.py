@@ -209,7 +209,7 @@ class SettingsDialog(QtWidgets.QDialog):
             if isinstance(r, dict):
                 kind = r.get("kind") or ("megascans" if r.get("megascans") else "library")
                 self._add_row(r.get("path", ""), r.get("read_only", False), kind,
-                              r.get("var", ""), r.get("label", ""))
+                              r.get("var", ""))
 
         row = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("Add folder...")
@@ -271,7 +271,7 @@ class SettingsDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
-    def _add_row(self, path, read_only, kind="library", var="", label=""):
+    def _add_row(self, path, read_only, kind="library", var=""):
         r = self.table.rowCount()
         self.table.insertRow(r)
         var_item = QtWidgets.QTableWidgetItem(var)
@@ -279,7 +279,6 @@ class SettingsDialog(QtWidgets.QDialog):
                             "variable. Leave empty to store absolute paths.")
         self.table.setItem(r, 0, var_item)
         item = QtWidgets.QTableWidgetItem(path)
-        item.setData(Qt.ItemDataRole.UserRole, label)
         item.setToolTip(_prefs.expand(path))
         self.table.setItem(r, 1, item)
         chk = QtWidgets.QTableWidgetItem()
@@ -337,9 +336,7 @@ class SettingsDialog(QtWidgets.QDialog):
             ro = self.table.item(r, 2).checkState() == Qt.CheckState.Checked
             combo = self.table.cellWidget(r, 3)
             kind = combo.currentData() if combo is not None else "library"
-            label = path_item.data(Qt.ItemDataRole.UserRole) or ""
-            roots.append({"var": var, "path": path, "read_only": ro, "kind": kind,
-                          "label": label})
+            roots.append({"var": var, "path": path, "read_only": ro, "kind": kind})
         order = [f.strip().lstrip(".").lower() for f in self.formats.text().split(",") if f.strip()]
         self.settings.set("roots", roots, save=False)
         self.settings.set("path_mode", self.path_mode.currentData(), save=False)

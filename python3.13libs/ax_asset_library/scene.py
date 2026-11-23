@@ -29,10 +29,18 @@ def asset_nodes():
     return out
 
 
+def _alive(node):
+    try:
+        node.path()
+        return True
+    except hou.ObjectWasDeleted:
+        return False
+
+
 def node_version(node):
     try:
         return int(node.userData(importers.UD_VERSION) or 0)
-    except (TypeError, ValueError):
+    except (hou.ObjectWasDeleted, TypeError, ValueError):
         return 0
 
 
@@ -41,8 +49,16 @@ class Usage:
 
     def __init__(self, rec, nodes):
         self.rec = rec
-        self.nodes = nodes
-        self.versions = sorted({node_version(n) for n in nodes})
+        self._nodes = nodes
+
+    @property
+    def nodes(self):
+        self._nodes = [n for n in self._nodes if _alive(n)]
+        return self._nodes
+
+    @property
+    def versions(self):
+        return sorted({node_version(n) for n in self.nodes})
 
     @property
     def outdated(self):

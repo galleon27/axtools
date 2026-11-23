@@ -251,9 +251,9 @@ class ImportFeatureTests(unittest.TestCase):
         self.assertEqual(nodes[-1].type().name(), "material")
         loader = next(n for n in geo.children() if n.type().name() == "file")
         self.assertTrue(loader.parm("file").eval().endswith("_LOD2.bgeo.sc"))
-        mat = hou.node(nodes[-1].parm("shop_materialpath1").eval())
+        mat = nodes[-1].node(nodes[-1].parm("shop_materialpath1").eval())
         self.assertIsNotNone(mat)
-        self.assertEqual(mat.parent(), hou.node("/mat"))
+        self.assertEqual(mat.parent(), geo.node("materials"))
         self.assertIn("_2K_", mat.node("basecolor").parm("file").eval())
 
     def test_model_material_lop(self):
@@ -295,16 +295,24 @@ class ImportFeatureTests(unittest.TestCase):
             as_geometry=True, records_all=[atlas])
         self.assertFalse(warnings, warnings)
         last = nodes[-1]
-        self.assertEqual(last.type().name(), "assemble")
+        self.assertEqual(last.type().name(), "material")
+        splitter = next(n for n in geo.children() if n.type().name() == "AX_atlas_splitter")
+        self.assertTrue(splitter.parm("pack").eval())
+        splitter.parm("dilate").set(0)     # default dilation would bridge the two blocks
+        splitter.parm("step").set(1)       # the small test blocks need a fine trace step
+        last.cook(force=True)
         data = last.geometry()
         packed = [p for p in data.prims() if "Packed" in str(p.type())]
         self.assertEqual(len(packed), 2)
-        self.assertTrue(data.findPrimAttrib("uv") or data.findVertexAttrib("uv")
-                        or data.findPointAttrib("uv"))
+        self.assertEqual({p.attribValue("name") for p in data.prims()}, {"piece0", "piece1"})
         self.assertIsNotNone(data.findPrimAttrib("shop_materialpath"))
+        parm = last.parm("shop_materialpath1")
+        self.assertTrue(parm.unexpandedString().startswith("../materials/"),
+                        parm.unexpandedString())
+        self.assertEqual(last.node(parm.eval()).parent(), geo.node("materials"))
 
     def test_atlas_uv_non_square(self):
-        """Trace's UVs follow the image for any aspect ratio (no reprojection)."""
+        """The splitter keeps the image UVs for any aspect ratio."""
         tex = os.path.join(self.tmp.name, "wide")
         os.makedirs(tex)
         opacity = os.path.join(tex, "wide_opacity.png")
@@ -316,19 +324,24 @@ class ImportFeatureTests(unittest.TestCase):
         nodes, warnings = importers.import_records(
             [atlas], self.settings, renderer="none", target=(None, geo), as_geometry=True)
         self.assertFalse(warnings, warnings)
-        self.assertFalse([n for n in geo.children() if n.type().name() == "uvproject"])
-        divide = next(n for n in geo.children() if n.type().name() == "divide")
-        data = divide.geometry()
+        split = nodes[-1]
+        self.assertEqual(split.type().name(), "AX_atlas_splitter")
+        split.parm("pack").set(0)
+        split.parm("dilate").set(0)
+        split.parm("step").set(1)
+        split.cook(force=True)
+        data = split.geometry()
+        names = {p.attribValue("name") for p in data.prims()} \
+            if data.findPrimAttrib("name") else set()
+        self.assertEqual(len(names), 1)
         if data.findVertexAttrib("uv") is not None:
             uvs = [v.attribValue("uv") for pr in data.prims() for v in pr.vertices()]
         else:
             uvs = [pt.attribValue("uv") for pt in data.points()]
-        us, vs = [uv[0] for uv in uvs], [uv[1] for uv in uvs]
-        # Block at pixels x 8..28 of 128 and y 8..28 of 64 from the top: v = 1 - y / 64.
-        self.assertAlmostEqual(min(us), 8 / 128, delta=0.02)
-        self.assertAlmostEqual(max(us), 28 / 128, delta=0.02)
-        self.assertAlmostEqual(min(vs), 1 - 28 / 64, delta=0.03)
-        self.assertAlmostEqual(max(vs), 1 - 8 / 64, delta=0.03)
+        us = [uv[0] for uv in uvs]
+        # Block at pixels x 8..28 of 128.
+        self.assertAlmostEqual(min(us), 8 / 128, delta=0.03)
+        self.assertAlmostEqual(max(us), 28 / 128, delta=0.03)
 
     def test_update_keeps_lod_and_resolution(self):
         from ax_asset_library import scene
@@ -342,7 +355,7 @@ class ImportFeatureTests(unittest.TestCase):
         self.assertFalse(warnings, warnings)
         self.assertTrue(loader.parm("file").eval().endswith("_LOD2.bgeo.sc"),
                         loader.parm("file").eval())
-        mat = hou.node(nodes[-1].parm("shop_materialpath1").eval())
+        mat = nodes[-1].node(nodes[-1].parm("shop_materialpath1").eval())
         scene.update_nodes(self._rec("material"), [mat], self.settings, "keep")
         self.assertIn("_2K_", mat.node("basecolor").parm("file").eval())
 
@@ -397,6 +410,18 @@ class ImportFeatureTests(unittest.TestCase):
         self.assertEqual(os.path.normcase(parm.eval()),
                          os.path.normcase(next(iter(rec.files.values()))))
 
+    def test_usage_skips_deleted_nodes(self):
+        from ax_asset_library import scene
+        rec = self._rec("geometry")
+        nodes, warnings = importers.import_records([rec], self.settings,
+                                                   target=(None, hou.node("/obj")))
+        self.assertFalse(warnings, warnings)
+        use = scene.usage(self.records)[rec.key]
+        self.assertTrue(use.nodes)
+        nodes[-1].destroy()
+        self.assertEqual(use.nodes, [])
+        self.assertEqual(use.outdated, [])
+
 
 @unittest.skipIf(hou is None, "needs hython")
 class PanelUITests(unittest.TestCase):
@@ -433,8 +458,7 @@ class PanelUITests(unittest.TestCase):
             self.libs.append(lib)
         self.w = panel.AssetLibraryPanel()
         self.addCleanup(self.w.close)
-        self.w.settings.set("roots", [{"path": p, "label": "Lib %d" % i}
-                                      for i, p in enumerate(self.libs)])
+        self.w.settings.set("roots", [{"path": p} for p in self.libs])
         self.w.rescan()
         self.w.show()
         self._wait(lambda: not self.w._scanning)
@@ -497,19 +521,26 @@ class PanelUITests(unittest.TestCase):
         self._wait(lambda: False, 0.2)
         return bool(seen and seen[0])
 
-    def _labels(self):
-        return [r.get("label", "") for r in self.w.settings.get("roots")]
-
-    def test_sidebar_rename_reset_no_crash(self):
+    def test_sidebar_menu_no_crash(self):
         # This sequence crashed Houdini: the tree was rebuilt while the menu held an item.
         for n in range(6):
-            root = n % 2
-            self.assertTrue(self._menu_action(root, "Reset name"))
-            self.assertEqual(self._labels()[root], "")
-            self.assertTrue(self._menu_action(root, "Rename...", "Renamed %d" % n))
-            self.assertEqual(self._labels()[root], "Renamed %d" % n)
-            self.assertTrue(self._menu_action(root, "Rescan"))
+            self.assertTrue(self._menu_action(n % 2, "Rescan"))
             self._wait(lambda: not self.w._scanning)
+        self.assertTrue(self._menu_action(1, "Remove from library list"))
+        self._wait(lambda: not self.w._scanning)
+        roots = self.w.settings.get("roots")
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(os.path.normcase(roots[0]["path"]),
+                         os.path.normcase(self.libs[0]))
+        self.assertTrue(self.w.isVisible())
+
+    def test_root_shows_folder_name(self):
+        texts = [self.w.tree.topLevelItem(i).text(0)
+                 for i in range(self.w.tree.topLevelItemCount())]
+        root_texts = [t for t in texts if t.startswith("lib")]
+        self.assertEqual(len(root_texts), 2, texts)
+        self.assertTrue(root_texts[0].startswith("lib0"), root_texts)
+        self.assertTrue(root_texts[1].startswith("lib1"), root_texts)
 
     def test_material_in_sop_asks_renderer(self):
         tex = os.path.join(self.tmp.name, "rock_basecolor.png")
@@ -523,4 +554,4 @@ class PanelUITests(unittest.TestCase):
         nodes = self.w._import_records([rec], target=(None, geo))
         self.assertEqual(asked, [1])
         self.assertEqual(len(nodes), 1)
-        self.assertEqual(nodes[0].parent(), hou.node("/mat"))
+        self.assertEqual(nodes[0].parent(), geo.node("materials"))

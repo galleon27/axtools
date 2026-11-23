@@ -1,7 +1,8 @@
 """Create nodes for library assets in the current SOP, OBJ or LOP network.
 
 Every created node carries user data (ax_asset_id, ax_asset_version, ax_asset_root) so the
-panel can find library assets in the scene later.
+panel can find library assets in the scene later. Materials built for a SOP import go into a
+materials matnet inside that SOP network (inside the new Geometry object for OBJ imports).
 """
 import os
 
@@ -264,6 +265,33 @@ def _material_maps(mrec, settings, opts):
     return {ch: to_parm(mrec, settings, p) for ch, p in channels.items()}
 
 
+def atlas_splitter_type():
+    """The AX Atlas Splitter SOP type, installing its HDA when it is not loaded yet."""
+    node_type = hou.nodeType(hou.sopNodeTypeCategory(), "AX_atlas_splitter")
+    if node_type is not None:
+        return node_type
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(repo, "otls", "AX_atlas_splitter.hdalc")
+    if os.path.isfile(path):
+        hou.hda.installFile(path)
+    node_type = hou.nodeType(hou.sopNodeTypeCategory(), "AX_atlas_splitter")
+    if node_type is None:
+        raise AssetImportError("AX Atlas Splitter HDA not found: %s" % path)
+    return node_type
+
+
+def local_matnet(container):
+    """The 'materials' matnet inside `container`, created when missing."""
+    if is_locked(container):
+        return hou.node("/mat")
+    node = container.node("materials")
+    if node is not None and node.type().name() == "matnet":
+        return node
+    node = container.createNode("matnet", "materials")
+    node.moveToGoodPosition()
+    return node
+
+
 def _material_in(parent, mrec, maps, renderer, disp):
     """Build a material node inside `parent` (a /mat, a matnet or a Material Library LOP)."""
     usd = parent.type().name() == "materiallibrary"
@@ -271,11 +299,14 @@ def _material_in(parent, mrec, maps, renderer, disp):
                            lop=usd, disp_scale=disp)
 
 
-def _build_linked_material(mrec, ctx, network, settings, opts, lop_parent=None):
+def _build_linked_material(mrec, ctx, network, settings, opts, lop_parent=None,
+                           container=None):
     """The material for a linked record, built once per import (cached in opts)."""
     cache = opts.setdefault("materials", {})
-    if mrec.key in cache:
-        return cache[mrec.key]
+    container = container or network
+    cache_key = (container.path(), mrec.key)
+    if cache_key in cache:
+        return cache[cache_key]
     renderer = opts.get("renderer")
     maps = _material_maps(mrec, settings, opts)
     disp = (mrec.info or {}).get("displacement_scale")
@@ -286,7 +317,7 @@ def _build_linked_material(mrec, ctx, network, settings, opts, lop_parent=None):
             mat = materials.build(lop_parent, unique_name(lop_parent, mrec.name), maps,
                                   renderer, lop=True, disp_scale=disp)
         else:
-            parent = hou.node("/mat")
+            parent = local_matnet(container)
             if parent is None:
                 raise AssetImportError("/mat not found.")
             if is_locked(parent):
@@ -296,14 +327,14 @@ def _build_linked_material(mrec, ctx, network, settings, opts, lop_parent=None):
     except materials.MaterialError as e:
         raise AssetImportError(str(e))
     _tag_node(mat, mrec, settings, mrec.current)
-    cache[mrec.key] = mat
+    cache[cache_key] = mat
     return mat
 
 
-def _material_sop(parent, mat_path, name):
+def _material_sop(parent, mat, name):
     node = parent.createNode("material", unique_name(parent, name))
     node.parm("num_materials").set(1)
-    node.parm("shop_materialpath1").set(mat_path)
+    node.parm("shop_materialpath1").set(node.relativePathTo(mat))
     return node
 
 
@@ -361,8 +392,9 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
         if last is not node:
             last.setPosition(pos + hou.Vector2(0, -1))
         if mrec is not None:
-            mat = _build_linked_material(mrec, ctx, network, settings, opts)
-            mnode = _material_sop(network, mat.path(), rec.name + "_material")
+            mat = _build_linked_material(mrec, ctx, network, settings, opts,
+                                         container=network)
+            mnode = _material_sop(network, mat, rec.name + "_material")
             mnode.setPosition(last.position() + hou.Vector2(0, -1))
             mnode.setInput(0, last)
             _tag_node(mnode, rec, settings, version)
@@ -378,8 +410,8 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
         last.setDisplayFlag(True)
         last.setRenderFlag(True)
         if mrec is not None:
-            mat = _build_linked_material(mrec, ctx, network, settings, opts)
-            mnode = _material_sop(geo, mat.path(), rec.name + "_material")
+            mat = _build_linked_material(mrec, ctx, network, settings, opts, container=geo)
+            mnode = _material_sop(geo, mat, rec.name + "_material")
             mnode.setPosition(last.position() + hou.Vector2(0, -1))
             mnode.setInput(0, last)
             mnode.setDisplayFlag(True)
@@ -448,6 +480,9 @@ def _import_material(rec, network, ctx, pos, anchor, settings, version, opts):
         if ctx == "vop":
             parent = material_container(network)
             in_place = parent == network      # else: we're inside a material, go up
+        elif ctx == "sop":
+            parent = local_matnet(network)
+            in_place = False
         else:
             parent = hou.node("/mat")
             in_place = False
@@ -511,43 +546,28 @@ def _import_image(rec, network, ctx, pos, anchor, settings, version, opts):
     return node
 
 
-def _atlas_chain(parent, rec, maps, size, pos):
-    """Trace the opacity map into cutouts, then give each cutout the atlas size."""
-    trace = parent.createNode("trace", unique_name(parent, rec.name + "_trace"))
-    if _set_first(trace, ("file",), maps.get("opacity", "")) is None:
-        raise AssetImportError("%s has no file parameter." % trace.type().name())
-    for parm, value in (("thresh", 0.5), ("addtexture", 1), ("convpoly", 1),
-                        ("dosmooth", 1), ("hole", 1), ("delborder", 1)):
-        trace.parm(parm).set(value)
-    trace.setPosition(pos)
-    # Trace's own UVs (addtexture) match the image for any aspect ratio; don't reproject.
-    divide = parent.createNode("divide", unique_name(parent, rec.name + "_divide"))
-    divide.parm("convex").set(1)
-    divide.setInput(0, trace)
-    divide.setPosition(pos + hou.Vector2(0, -1))
-    match = parent.createNode("matchsize", unique_name(parent, rec.name + "_size"))
-    for parm, value in (("justify_x", 0), ("justify_y", 0), ("justify_z", 0),
-                        ("doscale", 1), ("uniformscale", 1), ("sizex", size), ("sizey", size)):
-        match.parm(parm).set(value)
-    match.setInput(0, divide)
-    match.setPosition(pos + hou.Vector2(0, -2))
-    return trace, match
-
-
 def _import_atlas(rec, network, ctx, pos, anchor, settings, version, opts):
-    """Atlas material as geometry: opacity map -> cutouts -> packed primitives with UVs."""
+    """Atlas material as geometry: AX Atlas Splitter, one packed leaf per cutout."""
     maps = _material_maps(rec, settings, opts)
     info = rec.info or {}
     size = info.get("megascans_size_m") or info.get("physical_size") or 1.0
     renderer = opts.get("renderer")
+    splitter = atlas_splitter_type().name()
+
+    def make_splitter(parent):
+        node = parent.createNode(splitter, unique_name(parent, rec.name))
+        node.parm("file").set(maps.get("opacity", ""))
+        node.parm("size").set(size)
+        node.parm("pack").set(1)
+        return node
 
     if ctx == "lop":
         sc = network.createNode("sopcreate", unique_name(network, rec.name))
         sc.setPosition(pos)
         sc.allowEditingOfContents()
-        trace, last = _atlas_chain(sc.node("sopnet"), rec, maps, size, hou.Vector2(0, 0))
-        last.setDisplayFlag(True)
-        _tag_node(trace, rec, settings, version)
+        split = make_splitter(sc.node("sopnet"))
+        split.setDisplayFlag(True)
+        _tag_node(split, rec, settings, version)
         if renderer:
             prefix = sc.parm("pathprefix")
             prim = prefix.eval() if prefix is not None else ""
@@ -559,7 +579,7 @@ def _import_atlas(rec, network, ctx, pos, anchor, settings, version, opts):
             lib.parm("matnode1").set(mat.name())
             lib.parm("matpath1").set("/materials/" + mat.name())
             lib.parm("assign1").set(1)
-            lib.parm("geopath1").set(prim)
+            lib.parm("geopath1").set(prim + "/**" if prim else "/**")
             _tag_node(lib, rec, settings, version)
             return lib
         return sc
@@ -569,33 +589,28 @@ def _import_atlas(rec, network, ctx, pos, anchor, settings, version, opts):
         geo = network.createNode("geo", unique_name(network, rec.name))
         for child in geo.children():
             child.destroy()
-        parent, base = geo, hou.Vector2(0, 0)
+        parent, container, base = geo, geo, hou.Vector2(0, 0)
     else:
-        parent, base = network, pos
-    trace, last = _atlas_chain(parent, rec, maps, size, base)
-    _tag_node(trace, rec, settings, version)
+        parent, container, base = network, network, pos
+    split = make_splitter(parent)
+    split.setPosition(base)
+    _tag_node(split, rec, settings, version)
+    last = split
     if renderer:
-        mat = _build_linked_material(rec, ctx, network, settings, opts)
-        mnode = _material_sop(parent, mat.path(), rec.name + "_material")
+        mat = _build_linked_material(rec, ctx, network, settings, opts, container=container)
+        mnode = _material_sop(parent, mat, rec.name + "_material")
         mnode.setInput(0, last)
         mnode.setPosition(last.position() + hou.Vector2(0, -1))
         _tag_node(mnode, rec, settings, version)
         last = mnode
-    assemble = parent.createNode("assemble", unique_name(parent, rec.name + "_assemble"))
-    for parm, value in (("connect", 1), ("pack_geo", 1), ("pivot", 1)):
-        assemble.parm(parm).set(value)
-    assemble.parm("transfer_attributes").set("*")
-    assemble.setInput(0, last)
-    assemble.setPosition(last.position() + hou.Vector2(0, -1))
     if geo is not None:
-        assemble.setDisplayFlag(True)
-        assemble.setRenderFlag(True)
+        last.setDisplayFlag(True)
+        last.setRenderFlag(True)
         geo.layoutChildren()
         geo.setPosition(pos)
         _tag_node(geo, rec, settings, version)
         return geo
-    _tag_node(assemble, rec, settings, version)
-    return assemble
+    return last
 
 
 IMPORTERS = {"geometry": _import_geometry, "material": _import_material,

@@ -28,7 +28,7 @@ RESERVED_PREFIXES = ("HOUDINI_",)
 
 DEFAULTS = {
     "roots": [],                 # [{"var": "MEGASCANS", "path": "D:/lib", "read_only": False,
-                                 #   "kind": "library", "label": ""}]
+                                 #   "kind": "library"}]
     "path_mode": "token",        # "token": keep $VAR roots in parms, "absolute": expanded paths
     "geo_format_order": GEO_FORMAT_ORDER,
     "thumb_size": 128,
@@ -136,7 +136,7 @@ class Prefs:
 
     # --- roots -------------------------------------------------------------------
     def roots(self):
-        """[{"path" (as typed), "var", "label", "read_only", "megascans", "kind", "expanded"}].
+        """[{"path" (as typed), "var", "read_only", "megascans", "kind", "expanded"}].
 
         A Megascans or GSG root (a vendor folder browsed in place) is always read-only.
         """
@@ -148,7 +148,6 @@ class Prefs:
             r["kind"] = kind
             r["megascans"] = kind == "megascans"          # kept for older callers
             r["var"] = str(r.get("var") or "").strip().upper()
-            r["label"] = str(r.get("label") or "")
             r["read_only"] = bool(r.get("read_only")) or kind in schema.VENDOR_KINDS
             r["expanded"] = expand(r["path"])
         return roots

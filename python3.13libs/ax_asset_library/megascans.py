@@ -487,12 +487,16 @@ def _subdirs_unchanged(entry):
     return True
 
 
+def _entry_usable(entry):
+    return (entry is not None and isinstance(entry.get("records"), list)
+            and bool(entry.get("folder")))
+
+
 def _entry_current(entry, mtime=None):
     """A cache entry is reused when its folder (and its content subfolders, when `mtime` is
     given: the scan) are unchanged and its records are current; otherwise the folder is
     read again (the cache keeps no file lists)."""
-    if not (entry is not None and entry.get("version") == CACHE_VERSION
-            and isinstance(entry.get("records"), list) and entry.get("folder")):
+    if not _entry_usable(entry) or entry.get("version") != CACHE_VERSION:
         return False
     if mtime is None:
         return True
@@ -504,7 +508,7 @@ def records_from_entries(entries, root, thumb_dir):
     thumbs = _thumb_index(thumb_dir) if thumb_dir else {}
     out = []
     for entry in entries.values():
-        if not _entry_current(entry):
+        if not _entry_usable(entry):
             continue
         try:
             out.extend(_entry_records(entry, root, thumb_dir, thumbs))

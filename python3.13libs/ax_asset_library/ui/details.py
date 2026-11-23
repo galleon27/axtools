@@ -278,7 +278,7 @@ class DetailsPane(QtWidgets.QWidget):
         self._meta_changed()
 
     def _fill_scene(self, rec, use):
-        if use is None:
+        if use is None or not use.nodes:
             self.scene_box.hide()
             return
         outdated = len(use.outdated)

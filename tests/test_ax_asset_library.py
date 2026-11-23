@@ -604,6 +604,16 @@ class MegascansTests(unittest.TestCase):
         self.assertNotIn("Billboard", plant[2][2]["basecolor"])  # atlas, not billboard
         self.assertEqual(megascans.plan(by["xyzbrush"]), [])
 
+    def test_cache_entry_usable_while_rebuilding(self):
+        records, entries, errors = megascans.scan_root(self.dl)
+        self.assertFalse(errors, errors)
+        self.assertTrue(entries)
+        key, entry = next(iter(entries.items()))
+        entry["version"] = 2
+        self.assertFalse(megascans._entry_current(entry, entry.get("mtime")))
+        again = megascans.records_from_entries({key: entry}, self.dl, "")
+        self.assertTrue(again)
+
     def test_linked_material_records(self):
         recs, errors = library.scan_roots([(self.dl, "megascans")],
                                           os.path.join(self.tmp.name, "cache"))
@@ -924,24 +934,6 @@ class ManageTests(unittest.TestCase):
         # A second asset with the same name gets its own trash folder.
         again, _ = make_asset(self.root, "geometry", "rocks", "Boulder")
         self.assertNotEqual(manage.trash(again, self.root, "geometry"), dst)
-
-    def test_rename_category(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = os.path.join(d, "lib")
-            make_asset(root, "geometry", "rocks/cliff", "a1")
-            make_asset(root, "geometry", "rocks", "b1")
-            moved = manage.rename_category(root, "geometry", "rocks", "stones")
-            self.assertEqual(sorted(os.path.basename(new) for _old, new in moved), ["a1", "b1"])
-            stones = os.path.join(root, "geometry", "stones")
-            self.assertEqual(schema.load(os.path.join(stones, "cliff", "a1", "asset.json"))["category"],
-                             "stones/cliff")
-            self.assertEqual(schema.load(os.path.join(stones, "b1", "asset.json"))["category"],
-                             "stones")
-            self.assertFalse(os.path.exists(os.path.join(root, "geometry", "rocks")))
-            with self.assertRaises(manage.ManageError):
-                manage.rename_category(root, "geometry", "stones", "")
-            with self.assertRaises(manage.ManageError):
-                manage.rename_category(root, "geometry", "stones", "a/b")
 
 
 class CollectionTests(unittest.TestCase):

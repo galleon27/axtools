@@ -25,21 +25,24 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
   network editor:
   * Geometry: SOP gets a File or Alembic SOP, OBJ a Geometry node, LOP a Reference LOP. A
     model's material is built as well and assigned: a Material SOP in SOP and OBJ, the
-    Material Library LOP's assignment in LOP. When the asset has several LODs or texture
-    resolutions, a dialog asks for the renderer, LOD and resolution.
-  * Materials: a menu asks for Karma, Octane or Redshift. SOP and OBJ get the material in
-    `/mat`, LOP gets a Material Library LOP. When the network editor shows a material network
-    (`/mat`, a Material Network, or the inside of a Material Library LOP), the material is
-    created there; dragging puts it at the drop point. From inside a material it goes into
-    the material network above, and from any other context into `/mat`. The material is not
-    assigned to anything.
+    Material Library LOP's assignment in LOP. SOP imports build the material in a `materials`
+    matnet inside the geometry; OBJ imports build it inside the new Geometry object. When the
+    asset has several LODs or texture resolutions, a dialog asks for the renderer, LOD and
+    resolution.
+  * Materials: a menu asks for Karma, Octane or Redshift. A material shown in a SOP network
+    goes into a `materials` matnet there; OBJ and other contexts put it in `/mat`; LOP gets a
+    Material Library LOP. When the network editor shows a material network (`/mat`, a Material
+    Network, or the inside of a Material Library LOP), the material is created there; dragging
+    puts it at the drop point. From inside a material it goes into the material network above.
+    The material is not assigned to anything.
   * HDRIs: OBJ gets an Environment Light, LOP a Dome Light.
   * Images: in a material network, an image becomes a texture node for the builder's renderer
     (`mtlximage` for Karma, Image texture for Octane, TextureSampler for Redshift). Elsewhere
     use __Copy path__ or drag the image onto a parameter.
-  * Atlas materials import as geometry by default. A Trace SOP reads the opacity map, and each
-    cutout becomes a packed primitive with UVs and the material, sized to the atlas. Choose
-    __Import as material only__ for the plain material instead.
+  * Atlas materials import as geometry by default through AX Atlas Splitter: it reads the
+    opacity map, cuts out each leaf, stands it upright with its pivot at the stem base and
+    lays it flat in XZ. Each leaf is a packed piece named `piece0`, `piece1`, ... with the
+    material. Choose __Import as material only__ for the plain material instead.
 * Drag an asset onto a network editor to import it where you drop it. A material asks which
   renderer to build.
 * Drag an asset onto a parameter field to paste its path. A material gives its texture folder.
@@ -65,10 +68,9 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
   14 days) and __In this scene__. A green dot on a thumbnail means the asset has nodes in the
   open scene, an orange dot that some of them use an older version. Click __Update__ in the
   details pane to point them at the current version.
-* Right-click a root in the sidebar to rename its display name (the folder is not renamed),
-  show it in the file browser, rescan it, or remove it from the list. Right-click a category
-  of a writable library to rename its folder (F2); scene nodes are relinked. Vendor
-  categories can't be renamed.
+* Right-click a root in the sidebar to show it in the file browser, rescan it or remove it
+  from the list. Right-click a category of a library root to show its folder. Vendor
+  categories have no menu.
 * Edit an asset's tags and notes in the details pane and click __Save tags__. Favorites,
   color labels and recent imports are stored per user, not in the library.
 * Dropping a Quixel Bridge download folder (usually `Downloaded`) or a Greyscalegorilla

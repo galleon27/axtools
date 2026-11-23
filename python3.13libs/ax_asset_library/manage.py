@@ -110,43 +110,6 @@ def move(asset_dir, asset_type, src_root, dst_root, category):
     return dst
 
 
-def rename_category(root, asset_type, category, new_leaf):
-    """Rename a category folder. Returns [(old asset_dir, new asset_dir)] for moved assets."""
-    if not str(new_leaf).strip() or "/" in str(new_leaf):
-        raise ManageError("Enter a category name without slashes.")
-    name = schema.sanitize_name(new_leaf)
-    parts = [p for p in category.replace("\\", "/").split("/") if p]
-    if not parts:
-        raise ManageError("Pick a category first.")
-    if name == parts[-1]:
-        return []
-    parent = os.path.join(type_dir(root, asset_type), *parts[:-1])
-    src = os.path.join(parent, parts[-1])
-    dst = os.path.join(parent, name)
-    if not os.path.isdir(src):
-        raise ManageError("%s does not exist." % src)
-    if os.path.normcase(src) != os.path.normcase(dst):
-        _move_folder(src, dst)
-    else:
-        tmp = src + ".renaming"     # case-only rename on Windows
-        _move_folder(src, tmp)
-        _move_folder(tmp, dst)
-
-    new_category = "/".join(parts[:-1] + [name])
-    moved = []
-    for folder, dirs, files in os.walk(dst):
-        if schema.SIDECAR in files:
-            data = _load(folder)
-            rel = os.path.relpath(folder, dst).replace("\\", "/")
-            cat_rel = os.path.dirname(rel)
-            data["category"] = "/".join(p for p in (new_category, cat_rel) if p)
-            schema.save(_sidecar(folder), data)
-            old = src if rel == "." else os.path.join(src, *rel.split("/"))
-            moved.append((old, folder))
-            dirs[:] = []            # asset folders have no categories below them
-    return moved
-
-
 def trash(asset_dir, root, asset_type):
     """Move an asset to <root>/.trash (the scanner skips it). Returns the trash folder."""
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -263,9 +263,6 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.tree.assets_dropped.connect(self._on_assets_dropped)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
-        shortcut = QtGui.QShortcut(QtGui.QKeySequence("F2"), self.tree)
-        shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
-        shortcut.activated.connect(lambda: self._rename_tree_item())
         self.splitter.addWidget(self.tree)
 
         self.stack = QtWidgets.QStackedWidget()
@@ -461,10 +458,11 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                     item.setIcon(0, color_icon(rgb))
         if bad:
             add(None, "Errors / missing files (%d)" % bad, ("broken",))
-        for r in self._roots():
+        roots = self._roots()
+        for r in roots:
             root = r["expanded"]
             n_root = counts.get((root, None, ""), 0)
-            name = r["label"] or r["path"]
+            name = self._root_name(r, roots)
             tip = root
             if r["var"]:
                 tip += "\nVariable: $%s" % r["var"]
@@ -530,9 +528,6 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             actions[act] = fn
 
         if asset_type is None:
-            add("Rename...", lambda: self._rename_tree_item(scope))
-            if root_cfg and root_cfg.get("label"):
-                add("Reset name", lambda: self._set_root_label(root, ""))
             add("Show in file browser", lambda: self._reveal(root))
             add("Rescan", self.rescan)
             menu.addSeparator()
@@ -541,12 +536,12 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         elif not category:
             add("Show in file browser", lambda: self._reveal(manage.type_dir(root, asset_type)))
         else:
-            read_only = bool(root_cfg and root_cfg["read_only"])
-            add("Rename..." + (" (read-only library)" if read_only else ""),
-                lambda: self._rename_tree_item(scope), enabled=not read_only)
             if not (root_cfg and root_cfg["kind"] in schema.VENDOR_KINDS):
                 folder = os.path.join(manage.type_dir(root, asset_type), *category.split("/"))
                 add("Show in file browser", lambda: self._reveal(folder))
+        if not actions:             # vendor categories have no menu
+            menu.deleteLater()
+            return
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
         menu.deleteLater()
         fn = actions.get(chosen) if chosen is not None else None
@@ -561,8 +556,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             self._message(str(e), warning=True)
 
     def _remove_root(self, root):
-        root_cfg = self.settings.root_for(root)
-        name = (root_cfg or {}).get("label") or (root_cfg or {}).get("path") or root
+        name = self._root_name({"path": root, "expanded": root}, self._roots())
         answer = hou.ui.displayMessage(
             "Remove %s from the library list?\n\nFiles on disk are not changed." % name,
             buttons=("Remove", "Cancel"), severity=hou.severityType.Warning,
@@ -575,62 +569,19 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.settings.set("roots", keep)
         QtCore.QTimer.singleShot(0, self.rescan)
 
-    def _set_root_label(self, root, label):
-        roots = []
-        for r in self.settings.get("roots"):
-            if isinstance(r, dict) and _prefs._same(_prefs.expand(r.get("path", "")), root):
-                r = dict(r)
-                if label:
-                    r["label"] = label
-                else:
-                    r.pop("label", None)
-            roots.append(r)
-        self.settings.set("roots", roots)
-        QtCore.QTimer.singleShot(0, self._rebuild_tree)
-
-    def _rename_tree_item(self, scope=None):
-        """Rename the root (display name) or category of `scope` (default: current item)."""
-        if scope is None:
-            item = self.tree.currentItem()
-            scope = item.data(0, ScopeRole) if item is not None else None
-            del item
-        if not scope or scope[0] != "scope":
-            return
-        _kind, root, asset_type, category = scope
-        root_cfg = self.settings.root_for(root)
-        if asset_type is None:
-            current = (root_cfg or {}).get("label") or (root_cfg or {}).get("path") or root
-            text, ok = QtWidgets.QInputDialog.getText(
-                self, "Rename library root",
-                "Display name (the folder is not renamed):", text=current)
-            if ok:
-                self._set_root_label(root, text.strip())
-            return
-        if not category or root_cfg is None or root_cfg["read_only"]:
-            return
-        leaf = category.rsplit("/", 1)[-1]
-        text, ok = QtWidgets.QInputDialog.getText(
-            self, "Rename category",
-            "New folder name (asset.json files are updated; scene nodes are relinked):",
-            text=leaf)
-        if not ok or not text.strip() or schema.sanitize_name(text) == leaf:
-            return
-        used = [r for r in self.records
-                if library.in_scope(r, root, asset_type, category) and r.key in self._usage]
-        try:
-            pairs = manage.rename_category(root_cfg["expanded"], asset_type, category, text)
-        except manage.ManageError as e:
-            self._error(e)
-            return
-        by_old = {os.path.normcase(os.path.abspath(old)): new for old, new in pairs}
-        moved, warnings = [], []
-        for rec in used:
-            new_dir = by_old.get(os.path.normcase(os.path.abspath(rec.asset_dir)))
-            if new_dir is None:
-                continue
-            warnings.extend(self._relink(rec, new_dir))
-            moved.append((rec, new_dir))
-        self._after_move(moved, "Renamed category to %s." % schema.sanitize_name(text), warnings)
+    def _root_name(self, r, roots):
+        """The folder name of a root, parent/name when two roots share a name."""
+        path = os.path.normpath(r["expanded"])
+        name = os.path.basename(path)
+        if not name:
+            return r["path"]
+        same = [o for o in roots
+                if os.path.basename(os.path.normpath(o["expanded"])) == name]
+        if len(same) > 1:
+            parts = path.replace("\\", "/").rstrip("/").split("/")
+            if len(parts) >= 2:
+                return "%s/%s" % (parts[-2], parts[-1])
+        return name
 
     # ---- filtering ---------------------------------------------------------------------------
     def _on_type_toggled(self, _checked):
