@@ -25,6 +25,11 @@ VENDOR_KINDS = ("megascans", "gsg")
 ROOT_KINDS = ("library",) + VENDOR_KINDS
 ROOT_KIND_LABELS = {"library": "Library", "megascans": "Megascans", "gsg": "Greyscalegorilla"}
 
+COLOR_LABELS = (("red", "Red", (220, 60, 60)), ("orange", "Orange", (235, 140, 40)),
+                ("yellow", "Yellow", (230, 205, 50)), ("green", "Green", (80, 180, 80)),
+                ("blue", "Blue", (70, 130, 220)), ("purple", "Purple", (160, 90, 200)))
+COLOR_LABEL_KEYS = tuple(key for key, _label, _rgb in COLOR_LABELS)
+
 # Multi-part extensions first so ".bgeo.sc" wins over ".sc".
 _MULTI_EXTS = (".bgeo.sc", ".bgeo.gz", ".bgeo.lzma", ".bgeo.bz2", ".geo.sc", ".geo.gz")
 GEO_EXTS = {".bgeo.sc", ".bgeo.gz", ".bgeo.lzma", ".bgeo.bz2", ".bgeo", ".geo", ".geo.sc", ".geo.gz",

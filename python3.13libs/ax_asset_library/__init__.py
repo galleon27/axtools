@@ -12,7 +12,7 @@ import sys
 from . import schema, library, prefs  # noqa: F401
 
 # Reload order: dependencies first.
-_SUBMODULES = ("schema", "library", "prefs", "textures", "megascans", "gsg", "karma", "thumbnails", "materials",
+_SUBMODULES = ("schema", "library", "prefs", "textures", "variants", "megascans", "gsg", "karma", "thumbnails", "materials",
                "importers", "publish", "manage", "scene", "dragdrop",
                "ui.grid", "ui.details", "ui.dialogs", "ui.panel")
 

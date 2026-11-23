@@ -6,7 +6,7 @@ import hou
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import (importers, library, manage, materials, prefs as _prefs, publish, scene,
-               schema, thumbnails)
+               schema, thumbnails, variants)
 from . import details, dialogs, grid
 
 Qt = QtCore.Qt
@@ -15,13 +15,28 @@ RESCAN_AFTER_S = 60  # rescan when the panel is shown again after this long
 RECENTLY_ADDED_DAYS = 14
 
 SORT_MODES = (("name", "Name"), ("type", "Type"), ("category", "Category"),
-              ("added", "Newest"), ("modified", "Recently changed"))
+              ("added", "Newest"), ("modified", "Recently changed"), ("label", "Color label"))
+
+
+def _resolution_order(labels):
+    """Resolution labels highest first; the no-token "" label last."""
+    def key(label):
+        digits = label[:-1] if label else ""
+        return (label != "", int(digits) if digits.isdigit() else 0)
+    return sorted(labels, key=key, reverse=True)
 IMAGE_FILTER = "Images (*.jpg *.jpeg *.png *.tga *.tif *.tiff *.bmp *.webp *.exr *.hdr *.rat)"
 GEO_FILTER = "Geometry (%s)" % " ".join("*" + e for e in sorted(schema.GEO_EXTS))
 ASSET_FILTER = "Geometry and images (%s)" % " ".join(
     "*" + e for e in sorted(schema.GEO_EXTS | schema.IMAGE_EXTS))
 
 _ICONS = {}
+
+
+def color_icon(rgb, size=12):
+    """A square color swatch for menus and the sidebar."""
+    pix = QtGui.QPixmap(size, size)
+    pix.fill(QtGui.QColor(*rgb))
+    return QtGui.QIcon(pix)
 
 
 def icon(name):
@@ -142,6 +157,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._filter_timer.setInterval(150)
         self._filter_timer.timeout.connect(self._apply_filter)
 
+        _prefs.apply_root_vars(self.settings)
         self._load_cached()
         self.rescan()
         self._watch_hip()
@@ -213,13 +229,12 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.btn_add = QtWidgets.QToolButton()
         self.btn_add.setText("Add")  # shown if the icon is missing
         self.btn_add.setIcon(icon("BUTTONS_list_add"))
-        self.btn_add.setToolTip("Add files, a folder, or a Megascans or Greyscalegorilla "
-                                "library. You can also drop files or folders onto the panel.")
+        self.btn_add.setToolTip("Add files or a folder. Megascans and Greyscalegorilla folders "
+                                "are recognized. You can also drop files or folders onto the "
+                                "panel.")
         add_menu = QtWidgets.QMenu(self.btn_add)
         add_menu.addAction("Add files...", self._add_files)
         add_menu.addAction("Add folder...", self._add_folder)
-        add_menu.addAction("Import Megascans library...", self._add_megascans)
-        add_menu.addAction("Import Greyscalegorilla library...", self._add_gsg)
         self.btn_add.setMenu(add_menu)
         self.btn_add.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         bar.addWidget(self.btn_add)
@@ -246,6 +261,11 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.tree.setMinimumWidth(140)
         self.tree.currentItemChanged.connect(self._on_scope_changed)
         self.tree.assets_dropped.connect(self._on_assets_dropped)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
+        shortcut = QtGui.QShortcut(QtGui.QKeySequence("F2"), self.tree)
+        shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        shortcut.activated.connect(lambda: self._rename_tree_item())
         self.splitter.addWidget(self.tree)
 
         self.stack = QtWidgets.QStackedWidget()
@@ -257,6 +277,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.view.rename_requested.connect(self._rename_selected)
         self.view.copy_requested.connect(self._copy_paths)
         self.view.favorite_requested.connect(self._toggle_favorite_selected)
+        self.view.label_requested.connect(self._set_label_selected)
         self.view.customContextMenuRequested.connect(self._context_menu)
         self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.stack.addWidget(self.view)
@@ -424,18 +445,35 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             "Assets added to the library in the last %d days." % RECENTLY_ADDED_DAYS)
         add(None, "In this scene (%d)" % len(self._usage), ("scene",),
             "Assets with nodes in the open scene. Orange dot: a node uses an older version.")
+        labels = _prefs.color_labels(self.settings)
+        label_counts = {}
+        for rec in self.records:
+            key = labels.get(rec.id or "")
+            if key:
+                label_counts[key] = label_counts.get(key, 0) + 1
+        if label_counts:
+            group = add(None, "Color labels", ("label", None),
+                        "Assets with a color label (right-click > Color label, or keys 1-6).")
+            for key, label, rgb in schema.COLOR_LABELS:
+                count = label_counts.get(key, 0)
+                if count:
+                    item = add(group, "%s (%d)" % (label, count), ("label", key))
+                    item.setIcon(0, color_icon(rgb))
         if bad:
             add(None, "Errors / missing files (%d)" % bad, ("broken",))
         for r in self._roots():
             root = r["expanded"]
             n_root = counts.get((root, None, ""), 0)
+            name = r["label"] or r["path"]
             tip = root
+            if r["var"]:
+                tip += "\nVariable: $%s" % r["var"]
             if r["kind"] in schema.VENDOR_KINDS:
                 vendor = schema.ROOT_KIND_LABELS[r["kind"]]
-                label = r["path"] + "  [%s]" % vendor
+                label = name + "  [%s]" % vendor
                 tip += "\n%s library, browsed in place (read-only)." % vendor
             else:
-                label = r["path"] + ("  [read-only]" if r["read_only"] else "")
+                label = name + ("  [read-only]" if r["read_only"] else "")
                 guess = self._guess_vendor(root) if n_root == 0 else None
                 if guess:
                     vendor = schema.ROOT_KIND_LABELS[guess]
@@ -473,6 +511,127 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 p = p.parent()
         self.tree.blockSignals(False)
 
+    def _tree_menu(self, pos):
+        # Keep no QTreeWidgetItem past this point: actions rebuild the tree (tree.clear()),
+        # and a Python wrapper still holding a deleted item crashes Houdini (double free).
+        item = self.tree.itemAt(pos)
+        scope = item.data(0, ScopeRole) if item is not None else None
+        del item
+        if not scope or scope[0] != "scope":
+            return
+        _kind, root, asset_type, category = scope
+        root_cfg = self.settings.root_for(root)
+        menu = QtWidgets.QMenu(self)
+        actions = {}
+
+        def add(text, fn, enabled=True):
+            act = menu.addAction(text)
+            act.setEnabled(enabled)
+            actions[act] = fn
+
+        if asset_type is None:
+            add("Rename...", lambda: self._rename_tree_item(scope))
+            if root_cfg and root_cfg.get("label"):
+                add("Reset name", lambda: self._set_root_label(root, ""))
+            add("Show in file browser", lambda: self._reveal(root))
+            add("Rescan", self.rescan)
+            menu.addSeparator()
+            add("Remove from library list", lambda: self._remove_root(root))
+            add("Settings...", self._open_settings)
+        elif not category:
+            add("Show in file browser", lambda: self._reveal(manage.type_dir(root, asset_type)))
+        else:
+            read_only = bool(root_cfg and root_cfg["read_only"])
+            add("Rename..." + (" (read-only library)" if read_only else ""),
+                lambda: self._rename_tree_item(scope), enabled=not read_only)
+            if not (root_cfg and root_cfg["kind"] in schema.VENDOR_KINDS):
+                folder = os.path.join(manage.type_dir(root, asset_type), *category.split("/"))
+                add("Show in file browser", lambda: self._reveal(folder))
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        menu.deleteLater()
+        fn = actions.get(chosen) if chosen is not None else None
+        if fn is not None:
+            # Run once the context-menu event is over, not inside the menu's mouse release.
+            QtCore.QTimer.singleShot(0, fn)
+
+    def _reveal(self, path):
+        try:
+            importers.reveal(path)
+        except importers.AssetImportError as e:
+            self._message(str(e), warning=True)
+
+    def _remove_root(self, root):
+        root_cfg = self.settings.root_for(root)
+        name = (root_cfg or {}).get("label") or (root_cfg or {}).get("path") or root
+        answer = hou.ui.displayMessage(
+            "Remove %s from the library list?\n\nFiles on disk are not changed." % name,
+            buttons=("Remove", "Cancel"), severity=hou.severityType.Warning,
+            title="AX Asset Library")
+        if answer != 0:
+            return
+        keep = [r for r in self.settings.get("roots")
+                if not (isinstance(r, dict) and _prefs._same(
+                    _prefs.expand(r.get("path", "")), root))]
+        self.settings.set("roots", keep)
+        QtCore.QTimer.singleShot(0, self.rescan)
+
+    def _set_root_label(self, root, label):
+        roots = []
+        for r in self.settings.get("roots"):
+            if isinstance(r, dict) and _prefs._same(_prefs.expand(r.get("path", "")), root):
+                r = dict(r)
+                if label:
+                    r["label"] = label
+                else:
+                    r.pop("label", None)
+            roots.append(r)
+        self.settings.set("roots", roots)
+        QtCore.QTimer.singleShot(0, self._rebuild_tree)
+
+    def _rename_tree_item(self, scope=None):
+        """Rename the root (display name) or category of `scope` (default: current item)."""
+        if scope is None:
+            item = self.tree.currentItem()
+            scope = item.data(0, ScopeRole) if item is not None else None
+            del item
+        if not scope or scope[0] != "scope":
+            return
+        _kind, root, asset_type, category = scope
+        root_cfg = self.settings.root_for(root)
+        if asset_type is None:
+            current = (root_cfg or {}).get("label") or (root_cfg or {}).get("path") or root
+            text, ok = QtWidgets.QInputDialog.getText(
+                self, "Rename library root",
+                "Display name (the folder is not renamed):", text=current)
+            if ok:
+                self._set_root_label(root, text.strip())
+            return
+        if not category or root_cfg is None or root_cfg["read_only"]:
+            return
+        leaf = category.rsplit("/", 1)[-1]
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename category",
+            "New folder name (asset.json files are updated; scene nodes are relinked):",
+            text=leaf)
+        if not ok or not text.strip() or schema.sanitize_name(text) == leaf:
+            return
+        used = [r for r in self.records
+                if library.in_scope(r, root, asset_type, category) and r.key in self._usage]
+        try:
+            pairs = manage.rename_category(root_cfg["expanded"], asset_type, category, text)
+        except manage.ManageError as e:
+            self._error(e)
+            return
+        by_old = {os.path.normcase(os.path.abspath(old)): new for old, new in pairs}
+        moved, warnings = [], []
+        for rec in used:
+            new_dir = by_old.get(os.path.normcase(os.path.abspath(rec.asset_dir)))
+            if new_dir is None:
+                continue
+            warnings.extend(self._relink(rec, new_dir))
+            moved.append((rec, new_dir))
+        self._after_move(moved, "Renamed category to %s." % schema.sanitize_name(text), warnings)
+
     # ---- filtering ---------------------------------------------------------------------------
     def _on_type_toggled(self, _checked):
         self._apply_filter()
@@ -492,7 +651,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         types = {t for t, b in self.type_buttons.items() if b.isChecked()}
         favs = _prefs.favorites(self.settings)
         recent = _prefs.recent(self.settings)
-        query = library.Query(self.search.text(), favs)
+        labels = _prefs.color_labels(self.settings)
+        query = library.Query(self.search.text(), favs, labels)
         out = []
         for r in self.records:
             if scope[0] == "broken" and not (r.broken or r.missing):
@@ -505,13 +665,20 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 continue
             if scope[0] == "scene" and r.key not in self._usage:
                 continue
+            if scope[0] == "label":
+                label = labels.get(r.id or "")
+                if scope[1] is None:
+                    if not label:
+                        continue
+                elif label != scope[1]:
+                    continue
             if scope[0] == "scope" and not library.in_scope(r, scope[1], scope[2], scope[3]):
                 continue
             if types and r.type not in types:
                 continue
             if query.matches(r):
                 out.append(r)
-        out = library.sort_records(out, self.sort_combo.currentData() or "name")
+        out = library.sort_records(out, self.sort_combo.currentData() or "name", labels)
         if scope[0] == "recent":
             out.sort(key=lambda r: recent.get(r.id, ""), reverse=True)
         self._refresh_marks(favs)
@@ -524,9 +691,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             self._select_after_scan = set()
 
         if not self._roots():
-            self.empty_label.setText(
-                "No library folder set.\nSet the %s environment variable or add a folder in "
-                "Settings." % _prefs.ENV_VAR)
+            self.empty_label.setText("No library folder set.\nAdd a folder in Settings.")
             self.stack.setCurrentIndex(1)
         else:
             self.stack.setCurrentIndex(0)
@@ -617,6 +782,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 default = act
         menu.setActiveAction(default)
         chosen = menu.exec(QtGui.QCursor.pos(), default)
+        menu.deleteLater()
         if chosen is None:
             return None
         self.settings.set("material_renderer", chosen.data())
@@ -627,16 +793,58 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         if recs:
             self._import_records(recs, renderer)
 
-    def _import_records(self, recs, renderer=None, target=None, position=None):
+    def _import_records(self, recs, renderer=None, target=None, position=None,
+                        as_geometry=None):
         """Import `recs` into the current network (or `target`); returns the created nodes."""
-        if renderer is None and any(r.type == "material" for r in recs):
+        ctx, network = None, None
+        try:
+            if target is None:
+                _editor, network, ctx = importers.current_target()
+            else:
+                network = target[1]
+                ctx = importers.check_target(*target)
+        except importers.AssetImportError:
+            pass
+
+        lod = resolution = None
+        asked = False   # the import options dialog already picked the renderer
+        if ctx in ("sop", "obj", "lop") and network is not None:
+            lods, resolutions = set(), set()
+            atlas = False
+            for rec in recs:
+                if rec.type == "geometry":
+                    lods.update(variants.lod_files(rec.files))
+                    mrec = variants.linked_material(rec, self.records)
+                    if mrec is not None:
+                        resolutions.update(variants.resolution_sets(mrec.files_for(mrec.current)))
+                elif rec.type == "material":
+                    atlas = atlas or variants.is_atlas(rec)
+                    resolutions.update(variants.resolution_sets(rec.files_for(rec.current)))
+            linked = any(rec.type == "geometry" and variants.linked_material(rec, self.records)
+                         for rec in recs)
+            if linked or len(lods) > 1 or atlas:
+                dialog = dialogs.ImportOptionsDialog(
+                    sorted(lods), _resolution_order(resolutions),
+                    materials.available_renderers(), self.settings, atlas=atlas, parent=self)
+                if as_geometry is not None:
+                    dialog.trace.setChecked(as_geometry)
+                accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
+                dialog.deleteLater()
+                if not accepted:
+                    return []
+                renderer, lod, resolution, as_geometry = dialog.values()
+                asked = True
+        if not asked and renderer is None and (
+                any(r.type == "material" for r in recs)
+                or (network is not None and importers.needs_renderer(recs, network))):
             renderer = self._ask_renderer()
             if renderer is None:
                 return []
         try:
             nodes, warnings = importers.import_records(
                 recs, self.settings, self._picked_version(recs), renderer,
-                target=target, position=position)
+                target=target, position=position, lod=lod, resolution=resolution,
+                records_all=self.records, as_geometry=as_geometry)
         except importers.AssetImportError as e:
             hou.ui.displayMessage(str(e), severity=hou.severityType.Warning,
                                   title="AX Asset Library")
@@ -715,6 +923,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self)
         if recs:
             possible = True
+            ctx = None
             try:
                 _e, network, ctx = importers.current_target()
                 label = "Import into %s" % importers.CONTEXT_LABELS.get(ctx, "this network")
@@ -731,6 +940,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             else:
                 act = menu.addAction(label, lambda: self._import_selected())
                 act.setEnabled(possible)
+            if possible and ctx == "vop" and any(r.type == "image" for r in recs):
+                menu.addAction("Import texture node", lambda: self._import_selected())
+            if possible and len(recs) == 1 and variants.is_atlas(recs[0]):
+                menu.addAction("Import as traced geometry",
+                               lambda: self._import_records(recs, as_geometry=True))
+                menu.addAction("Import as material only",
+                               lambda: self._import_records(recs, as_geometry=False))
             menu.addAction("Copy path", self._copy_paths)
             if len(recs) == 1:
                 menu.addAction("Show in folder", self._reveal_selected)
@@ -745,6 +961,16 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             all_fav = all(r.id in favs for r in recs if r.id)
             menu.addAction("Remove from favorites" if all_fav else "Add to favorites",
                            lambda: self._set_favorite(recs, not all_fav))
+            labels_for = _prefs.color_labels(self.settings)
+            current = {labels_for.get(r.id or "", "") for r in recs}
+            sub = menu.addMenu("Color label")
+            for index, (key, label, rgb) in enumerate(schema.COLOR_LABELS, start=1):
+                act = sub.addAction(color_icon(rgb), "%s (%d)" % (label, index),
+                                    lambda k=key: self._set_label_selected(k))
+                act.setCheckable(True)
+                act.setChecked(len(current) == 1 and key in current)
+            sub.addAction(color_icon((90, 90, 90)), "None (0)",
+                          lambda: self._set_label_selected(""))
             used = [self._usage[r.key] for r in recs if r.key in self._usage]
             if used:
                 menu.addAction("Select nodes in scene", self._scene_select_selected)
@@ -763,6 +989,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         menu.addAction("Add files...", self._add_files)
         menu.addAction("Rescan", self.rescan)
         menu.exec(self.view.viewport().mapToGlobal(pos))
+        menu.deleteLater()
 
     # ---- collections / scene ---------------------------------------------------------------
     def _recently_added(self, rec):
@@ -786,6 +1013,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         d = self.view.delegate
         d.favorites = _prefs.favorites(self.settings) if favs is None else favs
         d.scene = {k: bool(u.outdated) for k, u in self._usage.items()}
+        d.labels = _prefs.color_labels(self.settings)
+        self.details.labels = d.labels
         self.view.viewport().update()
 
     def _refresh_scene(self, rebuild=True):
@@ -828,6 +1057,17 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     def _set_favorite(self, recs, on):
         _prefs.set_favorite(self.settings, [r.id for r in recs if r.id], on)
+        self._rebuild_tree()
+        self._apply_filter()
+
+    def _set_label_selected(self, key):
+        recs = self.view.selected_records()
+        if not recs:
+            return
+        _prefs.set_color_label(self.settings, [r.id for r in recs if r.id], key)
+        name = dict((k, label) for k, label, _rgb in schema.COLOR_LABELS).get(key)
+        self._message("%s: %s." % ("Label cleared" if not key else "Label set to %s" % name,
+                                   ", ".join(r.name for r in recs)))
         self._rebuild_tree()
         self._apply_filter()
 
@@ -1106,38 +1346,6 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             self.settings.set("last_ingest_dir", d)
             self._ingest([d])
 
-    def _add_megascans(self):
-        start = self.settings.get("megascans_dir") or os.environ.get("MEGASCANS", "")
-        d = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Megascans library (the Downloaded folder, or any folder inside it)", start)
-        if not d:
-            return
-        self.settings.set("megascans_dir", d)
-        plan = publish.plan_ingest([d])
-        if not plan.megascans:
-            hou.ui.displayMessage(
-                "No Megascans assets found in %s.\n\nPick the Bridge download folder "
-                "(usually 'Downloaded'): each asset folder in it has an <id>.json file." % d,
-                severity=hou.severityType.Message, title="AX Asset Library")
-            return
-        self._ingest([d], plan)
-
-    def _add_gsg(self):
-        start = self.settings.get("gsg_dir") or ""
-        d = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Greyscalegorilla library (or any folder inside it)", start)
-        if not d:
-            return
-        self.settings.set("gsg_dir", d)
-        plan = publish.plan_ingest([d])
-        if not plan.gsg:
-            hou.ui.displayMessage(
-                "No Greyscalegorilla assets found in %s.\n\nPick the library folder (with "
-                "hdris, materials, models, textures): each asset folder in it has a .gsga or "
-                ".gsgm file." % d, severity=hou.severityType.Message, title="AX Asset Library")
-            return
-        self._ingest([d], plan)
-
     def _ingest(self, paths, plan=None):
         if not self.settings.writable_roots():
             hou.ui.displayMessage("Add a library folder that is not read-only in Settings first.",
@@ -1204,6 +1412,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
     # ---- settings / lifecycle -----------------------------------------------------------
     def _open_settings(self):
         if dialogs.SettingsDialog(self.settings, self).exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            _prefs.apply_root_vars(self.settings)
             self._load_cached()
             self.rescan()
 

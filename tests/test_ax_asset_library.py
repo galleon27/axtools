@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
                                 "python3.13libs"))
 
 from ax_asset_library import (gsg, karma, library, manage, megascans, prefs,  # noqa: E402
-                              schema, textures)
+                              schema, textures, variants)
 
 
 def make_gsg_library(root):
@@ -274,6 +274,57 @@ class VersionTests(unittest.TestCase):
             with open(library.index_path(cache, d), "w") as f:
                 json.dump({"version": 1, "root": d, "entries": {"x": {}}}, f)
             self.assertEqual(library.load_index(cache, d), {})
+
+
+class VariantsTests(unittest.TestCase):
+    def test_lod_files_and_pick(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("x_LOD0.fbx", "x_LOD1.fbx", "x_LOD3.fbx", "x_LOD0.abc"):
+                open(os.path.join(d, name), "w").close()
+            files = {"fbx": os.path.join(d, "x_LOD0.fbx"),
+                     "abc": os.path.join(d, "x_LOD0.abc")}
+            lods = variants.lod_files(files)
+            self.assertEqual(sorted(lods), [0, 1, 3])
+            self.assertEqual(sorted(lods[1]), ["fbx"])
+        self.assertEqual(variants.pick_lod([0, 1, 3], 2), 1)
+        self.assertEqual(variants.pick_lod([0, 1, 3], 5), 3)
+        self.assertEqual(variants.pick_lod([2, 3], 0), 2)
+        self.assertEqual(variants.lod_label(-1), "Full")
+
+    def test_resolution_sets_and_pick(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("a_2K_Albedo.jpg", "a_4K_Albedo.jpg", "a_4K_Normal.jpg"):
+                open(os.path.join(d, name), "w").close()
+            channels = {"basecolor": os.path.join(d, "a_4K_Albedo.jpg"),
+                        "normal": os.path.join(d, "a_4K_Normal.jpg")}
+            sets = variants.resolution_sets(channels)
+            self.assertEqual(list(sets), ["4K", "2K"])
+            self.assertEqual(sets["2K"]["basecolor"], os.path.join(d, "a_2K_Albedo.jpg"))
+            self.assertEqual(sets["2K"]["normal"], channels["normal"])
+            self.assertEqual(variants.resolution_sets({"basecolor": "x.jpg"}), {"": {"basecolor": "x.jpg"}})
+        self.assertEqual(variants.pick_resolution(["4K", "2K"], "8K"), "4K")
+        self.assertEqual(variants.pick_resolution(["4K", "2K"], "1K"), "2K")
+        self.assertEqual(variants.pick_resolution(["4K", "2K"], ""), "4K")
+
+    def test_linked_material_library(self):
+        geo = library.AssetRecord(name="Rock", type="geometry", info={"megascans_id": "abc"},
+                                  root="/lib2")
+        mat = library.AssetRecord(name="Rock Mat", type="material", info={"megascans_id": "abc"},
+                                  root="/lib1")
+        same_root = library.AssetRecord(name="Rock Mat 2", type="material",
+                                        info={"megascans_id": "abc"}, root="/lib2")
+        self.assertIs(variants.linked_material(geo, [geo, mat, same_root]), same_root)
+        self.assertIsNone(variants.linked_material(geo, [geo]))
+
+    def test_is_atlas(self):
+        rec = library.AssetRecord(type="material", info={"vendor_kind": "atlas"},
+                                  files={"basecolor": "a.jpg"})
+        self.assertTrue(variants.is_atlas(rec))
+        rec.info = {"vendor_kind": "surface"}
+        rec.files = {"basecolor": "a.jpg", "opacity": "b.jpg"}
+        self.assertTrue(variants.is_atlas(rec))
+        rec.files = {"basecolor": "a.jpg"}
+        self.assertFalse(variants.is_atlas(rec))
 
 
 class KarmaTests(unittest.TestCase):
@@ -552,6 +603,17 @@ class MegascansTests(unittest.TestCase):
         self.assertEqual(plant[0][3]["megascans_size_m"], 0.26)
         self.assertNotIn("Billboard", plant[2][2]["basecolor"])  # atlas, not billboard
         self.assertEqual(megascans.plan(by["xyzbrush"]), [])
+
+    def test_linked_material_records(self):
+        recs, errors = library.scan_roots([(self.dl, "megascans")],
+                                          os.path.join(self.tmp.name, "cache"))
+        self.assertFalse(errors, errors)
+        geo = next(r for r in recs if r.type == "geometry"
+                   and r.id.startswith("megascans:wgqvdhf:"))
+        mat = variants.linked_material(geo, recs)
+        self.assertIsNotNone(mat)
+        self.assertEqual(mat.type, "material")
+        self.assertEqual(mat.id.split(":")[:2], geo.id.split(":")[:2])
 
     def test_check_scale_and_height(self):
         info = {"import_scale": 0.01, "megascans_size_m": 1.02,
@@ -863,6 +925,24 @@ class ManageTests(unittest.TestCase):
         again, _ = make_asset(self.root, "geometry", "rocks", "Boulder")
         self.assertNotEqual(manage.trash(again, self.root, "geometry"), dst)
 
+    def test_rename_category(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "lib")
+            make_asset(root, "geometry", "rocks/cliff", "a1")
+            make_asset(root, "geometry", "rocks", "b1")
+            moved = manage.rename_category(root, "geometry", "rocks", "stones")
+            self.assertEqual(sorted(os.path.basename(new) for _old, new in moved), ["a1", "b1"])
+            stones = os.path.join(root, "geometry", "stones")
+            self.assertEqual(schema.load(os.path.join(stones, "cliff", "a1", "asset.json"))["category"],
+                             "stones/cliff")
+            self.assertEqual(schema.load(os.path.join(stones, "b1", "asset.json"))["category"],
+                             "stones")
+            self.assertFalse(os.path.exists(os.path.join(root, "geometry", "rocks")))
+            with self.assertRaises(manage.ManageError):
+                manage.rename_category(root, "geometry", "stones", "")
+            with self.assertRaises(manage.ManageError):
+                manage.rename_category(root, "geometry", "stones", "a/b")
+
 
 class CollectionTests(unittest.TestCase):
     def test_favorites_recent_query(self):
@@ -915,14 +995,42 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(self.names("BIG boulder"), ["Big Boulder"])
 
 
+class LabelTests(unittest.TestCase):
+    def test_set_and_clear(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.json")
+            s = prefs.Prefs(path)
+            prefs.set_color_label(s, ["a", "b"], "red")
+            self.assertEqual(prefs.color_labels(s), {"a": "red", "b": "red"})
+            prefs.set_color_label(s, ["a"], "")
+            self.assertEqual(prefs.color_labels(s), {"b": "red"})
+            with self.assertRaises(ValueError):
+                prefs.set_color_label(s, ["a"], "magenta")
+            self.assertEqual(prefs.color_labels(prefs.Prefs(path)), {"b": "red"})
+
+    def test_query_and_sort(self):
+        recs = [library.AssetRecord(id="a", name="Zulu"),
+                library.AssetRecord(id="b", name="Alpha"),
+                library.AssetRecord(id="c", name="Mike")]
+        labels = {"a": "red", "b": "green"}
+        names = lambda q: [r.name for r in recs if q.matches(r)]  # noqa: E731
+        self.assertEqual(names(library.Query("label:red", labels=labels)), ["Zulu"])
+        self.assertEqual(names(library.Query("label:any", labels=labels)), ["Zulu", "Alpha"])
+        self.assertEqual(names(library.Query("label:none", labels=labels)), ["Mike"])
+        self.assertEqual(names(library.Query("-label:red", labels=labels)), ["Alpha", "Mike"])
+        self.assertEqual([r.name for r in library.sort_records(recs, "label", labels)],
+                         ["Zulu", "Alpha", "Mike"])
+
+
 class PrefsTests(unittest.TestCase):
     def test_roots_and_parm_path(self):
         with tempfile.TemporaryDirectory() as d:
             os.environ[prefs.ENV_VAR] = d
             try:
                 p = prefs.Prefs(os.path.join(d, "p.json"))
+                self.assertEqual(p.roots(), [])             # no $AX_ASSET_LIB fallback
+                p.set("roots", [{"path": "$" + prefs.ENV_VAR, "read_only": True}])
                 roots = p.roots()
-                self.assertEqual(roots[0]["path"], "$AX_ASSET_LIB")
                 self.assertEqual(roots[0]["expanded"], os.path.normpath(d))
                 f = os.path.join(d, "geometry", "rocks", "A", "v001", "a.bgeo.sc")
                 self.assertEqual(prefs.parm_path(f, roots[0], "token"),
@@ -938,6 +1046,27 @@ class PrefsTests(unittest.TestCase):
                 self.assertIsNotNone(again.root_for(d))
             finally:
                 del os.environ[prefs.ENV_VAR]
+
+    def test_check_var(self):
+        self.assertEqual(prefs.check_var(""), "")
+        self.assertEqual(prefs.check_var("MEGASCANS"), "")
+        for bad in ("HIP", "HOUDINI_PATH", "1A", "A-B"):
+            self.assertNotEqual(prefs.check_var(bad), "", bad)
+
+    def test_apply_root_vars(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = prefs.Prefs(os.path.join(d, "p.json"))
+            p.set("roots", [{"var": "megascans", "path": d, "read_only": False}], save=False)
+            applied = prefs.apply_root_vars(p)
+            try:
+                self.assertEqual(applied, {"MEGASCANS": os.path.normpath(d)})
+                self.assertEqual(os.environ["MEGASCANS"], os.path.normpath(d))
+                root = p.roots()[0]
+                self.assertEqual(root["var"], "MEGASCANS")
+                f = os.path.join(d, "3d", "x.fbx")
+                self.assertEqual(prefs.parm_path(f, root, "token"), "$MEGASCANS/3d/x.fbx")
+            finally:
+                os.environ.pop("MEGASCANS", None)
 
     def test_bad_types_ignored(self):
         with tempfile.TemporaryDirectory() as d:

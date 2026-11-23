@@ -3,9 +3,11 @@ another version, and relink them after an asset was renamed or moved.
 
 Nodes are found by the user data the importers set (ax_asset_id / ax_asset_version).
 """
+import os
+
 import hou
 
-from . import importers, materials, schema
+from . import importers, materials, megascans, schema, variants
 from .textures import CHANNELS
 
 # Parms that hold the asset file on nodes the importers create.
@@ -63,9 +65,31 @@ def usage(records, nodes_by_id=None):
 
 
 # --- updating nodes ------------------------------------------------------------------------
+def _same_lod(files, current):
+    """The files at the LOD the node loads now (an LOD picked at import), else `files`."""
+    rank = megascans.lod_rank(current) if current else -1
+    if rank < 0:
+        return files
+    lods = variants.lod_files(files)
+    pick = variants.pick_lod(list(lods), rank)
+    return lods.get(pick, files)
+
+
+def _same_resolution(files, current, cache):
+    """{channel: file} at the texture resolution the node uses now (picked at import)."""
+    m = variants.RES_RE.search(os.path.basename(current or ""))
+    if not m:
+        return files
+    if "sets" not in cache:
+        cache["sets"] = variants.resolution_sets(files)
+    sets = cache["sets"]
+    pick = variants.pick_resolution(list(sets), "%sK" % m.group(1))
+    return sets.get(pick, files)
+
+
 def _geometry_value(rec, settings, version, current):
     """Parm value for a geometry loader, keeping the format the node loads now if possible."""
-    files = rec.files_for(version)
+    files = _same_lod(rec.files_for(version), current)
     key = schema.format_key(current) if current else None
     if key in files:
         return importers.to_parm(rec, settings, files[key])
@@ -115,6 +139,7 @@ def _update_node(node, rec, settings, version, warnings):
 
     if rec.type == "material" and node.type().name() != "materiallibrary":
         files = rec.files_for(version)
+        res_cache = {}
         missing = set()
         for child in node.allSubChildren():
             channel = _channel(child)
@@ -128,7 +153,8 @@ def _update_node(node, rec, settings, version, warnings):
                 parm = child.parm(pname)
                 if parm is None:
                     continue
-                value = importers.to_parm(rec, settings, files[channel])
+                chosen = _same_resolution(files, parm.unexpandedString(), res_cache)
+                value = importers.to_parm(rec, settings, chosen.get(channel, files[channel]))
                 if parm.unexpandedString() != value:
                     parm.set(value)
                     changed = True

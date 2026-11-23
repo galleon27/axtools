@@ -200,7 +200,7 @@ def plan(asset):
     HDRIs: the .exr (else .hdr). Materials: base color/roughness/normal/height...; maps the
     builders don't wire (anisotropy, sheen, scattering) are kept as extra files. Gobo
     textures: an image asset. Models: geometry, plus a material when there are textures."""
-    info = {"gsg_id": asset.id}
+    info = {"gsg_id": asset.id, "vendor_kind": asset.kind}
     if asset.kind == "hdri":
         return _hdri(asset, info)
     if asset.kind == "material":

@@ -82,6 +82,7 @@ class DetailsPane(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.labels = {}   # asset id -> color label key (set by the panel)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(6)
@@ -328,10 +329,10 @@ class DetailsPane(QtWidgets.QWidget):
         self.title.setText(rec.name)
         self.subtitle.setText("%s%s" % (schema.TYPE_LABELS.get(rec.type, rec.type),
                                         (" · " + rec.category) if rec.category else ""))
-        self.body.setText(self._body_html(rec))
+        self.body.setText(self._body_html(rec, self.labels.get(rec.id or "", "")))
 
     @staticmethod
-    def _body_html(rec):
+    def _body_html(rec, label=""):
         rows = []
 
         def row(label, value):
@@ -360,6 +361,10 @@ class DetailsPane(QtWidgets.QWidget):
             row("On disk", _fmt_size(sum(v for v in sizes.values() if isinstance(v, (int, float)))))
         row("Added", _fmt_date(rec.created))
         row("Author", html.escape(rec.author))
+        for key, name, rgb in schema.COLOR_LABELS:
+            if key == label:
+                row("Label", "<span style='color:#%02x%02x%02x'>&#9632;</span> %s"
+                    % (rgb[0], rgb[1], rgb[2], html.escape(name)))
         out = "<table>%s</table>" % "".join(rows)
         warn = list(rec.problems) + ["missing file: %s" % k for k in rec.missing]
         if warn:

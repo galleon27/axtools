@@ -10,6 +10,7 @@ import hou
 from . import materials
 from . import prefs as _prefs
 from . import schema
+from . import variants
 
 UD_ID = "ax_asset_id"
 UD_VERSION = "ax_asset_version"
@@ -33,14 +34,17 @@ ALLOWED_CONTEXTS = {
     "geometry": ("sop", "obj", "lop"),
     "hdri": ("obj", "lop"),
     "material": ("sop", "obj", "lop", "vop", None),
-    "image": (),
+    "image": ("vop",),
 }
 TYPE_WHERE = {
     "geometry": "a SOP, OBJ or LOP network",
     "hdri": "an OBJ network (Environment Light) or a LOP network (Dome Light)",
     "material": "any network",
-    "image": "no network (use Copy path, or drag the image onto a parameter)",
+    "image": "a material network (texture node), or use Copy path",
 }
+IMAGE_NODES = {"karma": ("mtlximage", "file"),
+               "octane": ("NT_TEX_IMAGE", "A_FILENAME"),
+               "redshift": ("redshift::TextureSampler", "tex0")}
 
 
 class AssetImportError(Exception):
@@ -112,11 +116,37 @@ def is_locked(network):
 def creates_in_network(rec_type, network, ctx):
     """True when importing a `rec_type` asset with context `ctx` creates nodes in `network`
     itself (rather than in /mat or a material network above it)."""
-    if rec_type in ("geometry", "hdri"):
+    if rec_type in ("geometry", "hdri", "image"):
         return True
     if rec_type == "material":
         return ctx == "lop" or (ctx == "vop" and material_container(network) == network)
     return False
+
+
+def renderer_of(network):
+    """Renderer of the material network `network` is in, or None when it isn't clear."""
+    container = material_container(network)
+    node = network
+    while node is not None:
+        if node is container:
+            return None
+        name = node.type().name()
+        if name in ("redshift_vopnet", "rs_usd_material_builder"):
+            return "redshift"
+        children = [child.type().name() for child in node.children()]
+        if any(n.startswith("octane::") or n.startswith("NT_") for n in children):
+            return "octane"
+        if any(n.startswith("mtlx") or n.startswith("kma") for n in children):
+            return "karma"
+        if node.childTypeCategory() != hou.vopNodeTypeCategory():
+            return None
+        node = node.parent()
+    return None
+
+
+def needs_renderer(records, network):
+    """True when images in `records` need a renderer the network doesn't imply."""
+    return renderer_of(network) is None and any(r.type == "image" for r in records)
 
 
 def current_target():
@@ -188,12 +218,13 @@ def to_parm(rec, settings, path):
     return _prefs.parm_path(path, _root(rec, settings), settings.get("path_mode"))
 
 
-def file_for(rec, settings, version=None):
+def file_for(rec, settings, version=None, files=None):
     """(absolute path, parm path) of the file to load; current version when version is None.
 
-    For a material this is the folder holding its textures.
+    For a material this is the folder holding its textures. `files` overrides the record's
+    files (an LOD or a texture resolution picked in the import dialog).
     """
-    files = rec.files_for(version)
+    files = rec.files_for(version) if files is None else files
     if rec.type == "material":
         key = "basecolor" if "basecolor" in files else schema.pick_file(files, [])
         path = os.path.dirname(files[key]) if key else ""
@@ -212,6 +243,70 @@ def parm_path_for(rec, settings):
 
 
 # --- geometry -------------------------------------------------------------------------
+def _geo_files(rec, version, opts):
+    """The record's files, or the picked LOD's files when opts has one."""
+    files = rec.files_for(version)
+    lod = opts.get("lod")
+    if lod is not None:
+        lods = variants.lod_files(files)
+        files = lods[variants.pick_lod(list(lods), lod)]
+    return files
+
+
+def _material_maps(mrec, settings, opts):
+    """{channel: parm path} for a material, at the picked texture resolution.
+    """
+    channels = mrec.files_for(mrec.current)
+    resolution = opts.get("resolution")
+    if resolution is not None:
+        sets = variants.resolution_sets(channels)
+        channels = sets[variants.pick_resolution(list(sets), resolution)]
+    return {ch: to_parm(mrec, settings, p) for ch, p in channels.items()}
+
+
+def _material_in(parent, mrec, maps, renderer, disp):
+    """Build a material node inside `parent` (a /mat, a matnet or a Material Library LOP)."""
+    usd = parent.type().name() == "materiallibrary"
+    return materials.build(parent, unique_name(parent, mrec.name), maps, renderer,
+                           lop=usd, disp_scale=disp)
+
+
+def _build_linked_material(mrec, ctx, network, settings, opts, lop_parent=None):
+    """The material for a linked record, built once per import (cached in opts)."""
+    cache = opts.setdefault("materials", {})
+    if mrec.key in cache:
+        return cache[mrec.key]
+    renderer = opts.get("renderer")
+    maps = _material_maps(mrec, settings, opts)
+    disp = (mrec.info or {}).get("displacement_scale")
+    try:
+        if ctx == "lop":
+            if lop_parent is None:
+                raise AssetImportError("No material library for %s." % mrec.name)
+            mat = materials.build(lop_parent, unique_name(lop_parent, mrec.name), maps,
+                                  renderer, lop=True, disp_scale=disp)
+        else:
+            parent = hou.node("/mat")
+            if parent is None:
+                raise AssetImportError("/mat not found.")
+            if is_locked(parent):
+                raise AssetImportError("%s is inside a locked HDA." % parent.path())
+            mat = _material_in(parent, mrec, maps, renderer, disp)
+            mat.moveToGoodPosition()
+    except materials.MaterialError as e:
+        raise AssetImportError(str(e))
+    _tag_node(mat, mrec, settings, mrec.current)
+    cache[mrec.key] = mat
+    return mat
+
+
+def _material_sop(parent, mat_path, name):
+    node = parent.createNode("material", unique_name(parent, name))
+    node.parm("num_materials").set(1)
+    node.parm("shop_materialpath1").set(mat_path)
+    return node
+
+
 def _sop_loader(parent, rec, path, parm_value):
     node_type, parm = SOP_LOADERS.get(schema.file_ext(path), DEFAULT_SOP_LOADER)
     node = parent.createNode(node_type, unique_name(parent, rec.name))
@@ -252,7 +347,12 @@ def _sop_scale(parent, loader, rec):
 def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     if ctx not in ALLOWED_CONTEXTS["geometry"]:
         raise AssetImportError("geometry imports into %s." % TYPE_WHERE["geometry"])
-    path, value = file_for(rec, settings, version)
+    files = _geo_files(rec, version, opts)
+    path, value = file_for(rec, settings, version, files)
+    mrec = None
+    if opts.get("renderer") and opts.get("records_all"):
+        mrec = variants.linked_material(rec, opts["records_all"])
+
     if ctx == "sop":
         node = _sop_loader(network, rec, path, value)
         node.setPosition(pos)
@@ -260,6 +360,13 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
         last = _sop_scale(network, node, rec)
         if last is not node:
             last.setPosition(pos + hou.Vector2(0, -1))
+        if mrec is not None:
+            mat = _build_linked_material(mrec, ctx, network, settings, opts)
+            mnode = _material_sop(network, mat.path(), rec.name + "_material")
+            mnode.setPosition(last.position() + hou.Vector2(0, -1))
+            mnode.setInput(0, last)
+            _tag_node(mnode, rec, settings, version)
+            return mnode
         return last
 
     if ctx == "obj":
@@ -270,6 +377,14 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
         last = _sop_scale(geo, loader, rec)
         last.setDisplayFlag(True)
         last.setRenderFlag(True)
+        if mrec is not None:
+            mat = _build_linked_material(mrec, ctx, network, settings, opts)
+            mnode = _material_sop(geo, mat.path(), rec.name + "_material")
+            mnode.setPosition(last.position() + hou.Vector2(0, -1))
+            mnode.setInput(0, last)
+            mnode.setDisplayFlag(True)
+            mnode.setRenderFlag(True)
+            _tag_node(mnode, rec, settings, version)
         geo.layoutChildren()
         geo.setPosition(pos)
         _tag_node(geo, rec, settings, version)
@@ -285,6 +400,7 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     _wire_lop(ref, anchor)
     ref.setPosition(pos)
     _tag_node(ref, rec, settings, version)
+    last = ref
     scale = _import_scale(rec)
     if scale != 1.0:
         xf = network.createNode("xform", unique_name(network, rec.name + "_scale"))
@@ -296,8 +412,20 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
         xf.setGenericFlag(hou.nodeFlag.DisplayComment, True)
         if ref.isDisplayFlagSet():
             xf.setDisplayFlag(True)
-        return xf
-    return ref
+        last = xf
+    if mrec is not None:
+        lib = network.createNode("materiallibrary",
+                                 unique_name(network, rec.name + "_material"))
+        lib.setInput(0, last)
+        lib.setPosition(last.position() + hou.Vector2(0, -1))
+        mat = _build_linked_material(mrec, ctx, network, settings, opts, lop_parent=lib)
+        lib.parm("matnode1").set(mat.name())
+        lib.parm("matpath1").set("/materials/" + mat.name())
+        lib.parm("assign1").set(1)
+        lib.parm("geopath1").set(prim)
+        _tag_node(lib, rec, settings, version)
+        return lib
+    return last
 
 
 # --- materials ----------------------------------------------------------------------------
@@ -305,8 +433,7 @@ def _import_material(rec, network, ctx, pos, anchor, settings, version, opts):
     renderer = opts.get("renderer")
     if not renderer:
         raise AssetImportError("No renderer chosen for the material.")
-    files = rec.files_for(version)
-    maps = {ch: to_parm(rec, settings, p) for ch, p in files.items()}
+    maps = _material_maps(rec, settings, opts)
     disp = (rec.info or {}).get("displacement_scale")
     try:
         if ctx == "lop":
@@ -328,10 +455,7 @@ def _import_material(rec, network, ctx, pos, anchor, settings, version, opts):
             raise AssetImportError("/mat not found.")
         if is_locked(parent):
             raise AssetImportError("%s is inside a locked HDA." % parent.path())
-        # Inside a Material Library LOP the Redshift material must be the USD builder.
-        usd = parent.type().name() == "materiallibrary"
-        mat = materials.build(parent, unique_name(parent, rec.name), maps, renderer,
-                              lop=usd, disp_scale=disp)
+        mat = _material_in(parent, rec, maps, renderer, disp)
         if in_place:
             mat.setPosition(pos)
         else:
@@ -362,8 +486,116 @@ def _import_hdri(rec, network, ctx, pos, anchor, settings, version, opts):
 
 
 def _import_image(rec, network, ctx, pos, anchor, settings, version, opts):
-    raise AssetImportError("images have no node to create. Use Copy path, or drag the image "
-                           "onto a parameter.")
+    if ctx != "vop":
+        raise AssetImportError("images import into %s." % TYPE_WHERE["image"])
+    renderer = renderer_of(network) or opts.get("renderer")
+    if renderer is None:
+        raise AssetImportError("Choose a renderer for the texture node.")
+    if network is material_container(network) and renderer != "karma":
+        raise AssetImportError("Open a %s material to add the texture node."
+                               % materials.RENDERER_LABELS.get(renderer, renderer))
+    node_type, parm = IMAGE_NODES[renderer]
+    node = materials._tex_node(network, node_type, schema.sanitize_name(rec.name))
+    _path, value = file_for(rec, settings, version)
+    if _set_first(node, (parm,), value) is None:
+        raise AssetImportError("%s has no %s parameter." % (node.type().name(), parm))
+    if renderer == "karma":
+        materials._set(node, "signature", "color3")
+        materials._set(node, "filecolorspace", "srgb_texture")
+    elif renderer == "octane":
+        materials._set(node, "colorSpace", "NAMED_COLOR_SPACE_SRGB")
+    else:
+        materials._set(node, "tex0_colorSpace", "sRGB")
+    node.setPosition(pos)
+    _tag_node(node, rec, settings, version)
+    return node
+
+
+def _atlas_chain(parent, rec, maps, size, pos):
+    """Trace the opacity map into cutouts, then give each cutout the atlas size."""
+    trace = parent.createNode("trace", unique_name(parent, rec.name + "_trace"))
+    if _set_first(trace, ("file",), maps.get("opacity", "")) is None:
+        raise AssetImportError("%s has no file parameter." % trace.type().name())
+    for parm, value in (("thresh", 0.5), ("addtexture", 1), ("convpoly", 1),
+                        ("dosmooth", 1), ("hole", 1), ("delborder", 1)):
+        trace.parm(parm).set(value)
+    trace.setPosition(pos)
+    # Trace's own UVs (addtexture) match the image for any aspect ratio; don't reproject.
+    divide = parent.createNode("divide", unique_name(parent, rec.name + "_divide"))
+    divide.parm("convex").set(1)
+    divide.setInput(0, trace)
+    divide.setPosition(pos + hou.Vector2(0, -1))
+    match = parent.createNode("matchsize", unique_name(parent, rec.name + "_size"))
+    for parm, value in (("justify_x", 0), ("justify_y", 0), ("justify_z", 0),
+                        ("doscale", 1), ("uniformscale", 1), ("sizex", size), ("sizey", size)):
+        match.parm(parm).set(value)
+    match.setInput(0, divide)
+    match.setPosition(pos + hou.Vector2(0, -2))
+    return trace, match
+
+
+def _import_atlas(rec, network, ctx, pos, anchor, settings, version, opts):
+    """Atlas material as geometry: opacity map -> cutouts -> packed primitives with UVs."""
+    maps = _material_maps(rec, settings, opts)
+    info = rec.info or {}
+    size = info.get("megascans_size_m") or info.get("physical_size") or 1.0
+    renderer = opts.get("renderer")
+
+    if ctx == "lop":
+        sc = network.createNode("sopcreate", unique_name(network, rec.name))
+        sc.setPosition(pos)
+        sc.allowEditingOfContents()
+        trace, last = _atlas_chain(sc.node("sopnet"), rec, maps, size, hou.Vector2(0, 0))
+        last.setDisplayFlag(True)
+        _tag_node(trace, rec, settings, version)
+        if renderer:
+            prefix = sc.parm("pathprefix")
+            prim = prefix.eval() if prefix is not None else ""
+            lib = network.createNode("materiallibrary",
+                                     unique_name(network, rec.name + "_material"))
+            lib.setInput(0, sc)
+            lib.setPosition(pos + hou.Vector2(0, -1))
+            mat = _build_linked_material(rec, "lop", network, settings, opts, lop_parent=lib)
+            lib.parm("matnode1").set(mat.name())
+            lib.parm("matpath1").set("/materials/" + mat.name())
+            lib.parm("assign1").set(1)
+            lib.parm("geopath1").set(prim)
+            _tag_node(lib, rec, settings, version)
+            return lib
+        return sc
+
+    geo = None
+    if ctx == "obj":
+        geo = network.createNode("geo", unique_name(network, rec.name))
+        for child in geo.children():
+            child.destroy()
+        parent, base = geo, hou.Vector2(0, 0)
+    else:
+        parent, base = network, pos
+    trace, last = _atlas_chain(parent, rec, maps, size, base)
+    _tag_node(trace, rec, settings, version)
+    if renderer:
+        mat = _build_linked_material(rec, ctx, network, settings, opts)
+        mnode = _material_sop(parent, mat.path(), rec.name + "_material")
+        mnode.setInput(0, last)
+        mnode.setPosition(last.position() + hou.Vector2(0, -1))
+        _tag_node(mnode, rec, settings, version)
+        last = mnode
+    assemble = parent.createNode("assemble", unique_name(parent, rec.name + "_assemble"))
+    for parm, value in (("connect", 1), ("pack_geo", 1), ("pivot", 1)):
+        assemble.parm(parm).set(value)
+    assemble.parm("transfer_attributes").set("*")
+    assemble.setInput(0, last)
+    assemble.setPosition(last.position() + hou.Vector2(0, -1))
+    if geo is not None:
+        assemble.setDisplayFlag(True)
+        assemble.setRenderFlag(True)
+        geo.layoutChildren()
+        geo.setPosition(pos)
+        _tag_node(geo, rec, settings, version)
+        return geo
+    _tag_node(assemble, rec, settings, version)
+    return assemble
 
 
 IMPORTERS = {"geometry": _import_geometry, "material": _import_material,
@@ -371,13 +603,17 @@ IMPORTERS = {"geometry": _import_geometry, "material": _import_material,
 
 
 def import_records(records, settings, version=None, renderer=None, target=None,
-                   position=None):
+                   position=None, lod=None, resolution=None, records_all=None,
+                   as_geometry=None):
     """Import records into the current network. Returns (nodes, warnings).
 
     `version` picks a version other than the current one (single record only).
-    `renderer` ("karma", "octane", "redshift") is needed when materials are imported.
+    `renderer` ("karma", "octane", "redshift", "none") is needed when materials are imported.
     `target` = (editor, network) imports there instead of the current network; the editor
     may be None. `position` (hou.Vector2, network units) places the first node.
+    `lod` is a wanted LOD rank, `resolution` a texture label such as "4K".
+    `records_all` is the full library list, used to find a model's material.
+    `as_geometry` imports atlas materials as traced geometry (default: in sop/obj/lop).
 
     Raises AssetImportError when nothing can be imported (no editor, wrong context,
     unsupported type).
@@ -387,6 +623,10 @@ def import_records(records, settings, version=None, renderer=None, target=None,
     else:
         editor, network = target
         ctx = check_target(editor, network)
+    if as_geometry is None:
+        as_geometry = ctx in ("sop", "obj", "lop")
+    if ctx == "vop":
+        as_geometry = False
     records = [r for r in records if not r.broken]
     if len(records) != 1:
         version = None
@@ -406,7 +646,9 @@ def import_records(records, settings, version=None, renderer=None, target=None,
             ctx in ALLOWED_CONTEXTS.get(r.type, ()) and creates_in_network(r.type, network, ctx)
             for r in records):
         raise AssetImportError("%s is inside a locked HDA." % network.path())
-    opts = {"renderer": renderer}
+    opts = {"renderer": None if renderer == "none" else renderer,
+            "lod": lod, "resolution": resolution, "records_all": records_all,
+            "materials": {}, "as_geometry": as_geometry}
 
     # A drop has its own position: don't wire to whatever node happens to be selected.
     anchor = _anchor(network) if position is None else None
@@ -425,7 +667,10 @@ def import_records(records, settings, version=None, renderer=None, target=None,
             if missing:
                 warnings.append("%s: missing file(s) %s." % (rec.name, ", ".join(missing)))
             try:
-                node = fn(rec, network, ctx, pos, anchor, settings, use, opts)
+                if rec.type == "material" and opts["as_geometry"] and variants.is_atlas(rec):
+                    node = _import_atlas(rec, network, ctx, pos, anchor, settings, use, opts)
+                else:
+                    node = fn(rec, network, ctx, pos, anchor, settings, use, opts)
             except AssetImportError as e:
                 warnings.append("%s: %s" % (rec.name, e))
                 continue

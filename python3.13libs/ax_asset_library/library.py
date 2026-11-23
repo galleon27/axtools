@@ -359,7 +359,7 @@ TYPE_ALIASES = {
     "hdri": "hdri", "hdr": "hdri", "env": "hdri",
     "img": "image", "image": "image",
 }
-QUERY_FIELDS = ("type", "tag", "cat", "name", "fmt", "fav")
+QUERY_FIELDS = ("type", "tag", "cat", "name", "fmt", "fav", "label")
 _YES = ("1", "yes", "y", "true", "on")
 
 _TOKEN = re.compile(r'(-)?(?:([A-Za-z]+):)?(?:"([^"]*)"?|(\S+))')
@@ -370,14 +370,16 @@ class Query:
 
     Free words must all match (name, tags, category or description). Field tokens:
         type:hdri   tag:rock   cat:trees   name:oak   fmt:abc
-    fav:1 keeps favorites (asset ids in `favorites`).
+    fav:1 keeps favorites (asset ids in `favorites`); label:red, label:any and label:none
+    filter color labels (asset ids in `labels`).
     A leading '-' excludes: -tag:wip, -broken. Quotes group words: tag:"red oak".
     Several values for the same field are OR-ed (type:geo type:hdri).
     """
 
-    def __init__(self, text="", favorites=None):
+    def __init__(self, text="", favorites=None, labels=None):
         self.text = text
         self.favorites = favorites or set()
+        self.labels = labels or {}
         self.terms, self.neg_terms = [], []
         self.fields, self.neg_fields = {}, {}
         for m in _TOKEN.finditer(text or ""):
@@ -417,6 +419,13 @@ class Query:
         if field == "fmt":
             v = value.lstrip(".")
             return any(k == v or k.startswith(v) for k in rec.files)
+        if field == "label":
+            label = self.labels.get(rec.id or "", "")
+            if value in ("any", "1"):
+                return bool(label)
+            if value in ("none", "0"):
+                return not label
+            return label == value
         return False
 
     @staticmethod
@@ -448,8 +457,11 @@ class Query:
         return True
 
 
-def sort_records(records, mode="name"):
-    """Sort by name, or newest first by "added"/"modified" (ties stay in name order)."""
+def sort_records(records, mode="name", labels=None):
+    """Sort by name, or newest first by "added"/"modified" (ties stay in name order).
+
+    "label" sorts by the COLOR_LABELS order, unlabeled last. Needs the labels ({id: key}).
+    """
     out = sorted(records, key=lambda r: (r.name.lower(), r.category.lower()))
     if mode == "type":
         order = {t: i for i, t in enumerate(schema.ASSET_TYPES)}
@@ -460,4 +472,8 @@ def sort_records(records, mode="name"):
         out.sort(key=lambda r: r.created or "", reverse=True)
     elif mode == "modified":
         out.sort(key=lambda r: r.modified or "", reverse=True)
+    elif mode == "label":
+        order = {key: i for i, key in enumerate(schema.COLOR_LABEL_KEYS)}
+        labels = labels or {}
+        out.sort(key=lambda r: order.get(labels.get(r.id or "", ""), len(order)))
     return out

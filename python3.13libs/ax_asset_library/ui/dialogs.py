@@ -3,7 +3,7 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import gsg, karma, library, megascans, prefs as _prefs, publish, schema
+from .. import gsg, karma, library, megascans, prefs as _prefs, publish, schema, variants
 
 Qt = QtCore.Qt
 
@@ -189,45 +189,43 @@ class SettingsDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
 
         lay.addWidget(QtWidgets.QLabel("<b>Library roots</b>"))
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Path", "Read-only", "Type"])
-        self.table.horizontalHeader().setSectionResizeMode(
-            0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        for col in (1, 2):
-            self.table.horizontalHeader().setSectionResizeMode(
-                col, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Variable", "Path", "Read-only", "Type"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for col in (2, 3):
+            header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setColumnWidth(0, 110)
         self.table.verticalHeader().setVisible(False)
-        self.table.setToolTip("Folders scanned for assets. A path can use variables such as "
-                              "$AX_ASSET_LIB; node parms then keep the variable.\n"
+        self.table.setToolTip("Variable: a name such as MEGASCANS. Houdini gets $MEGASCANS set "
+                              "to this root, and imported nodes store $MEGASCANS/... so the .hip "
+                              "file still works when the library moves. Leave it empty to store "
+                              "absolute paths.\n"
                               "Read-only roots are browsed but never written to.\n"
                               + ROOT_TYPE_TIP)
         lay.addWidget(self.table, 1)
-        roots = [r for r in settings.get("roots") if isinstance(r, dict)]
-        if not roots and os.environ.get(_prefs.ENV_VAR):
-            roots = [{"path": "$" + _prefs.ENV_VAR, "read_only": False}]
-        for r in roots:
-            kind = r.get("kind") or ("megascans" if r.get("megascans") else "library")
-            self._add_row(r.get("path", ""), r.get("read_only", False), kind)
+        for r in settings.get("roots"):
+            if isinstance(r, dict):
+                kind = r.get("kind") or ("megascans" if r.get("megascans") else "library")
+                self._add_row(r.get("path", ""), r.get("read_only", False), kind,
+                              r.get("var", ""), r.get("label", ""))
 
         row = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("Add folder...")
         b_add.setToolTip("Pick a folder to add as a library root.")
-        b_var = QtWidgets.QPushButton("Add $%s" % _prefs.ENV_VAR)
-        b_var.setToolTip("Add the root from the %s environment variable." % _prefs.ENV_VAR)
         b_del = QtWidgets.QPushButton("Remove")
         b_del.setToolTip("Remove the selected roots from the list. Files are not touched.")
         b_add.clicked.connect(self._browse)
-        b_var.clicked.connect(lambda: self._add_row("$" + _prefs.ENV_VAR, False))
         b_del.clicked.connect(self._remove)
         row.addWidget(b_add)
-        row.addWidget(b_var)
         row.addWidget(b_del)
         row.addStretch()
         lay.addLayout(row)
 
         form = QtWidgets.QFormLayout()
         self.path_mode = QtWidgets.QComboBox()
-        self.path_mode.addItem("Keep root variable ($AX_ASSET_LIB/...)", "token")
+        self.path_mode.addItem("Keep root variable ($VARIABLE/...)", "token")
         self.path_mode.addItem("Absolute path", "absolute")
         self.path_mode.setCurrentIndex(max(0, self.path_mode.findData(settings.get("path_mode"))))
         self.path_mode.setToolTip("How file paths are written into imported nodes. Keeping the "
@@ -273,29 +271,41 @@ class SettingsDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
-    def _add_row(self, path, read_only, kind="library"):
+    def _add_row(self, path, read_only, kind="library", var="", label=""):
         r = self.table.rowCount()
         self.table.insertRow(r)
+        var_item = QtWidgets.QTableWidgetItem(var)
+        var_item.setToolTip("Letters, numbers and underscores; Houdini gets it as an environment "
+                            "variable. Leave empty to store absolute paths.")
+        self.table.setItem(r, 0, var_item)
         item = QtWidgets.QTableWidgetItem(path)
+        item.setData(Qt.ItemDataRole.UserRole, label)
         item.setToolTip(_prefs.expand(path))
-        self.table.setItem(r, 0, item)
+        self.table.setItem(r, 1, item)
         chk = QtWidgets.QTableWidgetItem()
         chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
         chk.setCheckState(Qt.CheckState.Checked if read_only else Qt.CheckState.Unchecked)
-        self.table.setItem(r, 1, chk)
+        self.table.setItem(r, 2, chk)
         combo = QtWidgets.QComboBox()
         for k in schema.ROOT_KINDS:
             combo.addItem(schema.ROOT_KIND_LABELS[k], k)
         combo.setCurrentIndex(max(0, combo.findData(kind)))
         combo.setToolTip(ROOT_TYPE_TIP)
-        self.table.setCellWidget(r, 2, combo)
+        self.table.setCellWidget(r, 3, combo)
 
     def _browse(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Library root")
         if d:
             kind = ("megascans" if megascans.looks_like_download(d)
                     else "gsg" if gsg.looks_like_library(d) else "library")
-            self._add_row(d.replace("\\", "/"), False, kind)  # vendor roots are read-only anyway
+            var = {"megascans": "MEGASCANS", "gsg": "GSG"}.get(kind, "")
+            used = {(self.table.item(r, 0).text() if self.table.item(r, 0) else "").strip().upper()
+                    for r in range(self.table.rowCount())}
+            base, n = var, 2
+            while var and var in used:
+                var = "%s_%d" % (base, n)
+                n += 1
+            self._add_row(d.replace("\\", "/"), False, kind, var)  # vendor roots are read-only
 
     def _remove(self):
         for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
@@ -303,13 +313,33 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _save(self):
         roots = []
+        seen = {}
         for r in range(self.table.rowCount()):
-            path = (self.table.item(r, 0).text() if self.table.item(r, 0) else "").strip()
-            if path:
-                ro = self.table.item(r, 1).checkState() == Qt.CheckState.Checked
-                combo = self.table.cellWidget(r, 2)
-                kind = combo.currentData() if combo is not None else "library"
-                roots.append({"path": path, "read_only": ro, "kind": kind})
+            path_item = self.table.item(r, 1)
+            path = (path_item.text() if path_item else "").strip()
+            if not path:
+                continue
+            var_item = self.table.item(r, 0)
+            var = (var_item.text() if var_item else "").strip().upper()
+            problem = _prefs.check_var(var)
+            if problem:
+                QtWidgets.QMessageBox.warning(self, "AX Asset Library",
+                                              "Row %d: variable %s. %s"
+                                              % (r + 1, var or "(empty)", problem))
+                return
+            if var and var in seen:
+                QtWidgets.QMessageBox.warning(self, "AX Asset Library",
+                                              "Rows %d and %d both use $%s. Give each root its "
+                                              "own variable." % (seen[var], r + 1, var))
+                return
+            if var:
+                seen[var] = r + 1
+            ro = self.table.item(r, 2).checkState() == Qt.CheckState.Checked
+            combo = self.table.cellWidget(r, 3)
+            kind = combo.currentData() if combo is not None else "library"
+            label = path_item.data(Qt.ItemDataRole.UserRole) or ""
+            roots.append({"var": var, "path": path, "read_only": ro, "kind": kind,
+                          "label": label})
         order = [f.strip().lstrip(".").lower() for f in self.formats.text().split(",") if f.strip()]
         self.settings.set("roots", roots, save=False)
         self.settings.set("path_mode", self.path_mode.currentData(), save=False)
@@ -317,6 +347,78 @@ class SettingsDialog(QtWidgets.QDialog):
         self.settings.set("thumb_renderer", self.renderer.currentData(), save=False)
         self.settings.set("thumb_samples", self.samples.value(), save=False)
         self.settings.set("thumb_resolution", self.resolution.value(), save=False)
+        self.settings.save()
+        self.accept()
+
+
+class ImportOptionsDialog(QtWidgets.QDialog):
+    """Renderer, LOD and texture resolution for a model import."""
+
+    def __init__(self, lods, resolutions, renderers, settings, atlas=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import options")
+        self.settings = settings
+        lay = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+
+        self.renderer = QtWidgets.QComboBox()
+        for key, label in renderers:
+            self.renderer.addItem(label, key)
+        self.renderer.addItem("No material", "none")
+        index = self.renderer.findData(settings.get("material_renderer"))
+        self.renderer.setCurrentIndex(index if index >= 0 else 0)
+        self.renderer.setToolTip("Renderer for the model's material. No material imports the "
+                                 "geometry alone.")
+        form.addRow("Renderer", self.renderer)
+
+        self.lod = QtWidgets.QComboBox()
+        for rank in lods:
+            self.lod.addItem(variants.lod_label(rank), rank)
+        index = self.lod.findData(settings.get("model_lod"))
+        self.lod.setCurrentIndex(index if index >= 0 else 0)
+        self.lod.setToolTip("LOD0 is the most detailed; higher numbers are lighter.")
+        form.addRow("LOD", self.lod)
+        self.lod.setVisible(len(lods) > 1)
+        lod_label = form.labelForField(self.lod)
+        if lod_label is not None:
+            lod_label.setVisible(len(lods) > 1)
+
+        self.resolution = QtWidgets.QComboBox()
+        for label in resolutions:
+            self.resolution.addItem(label or "Original", label)
+        index = self.resolution.findData(settings.get("model_resolution"))
+        self.resolution.setCurrentIndex(index if index >= 0 else 0)
+        self.resolution.setToolTip("Texture resolution used by the material.")
+        form.addRow("Texture resolution", self.resolution)
+        self.resolution.setVisible(len(resolutions) > 1)
+        res_label = form.labelForField(self.resolution)
+        if res_label is not None:
+            res_label.setVisible(len(resolutions) > 1)
+
+        lay.addLayout(form)
+        self.trace = QtWidgets.QCheckBox("Trace opacity into geometry")
+        self.trace.setChecked(True)
+        self.trace.setToolTip("Cut the atlas along its opacity map and pack each shape as "
+                              "geometry. Off imports the material only.")
+        self.trace.setVisible(atlas)
+        lay.addWidget(self.trace)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                             QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def values(self):
+        return (self.renderer.currentData(), self.lod.currentData(),
+                self.resolution.currentData(), self.trace.isChecked())
+
+    def _save(self):
+        renderer = self.renderer.currentData()
+        if renderer != "none":
+            self.settings.set("material_renderer", renderer, save=False)
+        self.settings.set("model_lod", self.lod.currentData(), save=False)
+        self.settings.set("model_resolution", self.resolution.currentData() or "", save=False)
         self.settings.save()
         self.accept()
 

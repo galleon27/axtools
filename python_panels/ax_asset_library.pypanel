@@ -16,13 +16,17 @@ def createInterface():
 
 Browse a folder library of geometry, materials, HDRIs and images, and load them into SOP, OBJ or LOP networks.
 
-Set the `AX_ASSET_LIB` environment variable to the library folder, or add folders in Settings.
+Add library folders in Settings. Each root can have a variable such as `MEGASCANS`; the panel
+sets it in Houdini, so imported node paths read `$MEGASCANS/...`.
 Each asset is a folder with an `asset.json` file, under a folder for its type:
 `<root>/geometry|materials|hdri|images/<category>/<asset>/asset.json`.
 
 * Double-click or press Enter to import the selected assets into the network shown in the
   network editor:
-  * Geometry: SOP gets a File or Alembic SOP, OBJ a Geometry node, LOP a Reference LOP.
+  * Geometry: SOP gets a File or Alembic SOP, OBJ a Geometry node, LOP a Reference LOP. A
+    model's material is built as well and assigned: a Material SOP in SOP and OBJ, the
+    Material Library LOP's assignment in LOP. When the asset has several LODs or texture
+    resolutions, a dialog asks for the renderer, LOD and resolution.
   * Materials: a menu asks for Karma, Octane or Redshift. SOP and OBJ get the material in
     `/mat`, LOP gets a Material Library LOP. When the network editor shows a material network
     (`/mat`, a Material Network, or the inside of a Material Library LOP), the material is
@@ -30,7 +34,12 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
     the material network above, and from any other context into `/mat`. The material is not
     assigned to anything.
   * HDRIs: OBJ gets an Environment Light, LOP a Dome Light.
-  * Images have no node; use __Copy path__ or drag them onto a parameter.
+  * Images: in a material network, an image becomes a texture node for the builder's renderer
+    (`mtlximage` for Karma, Image texture for Octane, TextureSampler for Redshift). Elsewhere
+    use __Copy path__ or drag the image onto a parameter.
+  * Atlas materials import as geometry by default. A Trace SOP reads the opacity map, and each
+    cutout becomes a packed primitive with UVs and the material, sized to the atlas. Choose
+    __Import as material only__ for the plain material instead.
 * Drag an asset onto a network editor to import it where you drop it. A material asks which
   renderer to build.
 * Drag an asset onto a parameter field to paste its path. A material gives its texture folder.
@@ -56,36 +65,43 @@ Each asset is a folder with an `asset.json` file, under a folder for its type:
   14 days) and __In this scene__. A green dot on a thumbnail means the asset has nodes in the
   open scene, an orange dot that some of them use an older version. Click __Update__ in the
   details pane to point them at the current version.
-* Edit an asset's tags and notes in the details pane and click __Save tags__. Favorites and
-  recent imports are stored per user, not in the library.
-* __Add__ > __Import Megascans library...__ reads a Quixel Bridge download folder (usually
-  `Downloaded`). Each asset's `.json` gives its name, tags and category; the name gets the
-  Megascans ID appended (`Beach_Cliff_wdeledb`). Surfaces become materials, 3D assets a
-  geometry asset (most detailed LOD) plus a material, plants one geometry asset per
-  variation plus the atlas material. Files stay where they are unless you tick __Copy files
-  into the library__. Dropping a Megascans folder onto the panel does the same.
-* A Megascans download folder can also be browsed in place: add it in __Settings__ and tick
-  __Megascans__. The panel reads Bridge's `Downloaded` folder and downloader folders with
-  `3d/`, `surfaces/` and `atlases/` (name from the folder name, type from the parent folder).
-  Nothing is written into that folder. Its assets are read-only; favorites and imports work.
-  The first scan of a large library takes a few minutes in the background, later rescans a
-  few seconds. Without preview images the thumbnails show the type letter until you render
-  them; rendered thumbnails are stored in your prefs folder.
+* Right-click a root in the sidebar to rename its display name (the folder is not renamed),
+  show it in the file browser, rescan it, or remove it from the list. Right-click a category
+  of a writable library to rename its folder (F2); scene nodes are relinked. Vendor
+  categories can't be renamed.
+* Edit an asset's tags and notes in the details pane and click __Save tags__. Favorites,
+  color labels and recent imports are stored per user, not in the library.
+* Dropping a Quixel Bridge download folder (usually `Downloaded`) or a Greyscalegorilla
+  library folder onto the panel adds its assets to the library. Each asset's metadata gives
+  its name, tags and category; the Megascans ID is appended to the name
+  (`Beach_Cliff_wdeledb`). Files stay where they are unless __Copy files into the library__
+  is ticked.
+* A Megascans download folder can be browsed in place instead: add it in __Settings__ and set
+  its __Type__ to Megascans. The panel reads Bridge's `Downloaded` folder and downloader
+  folders with `3d/`, `surfaces/` and `atlases/` (name from the folder name, type from the
+  parent folder). Nothing is written into that folder. Its assets are read-only; favorites
+  and imports work. The first scan of a large library takes a few minutes in the background,
+  later rescans a few seconds. Without preview images the thumbnails show the type letter
+  until you render them; rendered thumbnails are stored in your prefs folder.
 * Greyscalegorilla libraries can be browsed in place too: add the library folder in
   __Settings__ and set its __Type__ to Greyscalegorilla (it is picked automatically when the
-  folder is recognized), or import assets with __Add__ > __Import Greyscalegorilla library...__.
-  HDRIs, materials, gobo textures (image assets) and models are read; names and types come
-  from each asset's `.gsga`/`.gsgm` file. Materials use the base color, roughness, normal and
-  height maps; extra maps such as sheen or anisotropy are kept with the asset but not wired.
-  The GSG preview images are the thumbnails, and nothing is written into the library.
+  folder is recognized). HDRIs, materials, gobo textures (image assets) and models are read;
+  names and types come from each asset's `.gsga`/`.gsgm` file. Materials use the base color,
+  roughness, normal and height maps; extra maps such as sheen or anisotropy are kept with the
+  asset but not wired. The GSG preview images are the thumbnails, and nothing is written into
+  the library.
 * Megascans FBX files are in centimeters. Imports add a Transform node with scale 0.01 so the
   asset matches the size in its metadata.
 * __List__ shows assets as rows with type, category, formats and resolution. Sort by name,
-  type, category, newest or recently changed.
+  type, category, newest, recently changed or color label.
+* Color labels: right-click > __Color label__, or keys 1-6 for red, orange, yellow, green,
+  blue and purple; 0 clears the label. The sidebar's __Color labels__ group shows each color
+  with a count, and `label:red`, `label:any` and `label:none` filter by label.
 * Shortcuts in the grid: Enter imports, F2 renames, Del moves to trash, F toggles favorite,
-  Ctrl+C copies the path. Ctrl+F jumps to the search field, F5 rescans.
+  digits 1-6 set a color label and 0 clears it, Ctrl+C copies the path. Ctrl+F jumps to the
+  search field, F5 rescans.
 * Search with words or fields: `type:mat`, `tag:rock`, `cat:trees`, `fmt:abc`, `fav:1`,
-  `-tag:wip`, `broken`.
+  `label:red`, `-tag:wip`, `broken`.
 * F5 rescans the library. Shift-click the Rescan button to clear the cache first.
 
 After editing the code, run `ax_asset_library.dev_reload()` and reopen the panel.

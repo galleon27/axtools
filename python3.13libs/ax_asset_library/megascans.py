@@ -40,7 +40,7 @@ KIND_ALIASES = {
 META_KEYS = ("height", "length", "width", "dimensions")
 FBX_CM_SCALE = 0.01  # Megascans FBX/OBJ files are in centimeters
 MAX_DEPTH = 4        # how deep scan_root looks for asset folders below the root
-CACHE_VERSION = 2    # bump when plan()/records_for() change: cached records are rebuilt
+CACHE_VERSION = 3    # bump when plan()/records_for() change: cached records are rebuilt
 
 
 def _norm(path):
@@ -252,9 +252,12 @@ def find_assets(paths):
 
 
 # --- asset -> library items -------------------------------------------------------------------
-def _lod_rank(path):
+def lod_rank(path):
     m = re.search(r"lod(\d+)", os.path.basename(path).lower())
     return int(m.group(1)) if m else -1
+
+
+_lod_rank = lod_rank
 
 
 def mesh_files(files):
@@ -264,7 +267,7 @@ def mesh_files(files):
         if not schema.is_geometry(f):
             continue
         key = schema.format_key(f)
-        if key not in best or _lod_rank(f) < _lod_rank(best[key]):
+        if key not in best or lod_rank(f) < lod_rank(best[key]):
             best[key] = f
     return best
 
@@ -329,7 +332,11 @@ def plan(asset):
     Surfaces: one material. 3D assets: geometry (most detailed LOD) + material. Plants:
     one geometry asset per variation + the atlas material. Other kinds: nothing.
     """
-    info = {"megascans_id": asset.id}
+    info = {"megascans_id": asset.id, "vendor_kind": asset.kind}
+    if asset.kind == "atlas":
+        size = asset.size_m()
+        if size is not None:
+            info["megascans_size_m"] = size
     content = asset.content
     top = [f for f in content if "/" not in asset.rel(f)]
     if asset.kind in SURFACE_KINDS:

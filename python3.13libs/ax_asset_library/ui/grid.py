@@ -9,6 +9,8 @@ Qt = QtCore.Qt
 RecordRole = Qt.ItemDataRole.UserRole + 1
 ASSET_MIME = "application/x-ax-asset-keys"
 
+LABEL_COLORS = {key: QtGui.QColor(*rgb) for key, _label, rgb in schema.COLOR_LABELS}
+
 TYPE_COLORS = {
     "geometry": QtGui.QColor(37, 170, 142),
     "material": QtGui.QColor(200, 130, 40),
@@ -219,7 +221,24 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
         self.size = 128
         self.favorites = set()   # asset ids
         self.scene = {}          # record key -> True when outdated, False when current
+        self.labels = {}         # asset id -> color label key
         self.list_mode = False
+
+    def _label_color(self, rec):
+        return LABEL_COLORS.get(self.labels.get(rec.id or ""))
+
+    @staticmethod
+    def _label_height(box):
+        return max(5, box.height() // 20)
+
+    def _label_bar(self, painter, box, rec):
+        """Color label: a bar along the bottom of the thumbnail, inside the border."""
+        color = self._label_color(rec)
+        if color is None:
+            return
+        h = self._label_height(box)
+        painter.fillRect(QtCore.QRect(box.x() + 2, box.bottom() - 1 - h, box.width() - 4, h),
+                         color)
 
     def sizeHint(self, option, index):
         fm = option.fontMetrics
@@ -286,10 +305,16 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(box.adjusted(0, 0, -1, -1))
+        if not self.list_mode:   # list rows get a bar at the row's left edge instead
+            self._label_bar(painter, box, rec)   # after the border: selection never hides it
 
         fm = option.fontMetrics
         text_color = option.palette.color(QtGui.QPalette.ColorRole.Text)
         if self.list_mode:
+            label_color = self._label_color(rec)
+            if label_color is not None:
+                painter.fillRect(QtCore.QRect(cell.x(), cell.y() + 2, 5, cell.height() - 4),
+                                 label_color)
             x = box.right() + 10
             w = cell.right() - x - 4
             line = fm.height()
@@ -352,16 +377,17 @@ class AssetDelegate(QtWidgets.QStyledItemDelegate):
             painter.setPen(QtGui.QColor(230, 230, 230))
             painter.drawText(vr, Qt.AlignmentFlag.AlignCenter, label)
 
-        # Favorite star and in-scene dot, bottom left.
+        # Favorite star and in-scene dot, bottom left (above the color label bar).
         x = box.x() + 3
+        lift = self._label_height(box) if self._label_color(rec) is not None else 0
         if rec.id and rec.id in self.favorites:
-            star = QtCore.QRect(x, box.bottom() - 3 - h, h, h)
+            star = QtCore.QRect(x, box.bottom() - 3 - h - lift, h, h)
             painter.setPen(QtGui.QColor(0, 0, 0, 160))
             painter.setBrush(FAV_COLOR)
             painter.drawPolygon(_star(star))
             x += h + 3
         if rec.key in self.scene:
-            dot = QtCore.QRect(x, box.bottom() - 3 - h, h, h).adjusted(2, 2, -2, -2)
+            dot = QtCore.QRect(x, box.bottom() - 3 - h - lift, h, h).adjusted(2, 2, -2, -2)
             painter.setPen(QtGui.QColor(0, 0, 0, 160))
             painter.setBrush(OUTDATED_COLOR if self.scene[rec.key] else SCENE_COLOR)
             painter.drawEllipse(dot)
@@ -386,6 +412,7 @@ class AssetView(QtWidgets.QListView):
     rename_requested = QtCore.Signal()
     copy_requested = QtCore.Signal()
     favorite_requested = QtCore.Signal()
+    label_requested = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -444,6 +471,15 @@ class AssetView(QtWidgets.QListView):
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event):
+        label_keys = {Qt.Key.Key_0: "", Qt.Key.Key_1: "red", Qt.Key.Key_2: "orange",
+                      Qt.Key.Key_3: "yellow", Qt.Key.Key_4: "green", Qt.Key.Key_5: "blue",
+                      Qt.Key.Key_6: "purple"}
+        mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier   # keypad digits too
+        if event.key() in label_keys and mods == Qt.KeyboardModifier.NoModifier \
+                and self.selectionModel().hasSelection():
+            event.accept()
+            self.label_requested.emit(label_keys[event.key()])
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and \
                 self.selectionModel().hasSelection():
             event.accept()
