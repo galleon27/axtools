@@ -102,7 +102,8 @@ class AssetDropHandler:
 
     def choices(self, pane, source):
         payload = read_payload(source) or {}
-        if "material" in payload.get("types", []):
+        types = payload.get("types", [])
+        if types and all(t == "material" for t in types):
             tokens, labels, helps = [], [], []
             for key, label in materials.available_renderers():
                 tokens.append(key)

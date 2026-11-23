@@ -1,12 +1,15 @@
 """Per-user settings: library roots, import options, UI state.
 
-Stored in $HOUDINI_USER_PREF_DIR/ax_asset_library.json. Per-user data (favorites, recents,
-UI state) lives here and not in the library, so two machines syncing the same library
-never write the same file.
+Stored in $HOUDINI_USER_PREF_DIR/ax_asset_library.json. Per-user data (favorites, color
+labels, recents, UI state) lives here and not in the library, so two machines syncing the
+same library never write the same file.
 """
 import copy
 import json
 import os
+import re
+
+from . import schema
 
 try:
     import hou
@@ -18,8 +21,14 @@ PREFS_FILE = "ax_asset_library.json"
 
 GEO_FORMAT_ORDER = ["bgeo.sc", "bgeo", "usd", "usdc", "usda", "usdz", "abc", "fbx", "obj", "ply"]
 
+VAR_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+RESERVED_VARS = {"HIP", "HIPNAME", "HIPFILE", "JOB", "HFS", "HH", "HOME", "TEMP", "TMP", "PATH",
+                 "OS"}
+RESERVED_PREFIXES = ("HOUDINI_",)
+
 DEFAULTS = {
-    "roots": [],                 # [{"path": "$AX_ASSET_LIB" or "D:/lib", "read_only": False}]
+    "roots": [],                 # [{"var": "MEGASCANS", "path": "D:/lib", "read_only": False,
+                                 #   "kind": "library"}]
     "path_mode": "token",        # "token": keep $VAR roots in parms, "absolute": expanded paths
     "geo_format_order": GEO_FORMAT_ORDER,
     "thumb_size": 128,
@@ -30,11 +39,13 @@ DEFAULTS = {
     "read_geo_info": True,
     "ingest_render": False,
     "megascans_copy": False,       # Megascans textures are large: reference in place by default
-    "megascans_dir": "",
+    "model_lod": 0,                # wanted LOD rank; -1 = files without an LOD tag
+    "model_resolution": "",        # e.g. "4K"; "" = highest
     "list_mode": False,
     "material_renderer": "karma",  # last renderer picked for a material import
     # per-user collections (asset ids), kept here so a shared library never gets write conflicts
     "favorites": [],
+    "color_labels": {},            # asset id -> color label key
     "recent": [],                  # [[asset id, iso time], ...], newest first
     "recent_limit": 50,
     "last_ingest_dir": "",
@@ -125,18 +136,19 @@ class Prefs:
 
     # --- roots -------------------------------------------------------------------
     def roots(self):
-        """[{"path" (as typed), "read_only", "megascans", "kind", "expanded"}].
+        """[{"path" (as typed), "var", "read_only", "megascans", "kind", "expanded"}].
 
-        Falls back to $AX_ASSET_LIB. A Megascans root (a download folder browsed in place)
-        is always read-only.
+        A Megascans or GSG root (a vendor folder browsed in place) is always read-only.
         """
         roots = [dict(r) for r in self.get("roots") if isinstance(r, dict) and r.get("path")]
-        if not roots and os.environ.get(ENV_VAR):
-            roots = [{"path": "$" + ENV_VAR, "read_only": False}]
         for r in roots:
-            r["megascans"] = bool(r.get("megascans"))
-            r["kind"] = "megascans" if r["megascans"] else "library"
-            r["read_only"] = bool(r.get("read_only")) or r["megascans"]
+            kind = r.get("kind") or ("megascans" if r.get("megascans") else "library")
+            if kind not in schema.ROOT_KINDS:
+                kind = "library"
+            r["kind"] = kind
+            r["megascans"] = kind == "megascans"          # kept for older callers
+            r["var"] = str(r.get("var") or "").strip().upper()
+            r["read_only"] = bool(r.get("read_only")) or kind in schema.VENDOR_KINDS
             r["expanded"] = expand(r["path"])
         return roots
 
@@ -150,9 +162,62 @@ class Prefs:
         return [r for r in self.roots() if not r["read_only"]]
 
 
+def check_var(name):
+    """Error text for an invalid root variable name, or "" when it is valid or empty."""
+    if not name:
+        return ""
+    if not VAR_RE.match(name):
+        return "Use letters, numbers and underscores, and start with a letter or underscore."
+    if name in RESERVED_VARS or name.startswith(RESERVED_PREFIXES):
+        return "This name is reserved by Houdini."
+    return ""
+
+
+def apply_root_vars(settings):
+    """Set each root's variable in the environment; returns {var: expanded path}."""
+    applied = {}
+    for r in settings.roots():
+        var = r.get("var", "")
+        if not var or check_var(var):
+            continue
+        path = r["expanded"]
+        applied[var] = path
+        os.environ[var] = path
+        if hou is not None:
+            try:
+                hou.putenv(var, path.replace("\\", "/"))
+            except hou.Error:
+                pass
+    return applied
+
+
 # --- favorites / recently used -------------------------------------------------------------
 def favorites(settings):
     return set(settings.get("favorites"))
+
+
+def color_labels(settings):
+    """{asset id: color label key}, dropping keys that are no longer known."""
+    stored = settings.get("color_labels")
+    if not isinstance(stored, dict):
+        return {}
+    return {asset_id: key for asset_id, key in stored.items()
+            if key in schema.COLOR_LABEL_KEYS}
+
+
+def set_color_label(settings, asset_ids, key):
+    """Set one color label (None or "" clears it) on each asset; saves once."""
+    if key and key not in schema.COLOR_LABEL_KEYS:
+        raise ValueError("Unknown color label %r." % key)
+    labels = dict(settings.get("color_labels") or {})
+    for asset_id in asset_ids:
+        if not asset_id:
+            continue
+        if key:
+            labels[asset_id] = key
+        else:
+            labels.pop(asset_id, None)
+    settings.set("color_labels", labels)
 
 
 def set_favorite(settings, asset_ids, on):
@@ -179,15 +244,25 @@ def add_recent(settings, asset_ids, when):
 def parm_path(abs_path, root, path_mode="token"):
     """Path to write into a node parm.
 
-    With path_mode "token" and a root typed with a variable ($AX_ASSET_LIB), the result keeps
-    the variable so the .hip works on machines where the library sits elsewhere.
+    With path_mode "token", the result keeps the root's variable ($MEGASCANS/...) or a root
+    path typed with a variable, so the .hip works on machines where the library sits
+    elsewhere.
     """
     abs_path = os.path.normpath(abs_path)
-    if root and path_mode == "token" and "$" in root.get("path", ""):
-        try:
-            rel = os.path.relpath(abs_path, root["expanded"])
-        except ValueError:
-            rel = ".."
-        if not rel.startswith(".."):
-            return root["path"].rstrip("/\\") + "/" + rel.replace("\\", "/")
+    if root and path_mode == "token":
+        var = root.get("var", "")
+        if var:
+            try:
+                rel = os.path.relpath(abs_path, root["expanded"])
+            except ValueError:
+                rel = ".."
+            if not rel.startswith(".."):
+                return "$" + var + "/" + rel.replace("\\", "/")
+        if "$" in root.get("path", ""):
+            try:
+                rel = os.path.relpath(abs_path, root["expanded"])
+            except ValueError:
+                rel = ".."
+            if not rel.startswith(".."):
+                return root["path"].rstrip("/\\") + "/" + rel.replace("\\", "/")
     return abs_path.replace("\\", "/")

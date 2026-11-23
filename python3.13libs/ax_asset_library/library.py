@@ -209,7 +209,8 @@ MEGASCANS_THUMBS = "megascans_thumbs"
 
 
 def _root_kind(root):
-    """Roots are a path (library) or (path, kind) with kind "library" or "megascans"."""
+    """Roots are a path (library) or (path, kind) with kind "library", "megascans" or
+    "gsg"."""
     if isinstance(root, (tuple, list)):
         return root[0], (root[1] or "library")
     return root, "library"
@@ -251,7 +252,7 @@ def save_index(cache_dir, root, entries, kind="library"):
 def records_from_index(cache_dir, root, kind="library"):
     """Records straight from the cache, without touching the library (instant first paint)."""
     entries = load_index(cache_dir, root, kind)
-    if kind == "megascans":
+    if kind in schema.VENDOR_KINDS:
         from . import megascans
         return megascans.records_from_entries(entries, root, megascans_thumb_dir(cache_dir))
     out = []
@@ -264,14 +265,14 @@ def records_from_index(cache_dir, root, kind="library"):
 
 
 def dedupe_megascans(records):
-    """Drop Megascans records whose id an earlier root already provided.
+    """Drop Megascans or GSG records whose id an earlier root already provided.
 
-    The same Megascans asset can sit in two Megascans roots (Bridge 'Downloaded' and a
-    downloader folder). Its id (megascans:<asset id>:<type>) keys favorites, recents, scene
-    nodes and the rendered thumbnail, so only the first root's copy is listed."""
+    The same vendor asset can sit in two roots (e.g. Bridge 'Downloaded' and a downloader
+    folder). Its id (megascans:<asset id>:<type>, gsg:<code>:<type>) keys favorites, recents,
+    scene nodes and the rendered thumbnail, so only the first root's copy is listed."""
     seen, out = set(), []
     for r in records:
-        if r.source_kind == "megascans" and r.id:
+        if r.source_kind in schema.VENDOR_KINDS and r.id:
             if r.id in seen:
                 continue
             seen.add(r.id)
@@ -282,17 +283,20 @@ def dedupe_megascans(records):
 def scan_roots(roots, cache_dir, use_cache=True):
     """Scan every root and update their index files.
 
-    `roots` holds expanded paths, or (path, kind) pairs where kind "megascans" reads a
-    Megascans download in place (see megascans.scan_root). Returns (records, errors).
+    `roots` holds expanded paths, or (path, kind) pairs where kind "megascans" or "gsg"
+    reads a Megascans download or a Greyscalegorilla library in place (megascans.scan_root,
+    gsg.scan_root; rendered thumbnails share one cache folder, ids differ by prefix).
+    Returns (records, errors).
     Safe to call from a worker thread.
     """
     records, errors = [], []
     for item in roots:
         root, kind = _root_kind(item)
         cached = load_index(cache_dir, root, kind) if use_cache else {}
-        if kind == "megascans":
-            from . import megascans
-            recs, entries, errs = megascans.scan_root(root, cached, megascans_thumb_dir(cache_dir))
+        if kind in schema.VENDOR_KINDS:
+            from . import gsg, megascans
+            scan = gsg.scan_root if kind == "gsg" else megascans.scan_root
+            recs, entries, errs = scan(root, cached, megascans_thumb_dir(cache_dir))
         else:
             recs, entries, errs = scan_root(root, cached)
         records.extend(recs)
@@ -355,7 +359,7 @@ TYPE_ALIASES = {
     "hdri": "hdri", "hdr": "hdri", "env": "hdri",
     "img": "image", "image": "image",
 }
-QUERY_FIELDS = ("type", "tag", "cat", "name", "fmt", "fav")
+QUERY_FIELDS = ("type", "tag", "cat", "name", "fmt", "fav", "label")
 _YES = ("1", "yes", "y", "true", "on")
 
 _TOKEN = re.compile(r'(-)?(?:([A-Za-z]+):)?(?:"([^"]*)"?|(\S+))')
@@ -366,14 +370,16 @@ class Query:
 
     Free words must all match (name, tags, category or description). Field tokens:
         type:hdri   tag:rock   cat:trees   name:oak   fmt:abc
-    fav:1 keeps favorites (asset ids in `favorites`).
+    fav:1 keeps favorites (asset ids in `favorites`); label:red, label:any and label:none
+    filter color labels (asset ids in `labels`).
     A leading '-' excludes: -tag:wip, -broken. Quotes group words: tag:"red oak".
     Several values for the same field are OR-ed (type:geo type:hdri).
     """
 
-    def __init__(self, text="", favorites=None):
+    def __init__(self, text="", favorites=None, labels=None):
         self.text = text
         self.favorites = favorites or set()
+        self.labels = labels or {}
         self.terms, self.neg_terms = [], []
         self.fields, self.neg_fields = {}, {}
         for m in _TOKEN.finditer(text or ""):
@@ -413,6 +419,13 @@ class Query:
         if field == "fmt":
             v = value.lstrip(".")
             return any(k == v or k.startswith(v) for k in rec.files)
+        if field == "label":
+            label = self.labels.get(rec.id or "", "")
+            if value in ("any", "1"):
+                return bool(label)
+            if value in ("none", "0"):
+                return not label
+            return label == value
         return False
 
     @staticmethod
@@ -444,8 +457,11 @@ class Query:
         return True
 
 
-def sort_records(records, mode="name"):
-    """Sort by name, or newest first by "added"/"modified" (ties stay in name order)."""
+def sort_records(records, mode="name", labels=None):
+    """Sort by name, or newest first by "added"/"modified" (ties stay in name order).
+
+    "label" sorts by the COLOR_LABELS order, unlabeled last. Needs the labels ({id: key}).
+    """
     out = sorted(records, key=lambda r: (r.name.lower(), r.category.lower()))
     if mode == "type":
         order = {t: i for i, t in enumerate(schema.ASSET_TYPES)}
@@ -456,4 +472,8 @@ def sort_records(records, mode="name"):
         out.sort(key=lambda r: r.created or "", reverse=True)
     elif mode == "modified":
         out.sort(key=lambda r: r.modified or "", reverse=True)
+    elif mode == "label":
+        order = {key: i for i, key in enumerate(schema.COLOR_LABEL_KEYS)}
+        labels = labels or {}
+        out.sort(key=lambda r: order.get(labels.get(r.id or "", ""), len(order)))
     return out

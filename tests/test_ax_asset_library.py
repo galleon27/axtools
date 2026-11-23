@@ -12,8 +12,53 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
 
-from ax_asset_library import (karma, library, manage, megascans, prefs, schema,  # noqa: E402
-                              textures)
+from ax_asset_library import (gsg, karma, library, manage, megascans, prefs,  # noqa: E402
+                              schema, textures, variants)
+
+
+def make_gsg_library(root):
+    """Fake Greyscalegorilla library with the real folder and file names (empty files)."""
+    def asset(rel, meta_name, meta, files):
+        d = os.path.join(root, rel)
+        os.makedirs(d)
+        with open(os.path.join(d, meta_name), "w") as f:
+            json.dump(meta, f)
+        for fn, size in files:
+            with open(os.path.join(d, fn), "wb") as f:
+                f.write(b"x" * size)
+        return d
+
+    hd = "GSG_HC006_A003_GSGPROSTUDIOSMETAL003"
+    asset("hdris/" + hd, "GSG_PRO_STUDIOS_METAL_003.gsga",
+          {"version": 1, "type": "hdri", "productCode": "HC006", "assetcode": "A003",
+           "name": "GSG PRO STUDIOS METAL 003", "tags": "", "res": ""},
+          [(hd + ".exr", 0), (hd + ".exr.rat", 0), (hd + ".hdr", 0), (hd + "_preview.jpg", 0)])
+    mf = "GSG_MC032_A010_MicrofiberJerseyLightGreen"
+    asset("materials/" + mf, "Microfiber_Jersey_Light_Green.gsgm",
+          {"version": 1, "type": "material", "subtype": "cloth", "productCode": "MC032",
+           "assetcode": "A010", "name": "Microfiber Jersey Light Green", "tags": "",
+           "physicalsize": 0, "params": {"standard_surface": {"subsurface_scale": 0.01}}},
+          [(mf + "_4k_" + ch, 0) for ch in ("basecolor.tif", "height.exr", "normal.tif",
+                                            "roughness.tif", "anisotropyangle.tif",
+                                            "sheencolor.tif")] + [(mf + "_preview.jpg", 0)])
+    ck = "GSG_MC036_A001_CorkChips03"
+    asset("materials/" + ck, "Cork_Chips_03.gsgm",
+          {"version": 1, "type": "material", "productCode": "MC036", "assetcode": "A001",
+           "name": "Cork Chips 03", "tags": "", "physicalsize": 35},
+          [(ck + "_4k_" + ch, 0) for ch in ("basecolor.tif", "height.exr", "normal.tif",
+                                            "roughness.tif")]
+          + [("GSG_MC036_A001_Cork_preview.jpg", 0), ("Thumbs.db", 0)])
+    tx = "GSG_GC001_A009_Abstract09"
+    asset("textures/" + tx, "Abstract_09.gsga",
+          {"version": 1, "type": "gobo", "productCode": "GC001", "assetcode": "A009",
+           "name": "Abstract 09", "tags": "", "res": ""},
+          [(tx + ".jpg", 100), (tx + "_preview.jpg", 10), ("Thumbs.db", 0)])
+    md = "GSG_MD001_A001_Chair"
+    asset("models/" + md, "Chair.gsga",
+          {"version": 1, "type": "model", "productCode": "MD001", "assetcode": "A001",
+           "name": "Chair", "tags": "wood, furniture"},
+          [(md + ".fbx", 0), (md + "_4k_basecolor.tif", 0), (md + "_4k_normal.tif", 0)])
+    return root
 
 try:
     import pxr  # noqa: F401
@@ -229,6 +274,57 @@ class VersionTests(unittest.TestCase):
             with open(library.index_path(cache, d), "w") as f:
                 json.dump({"version": 1, "root": d, "entries": {"x": {}}}, f)
             self.assertEqual(library.load_index(cache, d), {})
+
+
+class VariantsTests(unittest.TestCase):
+    def test_lod_files_and_pick(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("x_LOD0.fbx", "x_LOD1.fbx", "x_LOD3.fbx", "x_LOD0.abc"):
+                open(os.path.join(d, name), "w").close()
+            files = {"fbx": os.path.join(d, "x_LOD0.fbx"),
+                     "abc": os.path.join(d, "x_LOD0.abc")}
+            lods = variants.lod_files(files)
+            self.assertEqual(sorted(lods), [0, 1, 3])
+            self.assertEqual(sorted(lods[1]), ["fbx"])
+        self.assertEqual(variants.pick_lod([0, 1, 3], 2), 1)
+        self.assertEqual(variants.pick_lod([0, 1, 3], 5), 3)
+        self.assertEqual(variants.pick_lod([2, 3], 0), 2)
+        self.assertEqual(variants.lod_label(-1), "Full")
+
+    def test_resolution_sets_and_pick(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("a_2K_Albedo.jpg", "a_4K_Albedo.jpg", "a_4K_Normal.jpg"):
+                open(os.path.join(d, name), "w").close()
+            channels = {"basecolor": os.path.join(d, "a_4K_Albedo.jpg"),
+                        "normal": os.path.join(d, "a_4K_Normal.jpg")}
+            sets = variants.resolution_sets(channels)
+            self.assertEqual(list(sets), ["4K", "2K"])
+            self.assertEqual(sets["2K"]["basecolor"], os.path.join(d, "a_2K_Albedo.jpg"))
+            self.assertEqual(sets["2K"]["normal"], channels["normal"])
+            self.assertEqual(variants.resolution_sets({"basecolor": "x.jpg"}), {"": {"basecolor": "x.jpg"}})
+        self.assertEqual(variants.pick_resolution(["4K", "2K"], "8K"), "4K")
+        self.assertEqual(variants.pick_resolution(["4K", "2K"], "1K"), "2K")
+        self.assertEqual(variants.pick_resolution(["4K", "2K"], ""), "4K")
+
+    def test_linked_material_library(self):
+        geo = library.AssetRecord(name="Rock", type="geometry", info={"megascans_id": "abc"},
+                                  root="/lib2")
+        mat = library.AssetRecord(name="Rock Mat", type="material", info={"megascans_id": "abc"},
+                                  root="/lib1")
+        same_root = library.AssetRecord(name="Rock Mat 2", type="material",
+                                        info={"megascans_id": "abc"}, root="/lib2")
+        self.assertIs(variants.linked_material(geo, [geo, mat, same_root]), same_root)
+        self.assertIsNone(variants.linked_material(geo, [geo]))
+
+    def test_is_atlas(self):
+        rec = library.AssetRecord(type="material", info={"vendor_kind": "atlas"},
+                                  files={"basecolor": "a.jpg"})
+        self.assertTrue(variants.is_atlas(rec))
+        rec.info = {"vendor_kind": "surface"}
+        rec.files = {"basecolor": "a.jpg", "opacity": "b.jpg"}
+        self.assertTrue(variants.is_atlas(rec))
+        rec.files = {"basecolor": "a.jpg"}
+        self.assertFalse(variants.is_atlas(rec))
 
 
 class KarmaTests(unittest.TestCase):
@@ -508,6 +604,27 @@ class MegascansTests(unittest.TestCase):
         self.assertNotIn("Billboard", plant[2][2]["basecolor"])  # atlas, not billboard
         self.assertEqual(megascans.plan(by["xyzbrush"]), [])
 
+    def test_cache_entry_usable_while_rebuilding(self):
+        records, entries, errors = megascans.scan_root(self.dl)
+        self.assertFalse(errors, errors)
+        self.assertTrue(entries)
+        key, entry = next(iter(entries.items()))
+        entry["version"] = 2
+        self.assertFalse(megascans._entry_current(entry, entry.get("mtime")))
+        again = megascans.records_from_entries({key: entry}, self.dl, "")
+        self.assertTrue(again)
+
+    def test_linked_material_records(self):
+        recs, errors = library.scan_roots([(self.dl, "megascans")],
+                                          os.path.join(self.tmp.name, "cache"))
+        self.assertFalse(errors, errors)
+        geo = next(r for r in recs if r.type == "geometry"
+                   and r.id.startswith("megascans:wgqvdhf:"))
+        mat = variants.linked_material(geo, recs)
+        self.assertIsNotNone(mat)
+        self.assertEqual(mat.type, "material")
+        self.assertEqual(mat.id.split(":")[:2], geo.id.split(":")[:2])
+
     def test_check_scale_and_height(self):
         info = {"import_scale": 0.01, "megascans_size_m": 1.02,
                 "bounds": [[-50.8, -5.7, -14.8], [50.9, 15.0, 19.2]]}
@@ -658,6 +775,102 @@ class MegascansTests(unittest.TestCase):
         self.assertEqual([r.name for r in library.sort_records(recs, "category")], ["c", "b", "a"])
 
 
+class GsgTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = make_gsg_library(os.path.join(self.tmp.name, "Greyscalegorilla"))
+        self.cache = os.path.join(self.tmp.name, "cache")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _asset(self, rel):
+        return gsg.read_asset(os.path.join(self.root, rel))
+
+    def test_read_and_plan(self):
+        mf = self._asset("materials/GSG_MC032_A010_MicrofiberJerseyLightGreen")
+        self.assertEqual((mf.id, mf.name, mf.kind, mf.category),
+                         ("MC032_A010", "Microfiber Jersey Light Green", "material", "cloth"))
+        self.assertIn("cloth", mf.tags)
+        self.assertEqual(mf.library_name, "Microfiber_Jersey_Light_Green_MC032_A010")
+
+        (kind, _n, files, _i, extra), = gsg.plan(
+            self._asset("hdris/GSG_HC006_A003_GSGPROSTUDIOSMETAL003"))
+        self.assertEqual(kind, "hdri")
+        self.assertTrue(files["hdri"].endswith(".exr"))
+        self.assertEqual(sorted(schema.file_ext(f) for f in extra), [".hdr", ".rat"])
+
+        (kind, _n, files, info, extra), = gsg.plan(mf)
+        self.assertEqual(sorted(files), ["basecolor", "displacement", "normal", "roughness"])
+        self.assertEqual(sorted(os.path.basename(f).split("_4k_")[1] for f in extra),
+                         ["anisotropyangle.tif", "sheencolor.tif"])
+        self.assertEqual(info["resolution"], [4096, 4096])
+        self.assertNotIn("physical_size", info)                     # physicalsize 0
+
+        cork = self._asset("materials/GSG_MC036_A001_CorkChips03")
+        self.assertTrue(cork.preview.endswith("GSG_MC036_A001_Cork_preview.jpg"))
+        self.assertEqual(gsg.plan(cork)[0][3]["physical_size"], 35)
+        self.assertFalse(any("Thumbs.db" in f for f in cork.content))
+
+        (kind, _n, files, _i, _e), = gsg.plan(self._asset("textures/GSG_GC001_A009_Abstract09"))
+        self.assertEqual(kind, "image")
+        self.assertTrue(files["image"].endswith("Abstract09.jpg"))   # not the preview
+
+        chair = self._asset("models/GSG_MD001_A001_Chair")
+        self.assertEqual(chair.tags, ["wood", "furniture"])
+        self.assertEqual([p[0] for p in gsg.plan(chair)], ["geometry", "material"])
+
+    def test_scan_in_place(self):
+        before = sorted(os.walk(self.root))
+        recs, errs = library.scan_roots([(self.root, "gsg")], self.cache)
+        self.assertEqual(errs, [])
+        self.assertEqual(sorted(os.walk(self.root)), before)       # nothing written there
+        types = sorted(r.type for r in recs)
+        self.assertEqual(types, ["geometry", "hdri", "image", "material", "material", "material"])
+        ids = {r.id for r in recs}
+        by_id = {r.id: r for r in recs}
+        self.assertEqual(by_id["gsg:MC032_A010:material"].category, "cloth")
+        self.assertEqual(by_id["gsg:MC036_A001:material"].category, "")   # no subtype
+        self.assertIn("gsg:MC036_A001:material", ids)
+        self.assertIn("gsg:HC006_A003:hdri", ids)
+        self.assertTrue(all(r.source_kind == "gsg" for r in recs))
+        with_preview = [r for r in recs if r.id != "gsg:MD001_A001:geometry"
+                        and r.id != "gsg:MD001_A001:material"]
+        self.assertTrue(all(r.thumb.endswith("_preview.jpg") for r in with_preview))
+        cached = library.records_from_index(self.cache, self.root, "gsg")
+        self.assertEqual(sorted(r.key for r in cached), sorted(r.key for r in recs))
+        again, _ = library.scan_roots([(self.root, "gsg")], self.cache)
+        self.assertEqual(sorted(r.key for r in again), sorted(r.key for r in recs))
+
+    def test_detection(self):
+        self.assertTrue(gsg.looks_like_library(self.root))
+        self.assertFalse(megascans.looks_like_download(self.root))
+        proj = os.path.join(self.tmp.name, "project")
+        os.makedirs(os.path.join(proj, "materials", "wood"))
+        open(os.path.join(proj, "materials", "wood", "wood.jpg"), "w").close()
+        self.assertFalse(gsg.looks_like_library(proj))
+        ms = os.path.join(self.tmp.name, "ms", "surfaces", "abcdefgh_Moss")
+        os.makedirs(ms)
+        with open(os.path.join(ms, "abcdefgh.json"), "w") as f:
+            json.dump({"assetID": "abcdefgh"}, f)
+        self.assertFalse(gsg.looks_like_library(os.path.join(self.tmp.name, "ms")))
+        self.assertTrue(megascans.looks_like_download(os.path.join(self.tmp.name, "ms")))
+
+    def test_prefs_kinds(self):
+        s = prefs.Prefs(os.path.join(self.tmp.name, "p.json"))
+        s.set("roots", [{"path": "a", "kind": "gsg"}, {"path": "b", "megascans": True},
+                        {"path": "c", "kind": "nonsense"}])
+        roots = s.roots()
+        self.assertEqual([r["kind"] for r in roots], ["gsg", "megascans", "library"])
+        self.assertEqual([r["read_only"] for r in roots], [True, True, False])
+
+    def test_dedupe_two_roots(self):
+        root2 = os.path.join(self.tmp.name, "copy")
+        shutil.copytree(os.path.join(self.root, "hdris"), os.path.join(root2, "hdris"))
+        recs, _ = library.scan_roots([(self.root, "gsg"), (root2, "gsg")], self.cache)
+        self.assertEqual([r.id for r in recs].count("gsg:HC006_A003:hdri"), 1)
+
+
 class ManageTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -774,14 +987,42 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(self.names("BIG boulder"), ["Big Boulder"])
 
 
+class LabelTests(unittest.TestCase):
+    def test_set_and_clear(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.json")
+            s = prefs.Prefs(path)
+            prefs.set_color_label(s, ["a", "b"], "red")
+            self.assertEqual(prefs.color_labels(s), {"a": "red", "b": "red"})
+            prefs.set_color_label(s, ["a"], "")
+            self.assertEqual(prefs.color_labels(s), {"b": "red"})
+            with self.assertRaises(ValueError):
+                prefs.set_color_label(s, ["a"], "magenta")
+            self.assertEqual(prefs.color_labels(prefs.Prefs(path)), {"b": "red"})
+
+    def test_query_and_sort(self):
+        recs = [library.AssetRecord(id="a", name="Zulu"),
+                library.AssetRecord(id="b", name="Alpha"),
+                library.AssetRecord(id="c", name="Mike")]
+        labels = {"a": "red", "b": "green"}
+        names = lambda q: [r.name for r in recs if q.matches(r)]  # noqa: E731
+        self.assertEqual(names(library.Query("label:red", labels=labels)), ["Zulu"])
+        self.assertEqual(names(library.Query("label:any", labels=labels)), ["Zulu", "Alpha"])
+        self.assertEqual(names(library.Query("label:none", labels=labels)), ["Mike"])
+        self.assertEqual(names(library.Query("-label:red", labels=labels)), ["Alpha", "Mike"])
+        self.assertEqual([r.name for r in library.sort_records(recs, "label", labels)],
+                         ["Zulu", "Alpha", "Mike"])
+
+
 class PrefsTests(unittest.TestCase):
     def test_roots_and_parm_path(self):
         with tempfile.TemporaryDirectory() as d:
             os.environ[prefs.ENV_VAR] = d
             try:
                 p = prefs.Prefs(os.path.join(d, "p.json"))
+                self.assertEqual(p.roots(), [])             # no $AX_ASSET_LIB fallback
+                p.set("roots", [{"path": "$" + prefs.ENV_VAR, "read_only": True}])
                 roots = p.roots()
-                self.assertEqual(roots[0]["path"], "$AX_ASSET_LIB")
                 self.assertEqual(roots[0]["expanded"], os.path.normpath(d))
                 f = os.path.join(d, "geometry", "rocks", "A", "v001", "a.bgeo.sc")
                 self.assertEqual(prefs.parm_path(f, roots[0], "token"),
@@ -797,6 +1038,27 @@ class PrefsTests(unittest.TestCase):
                 self.assertIsNotNone(again.root_for(d))
             finally:
                 del os.environ[prefs.ENV_VAR]
+
+    def test_check_var(self):
+        self.assertEqual(prefs.check_var(""), "")
+        self.assertEqual(prefs.check_var("MEGASCANS"), "")
+        for bad in ("HIP", "HOUDINI_PATH", "1A", "A-B"):
+            self.assertNotEqual(prefs.check_var(bad), "", bad)
+
+    def test_apply_root_vars(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = prefs.Prefs(os.path.join(d, "p.json"))
+            p.set("roots", [{"var": "megascans", "path": d, "read_only": False}], save=False)
+            applied = prefs.apply_root_vars(p)
+            try:
+                self.assertEqual(applied, {"MEGASCANS": os.path.normpath(d)})
+                self.assertEqual(os.environ["MEGASCANS"], os.path.normpath(d))
+                root = p.roots()[0]
+                self.assertEqual(root["var"], "MEGASCANS")
+                f = os.path.join(d, "3d", "x.fbx")
+                self.assertEqual(prefs.parm_path(f, root, "token"), "$MEGASCANS/3d/x.fbx")
+            finally:
+                os.environ.pop("MEGASCANS", None)
 
     def test_bad_types_ignored(self):
         with tempfile.TemporaryDirectory() as d:
