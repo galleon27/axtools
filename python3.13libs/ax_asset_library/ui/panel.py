@@ -213,12 +213,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.btn_add = QtWidgets.QToolButton()
         self.btn_add.setText("Add")  # shown if the icon is missing
         self.btn_add.setIcon(icon("BUTTONS_list_add"))
-        self.btn_add.setToolTip("Add files, a folder or a Megascans library. You can also drop "
-                                "files or folders onto the panel.")
+        self.btn_add.setToolTip("Add files, a folder, or a Megascans or Greyscalegorilla "
+                                "library. You can also drop files or folders onto the panel.")
         add_menu = QtWidgets.QMenu(self.btn_add)
         add_menu.addAction("Add files...", self._add_files)
         add_menu.addAction("Add folder...", self._add_folder)
         add_menu.addAction("Import Megascans library...", self._add_megascans)
+        add_menu.addAction("Import Greyscalegorilla library...", self._add_gsg)
         self.btn_add.setMenu(add_menu)
         self.btn_add.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         bar.addWidget(self.btn_add)
@@ -349,11 +350,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         if generation == self._cache_generation and self._scanning:
             self._set_records(records)
 
-    def _looks_like_megascans(self, root):
-        cache = self.__dict__.setdefault("_ms_guess", {})
+    def _guess_vendor(self, root):
+        """"megascans" or "gsg" when a library root looks like that vendor's folder."""
+        cache = self.__dict__.setdefault("_vendor_guess", {})
         if root not in cache:
-            from .. import megascans
-            cache[root] = megascans.looks_like_download(root)
+            from .. import gsg, megascans
+            cache[root] = ("megascans" if megascans.looks_like_download(root)
+                           else "gsg" if gsg.looks_like_library(root) else None)
         return cache[root]
 
     def rescan(self, use_cache=True):
@@ -427,16 +430,19 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             root = r["expanded"]
             n_root = counts.get((root, None, ""), 0)
             tip = root
-            if r["megascans"]:
-                label = r["path"] + "  [Megascans]"
-                tip += "\nMegascans download, browsed in place (read-only)."
+            if r["kind"] in schema.VENDOR_KINDS:
+                vendor = schema.ROOT_KIND_LABELS[r["kind"]]
+                label = r["path"] + "  [%s]" % vendor
+                tip += "\n%s library, browsed in place (read-only)." % vendor
             else:
                 label = r["path"] + ("  [read-only]" if r["read_only"] else "")
-                if n_root == 0 and self._looks_like_megascans(root):
-                    label += "  (Megascans folder? tick Megascans in Settings)"
-                    tip += ("\nThis folder looks like a Megascans download. Library roots "
-                            "hold asset.json files; open Settings and tick Megascans for "
-                            "this folder to browse it in place.")
+                guess = self._guess_vendor(root) if n_root == 0 else None
+                if guess:
+                    vendor = schema.ROOT_KIND_LABELS[guess]
+                    label += "  (%s folder? set its type in Settings)" % vendor
+                    tip += ("\nThis folder looks like a %s library. Library roots hold "
+                            "asset.json files; open Settings and set Type to %s to browse "
+                            "it in place." % (vendor, vendor))
             ri = add(None, "%s (%d)" % (label, n_root), ("scope", root, None, ""), tip)
             for t in schema.ASSET_TYPES:
                 n = counts.get((root, t, ""), 0)
@@ -1116,6 +1122,22 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             return
         self._ingest([d], plan)
 
+    def _add_gsg(self):
+        start = self.settings.get("gsg_dir") or ""
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Greyscalegorilla library (or any folder inside it)", start)
+        if not d:
+            return
+        self.settings.set("gsg_dir", d)
+        plan = publish.plan_ingest([d])
+        if not plan.gsg:
+            hou.ui.displayMessage(
+                "No Greyscalegorilla assets found in %s.\n\nPick the library folder (with "
+                "hdris, materials, models, textures): each asset folder in it has a .gsga or "
+                ".gsgm file." % d, severity=hou.severityType.Message, title="AX Asset Library")
+            return
+        self._ingest([d], plan)
+
     def _ingest(self, paths, plan=None):
         if not self.settings.writable_roots():
             hou.ui.displayMessage("Add a library folder that is not read-only in Settings first.",
@@ -1132,8 +1154,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             return
         v = dlg.values()
         self.settings.set("last_category", v["category"], save=False)
-        self.settings.set("megascans_copy" if plan.megascans else "copy_on_ingest", v["copy"],
-                          save=False)
+        self.settings.set("megascans_copy" if (plan.megascans or plan.gsg) else "copy_on_ingest",
+                          v["copy"], save=False)
         self.settings.set("read_geo_info", v["read_info"], save=False)
         self.settings.set("ingest_render", v["render"])
         try:

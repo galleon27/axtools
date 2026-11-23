@@ -1,4 +1,5 @@
 """Import-context tests for AX Asset Library. Run under hython; skipped under plain Python."""
+import json
 import os
 import sys
 import tempfile
@@ -146,6 +147,29 @@ class ImportContextTests(unittest.TestCase):
         with self.assertRaises(importers.AssetImportError) as caught:
             importers.import_records([self.geometry], self.settings, target=(None, node))
         self.assertIn("locked HDA", str(caught.exception))
+
+    def test_gsg_batch_import(self):
+        from tests.test_ax_asset_library import make_gsg_library
+        gsg_root = make_gsg_library(os.path.join(self.tmp.name, "Greyscalegorilla"))
+        plan = publish.plan_ingest([gsg_root])
+        self.assertEqual(plan.gsg, 5)
+        self.assertEqual(plan.counts(), {"hdri": 1, "material": 3, "image": 1, "geometry": 1})
+        lib = os.path.join(self.tmp.name, "gsg_lib")
+        root = {"path": lib, "expanded": lib, "read_only": False}
+        report = publish.ingest(plan, root, "gsg", copy=False, read_info=False)
+        self.assertFalse(report.failed, report.failed)
+        self.assertEqual(len(report.created), 6)
+        recs, errors = library.scan_roots([lib], os.path.join(self.tmp.name, "gsg_cache"))
+        self.assertFalse(errors, errors)
+        cork = next(r for r in recs if r.name == "Cork_Chips_03_MC036_A001")
+        self.assertEqual(cork.type, "material")
+        self.assertEqual(cork.category, "gsg")
+        data = json.load(open(cork.sidecar, encoding="utf-8"))
+        self.assertEqual(data["source"]["kind"], "gsg")
+        self.assertEqual(data["source"]["gsg_id"], "MC036_A001")
+        cork_item = next(i for i in plan.items if i.name == "Cork_Chips_03_MC036_A001")
+        self.assertTrue(cork_item.thumb.endswith("GSG_MC036_A001_Cork_preview.jpg"))
+        # (the fixture's preview files are empty, so no thumbnail image is written here)
 
     def test_mixed_into_matnet(self):
         matnet = self._matnet()

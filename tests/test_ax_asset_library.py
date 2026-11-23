@@ -12,8 +12,53 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
 
-from ax_asset_library import (karma, library, manage, megascans, prefs, schema,  # noqa: E402
-                              textures)
+from ax_asset_library import (gsg, karma, library, manage, megascans, prefs,  # noqa: E402
+                              schema, textures)
+
+
+def make_gsg_library(root):
+    """Fake Greyscalegorilla library with the real folder and file names (empty files)."""
+    def asset(rel, meta_name, meta, files):
+        d = os.path.join(root, rel)
+        os.makedirs(d)
+        with open(os.path.join(d, meta_name), "w") as f:
+            json.dump(meta, f)
+        for fn, size in files:
+            with open(os.path.join(d, fn), "wb") as f:
+                f.write(b"x" * size)
+        return d
+
+    hd = "GSG_HC006_A003_GSGPROSTUDIOSMETAL003"
+    asset("hdris/" + hd, "GSG_PRO_STUDIOS_METAL_003.gsga",
+          {"version": 1, "type": "hdri", "productCode": "HC006", "assetcode": "A003",
+           "name": "GSG PRO STUDIOS METAL 003", "tags": "", "res": ""},
+          [(hd + ".exr", 0), (hd + ".exr.rat", 0), (hd + ".hdr", 0), (hd + "_preview.jpg", 0)])
+    mf = "GSG_MC032_A010_MicrofiberJerseyLightGreen"
+    asset("materials/" + mf, "Microfiber_Jersey_Light_Green.gsgm",
+          {"version": 1, "type": "material", "subtype": "cloth", "productCode": "MC032",
+           "assetcode": "A010", "name": "Microfiber Jersey Light Green", "tags": "",
+           "physicalsize": 0, "params": {"standard_surface": {"subsurface_scale": 0.01}}},
+          [(mf + "_4k_" + ch, 0) for ch in ("basecolor.tif", "height.exr", "normal.tif",
+                                            "roughness.tif", "anisotropyangle.tif",
+                                            "sheencolor.tif")] + [(mf + "_preview.jpg", 0)])
+    ck = "GSG_MC036_A001_CorkChips03"
+    asset("materials/" + ck, "Cork_Chips_03.gsgm",
+          {"version": 1, "type": "material", "productCode": "MC036", "assetcode": "A001",
+           "name": "Cork Chips 03", "tags": "", "physicalsize": 35},
+          [(ck + "_4k_" + ch, 0) for ch in ("basecolor.tif", "height.exr", "normal.tif",
+                                            "roughness.tif")]
+          + [("GSG_MC036_A001_Cork_preview.jpg", 0), ("Thumbs.db", 0)])
+    tx = "GSG_GC001_A009_Abstract09"
+    asset("textures/" + tx, "Abstract_09.gsga",
+          {"version": 1, "type": "gobo", "productCode": "GC001", "assetcode": "A009",
+           "name": "Abstract 09", "tags": "", "res": ""},
+          [(tx + ".jpg", 100), (tx + "_preview.jpg", 10), ("Thumbs.db", 0)])
+    md = "GSG_MD001_A001_Chair"
+    asset("models/" + md, "Chair.gsga",
+          {"version": 1, "type": "model", "productCode": "MD001", "assetcode": "A001",
+           "name": "Chair", "tags": "wood, furniture"},
+          [(md + ".fbx", 0), (md + "_4k_basecolor.tif", 0), (md + "_4k_normal.tif", 0)])
+    return root
 
 try:
     import pxr  # noqa: F401
@@ -656,6 +701,102 @@ class MegascansTests(unittest.TestCase):
                 library.AssetRecord(name="c", type="geometry", category="a")]
         self.assertEqual([r.name for r in library.sort_records(recs, "type")], ["c", "b", "a"])
         self.assertEqual([r.name for r in library.sort_records(recs, "category")], ["c", "b", "a"])
+
+
+class GsgTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = make_gsg_library(os.path.join(self.tmp.name, "Greyscalegorilla"))
+        self.cache = os.path.join(self.tmp.name, "cache")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _asset(self, rel):
+        return gsg.read_asset(os.path.join(self.root, rel))
+
+    def test_read_and_plan(self):
+        mf = self._asset("materials/GSG_MC032_A010_MicrofiberJerseyLightGreen")
+        self.assertEqual((mf.id, mf.name, mf.kind, mf.category),
+                         ("MC032_A010", "Microfiber Jersey Light Green", "material", "cloth"))
+        self.assertIn("cloth", mf.tags)
+        self.assertEqual(mf.library_name, "Microfiber_Jersey_Light_Green_MC032_A010")
+
+        (kind, _n, files, _i, extra), = gsg.plan(
+            self._asset("hdris/GSG_HC006_A003_GSGPROSTUDIOSMETAL003"))
+        self.assertEqual(kind, "hdri")
+        self.assertTrue(files["hdri"].endswith(".exr"))
+        self.assertEqual(sorted(schema.file_ext(f) for f in extra), [".hdr", ".rat"])
+
+        (kind, _n, files, info, extra), = gsg.plan(mf)
+        self.assertEqual(sorted(files), ["basecolor", "displacement", "normal", "roughness"])
+        self.assertEqual(sorted(os.path.basename(f).split("_4k_")[1] for f in extra),
+                         ["anisotropyangle.tif", "sheencolor.tif"])
+        self.assertEqual(info["resolution"], [4096, 4096])
+        self.assertNotIn("physical_size", info)                     # physicalsize 0
+
+        cork = self._asset("materials/GSG_MC036_A001_CorkChips03")
+        self.assertTrue(cork.preview.endswith("GSG_MC036_A001_Cork_preview.jpg"))
+        self.assertEqual(gsg.plan(cork)[0][3]["physical_size"], 35)
+        self.assertFalse(any("Thumbs.db" in f for f in cork.content))
+
+        (kind, _n, files, _i, _e), = gsg.plan(self._asset("textures/GSG_GC001_A009_Abstract09"))
+        self.assertEqual(kind, "image")
+        self.assertTrue(files["image"].endswith("Abstract09.jpg"))   # not the preview
+
+        chair = self._asset("models/GSG_MD001_A001_Chair")
+        self.assertEqual(chair.tags, ["wood", "furniture"])
+        self.assertEqual([p[0] for p in gsg.plan(chair)], ["geometry", "material"])
+
+    def test_scan_in_place(self):
+        before = sorted(os.walk(self.root))
+        recs, errs = library.scan_roots([(self.root, "gsg")], self.cache)
+        self.assertEqual(errs, [])
+        self.assertEqual(sorted(os.walk(self.root)), before)       # nothing written there
+        types = sorted(r.type for r in recs)
+        self.assertEqual(types, ["geometry", "hdri", "image", "material", "material", "material"])
+        ids = {r.id for r in recs}
+        by_id = {r.id: r for r in recs}
+        self.assertEqual(by_id["gsg:MC032_A010:material"].category, "cloth")
+        self.assertEqual(by_id["gsg:MC036_A001:material"].category, "")   # no subtype
+        self.assertIn("gsg:MC036_A001:material", ids)
+        self.assertIn("gsg:HC006_A003:hdri", ids)
+        self.assertTrue(all(r.source_kind == "gsg" for r in recs))
+        with_preview = [r for r in recs if r.id != "gsg:MD001_A001:geometry"
+                        and r.id != "gsg:MD001_A001:material"]
+        self.assertTrue(all(r.thumb.endswith("_preview.jpg") for r in with_preview))
+        cached = library.records_from_index(self.cache, self.root, "gsg")
+        self.assertEqual(sorted(r.key for r in cached), sorted(r.key for r in recs))
+        again, _ = library.scan_roots([(self.root, "gsg")], self.cache)
+        self.assertEqual(sorted(r.key for r in again), sorted(r.key for r in recs))
+
+    def test_detection(self):
+        self.assertTrue(gsg.looks_like_library(self.root))
+        self.assertFalse(megascans.looks_like_download(self.root))
+        proj = os.path.join(self.tmp.name, "project")
+        os.makedirs(os.path.join(proj, "materials", "wood"))
+        open(os.path.join(proj, "materials", "wood", "wood.jpg"), "w").close()
+        self.assertFalse(gsg.looks_like_library(proj))
+        ms = os.path.join(self.tmp.name, "ms", "surfaces", "abcdefgh_Moss")
+        os.makedirs(ms)
+        with open(os.path.join(ms, "abcdefgh.json"), "w") as f:
+            json.dump({"assetID": "abcdefgh"}, f)
+        self.assertFalse(gsg.looks_like_library(os.path.join(self.tmp.name, "ms")))
+        self.assertTrue(megascans.looks_like_download(os.path.join(self.tmp.name, "ms")))
+
+    def test_prefs_kinds(self):
+        s = prefs.Prefs(os.path.join(self.tmp.name, "p.json"))
+        s.set("roots", [{"path": "a", "kind": "gsg"}, {"path": "b", "megascans": True},
+                        {"path": "c", "kind": "nonsense"}])
+        roots = s.roots()
+        self.assertEqual([r["kind"] for r in roots], ["gsg", "megascans", "library"])
+        self.assertEqual([r["read_only"] for r in roots], [True, True, False])
+
+    def test_dedupe_two_roots(self):
+        root2 = os.path.join(self.tmp.name, "copy")
+        shutil.copytree(os.path.join(self.root, "hdris"), os.path.join(root2, "hdris"))
+        recs, _ = library.scan_roots([(self.root, "gsg"), (root2, "gsg")], self.cache)
+        self.assertEqual([r.id for r in recs].count("gsg:HC006_A003:hdri"), 1)
 
 
 class ManageTests(unittest.TestCase):

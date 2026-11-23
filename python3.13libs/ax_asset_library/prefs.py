@@ -8,6 +8,8 @@ import copy
 import json
 import os
 
+from . import schema
+
 try:
     import hou
 except ImportError:  # plain-Python tests
@@ -31,6 +33,7 @@ DEFAULTS = {
     "ingest_render": False,
     "megascans_copy": False,       # Megascans textures are large: reference in place by default
     "megascans_dir": "",
+    "gsg_dir": "",
     "list_mode": False,
     "material_renderer": "karma",  # last renderer picked for a material import
     # per-user collections (asset ids), kept here so a shared library never gets write conflicts
@@ -134,9 +137,12 @@ class Prefs:
         if not roots and os.environ.get(ENV_VAR):
             roots = [{"path": "$" + ENV_VAR, "read_only": False}]
         for r in roots:
-            r["megascans"] = bool(r.get("megascans"))
-            r["kind"] = "megascans" if r["megascans"] else "library"
-            r["read_only"] = bool(r.get("read_only")) or r["megascans"]
+            kind = r.get("kind") or ("megascans" if r.get("megascans") else "library")
+            if kind not in schema.ROOT_KINDS:
+                kind = "library"
+            r["kind"] = kind
+            r["megascans"] = kind == "megascans"          # kept for older callers
+            r["read_only"] = bool(r.get("read_only")) or kind in schema.VENDOR_KINDS
             r["expanded"] = expand(r["path"])
         return roots
 

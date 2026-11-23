@@ -8,7 +8,7 @@ import tempfile
 
 import hou
 
-from . import karma, library, megascans, schema, textures, thumbnails
+from . import gsg, karma, library, megascans, schema, textures, thumbnails
 
 # Files copied along with a geometry file of the same name (OBJ materials).
 COMPANION_EXTS = {".obj": (".mtl",)}
@@ -172,6 +172,7 @@ class IngestPlan:
         self.items = []
         self.skipped = []   # (path, reason)
         self.megascans = 0  # number of Megascans asset folders found
+        self.gsg = 0        # number of Greyscalegorilla asset folders found
 
     def by_type(self, asset_type):
         return [i for i in self.items if i.type == asset_type]
@@ -212,6 +213,19 @@ def plan_ingest(paths):
                 asset_type, name, files, asset.preview, extra=extra, info=info,
                 category=asset.category, tags=asset.tags,
                 source={"kind": "megascans", "megascans_id": asset.id,
+                        "origin_path": asset.folder.replace("\\", "/")}))
+    gsg_assets, paths = gsg.find_assets(paths)
+    plan.gsg = len(gsg_assets)
+    for asset in gsg_assets:
+        made = gsg.plan(asset)
+        if not made:
+            plan.skipped.append((asset.folder, "Greyscalegorilla %s asset: nothing to import"
+                                 % (asset.kind or "unknown")))
+        for asset_type, name, files, info, extra in made:
+            plan.items.append(IngestItem(
+                asset_type, name, files, asset.preview, extra=extra, info=info,
+                category=asset.category, tags=asset.tags,
+                source={"kind": "gsg", "gsg_id": asset.id,
                         "origin_path": asset.folder.replace("\\", "/")}))
     geo, images, other = collect(paths)
     companions = {os.path.normcase(os.path.splitext(os.path.abspath(g))[0] + ext)
@@ -574,8 +588,9 @@ def _queue(asset_dir, name, workdir, writer, settings, key=None, target=None):
 
 
 def megascans_thumb(rec):
-    """Thumbnail file of a record from a Megascans root (in the prefs cache), else None."""
-    if rec.source_kind != "megascans" or not rec.id or not rec.id.startswith("megascans:"):
+    """Thumbnail file of a record from a Megascans or GSG root (in the prefs cache), else None."""
+    if (rec.source_kind not in schema.VENDOR_KINDS or not rec.id
+            or not rec.id.startswith(rec.source_kind + ":")):
         return None
     from . import prefs
     return megascans.thumb_path(library.megascans_thumb_dir(prefs.cache_dir()), rec.id)

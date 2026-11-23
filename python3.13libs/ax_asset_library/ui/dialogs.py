@@ -3,9 +3,18 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import karma, library, megascans, prefs as _prefs, publish, schema
+from .. import gsg, karma, library, megascans, prefs as _prefs, publish, schema
 
 Qt = QtCore.Qt
+
+VENDOR_INGEST_NOTE = (
+    "%d Megascans / Greyscalegorilla asset(s): names, tags and categories come from their "
+    "metadata files, and categories go under the one above. Their textures are large, so "
+    "files stay where they are unless you tick Copy.")
+ROOT_TYPE_TIP = (
+    "Type: Library (folders with asset.json), Megascans (a Megascans download) or "
+    "Greyscalegorilla (a GSG library folder). Megascans and Greyscalegorilla roots are "
+    "browsed in place and read-only; thumbnails go to your prefs folder.")
 
 
 class IngestDialog(QtWidgets.QDialog):
@@ -70,16 +79,14 @@ class IngestDialog(QtWidgets.QDialog):
         form.addRow("Tags", self.tags_edit)
 
         self.copy_check = QtWidgets.QCheckBox("Copy files into the library")
-        self.copy_check.setChecked(settings.get("megascans_copy" if plan.megascans
+        vendor = plan.megascans + plan.gsg
+        self.copy_check.setChecked(settings.get("megascans_copy" if vendor
                                                 else "copy_on_ingest"))
         self.copy_check.setToolTip("On: files are copied into the asset folder (v001/).\n"
                                    "Off: the asset points at the files where they are now.")
         form.addRow("", self.copy_check)
-        if plan.megascans:
-            ms = QtWidgets.QLabel(
-                "%d Megascans asset(s): names, tags and categories come from their .json "
-                "files, and categories go under the one above. Megascans textures are large, "
-                "so files stay where they are unless you tick Copy." % plan.megascans)
+        if vendor:
+            ms = QtWidgets.QLabel(VENDOR_INGEST_NOTE % vendor)
             ms.setWordWrap(True)
             ms.setStyleSheet("color: #9aa0a8;")
             form.addRow("", ms)
@@ -183,7 +190,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
         lay.addWidget(QtWidgets.QLabel("<b>Library roots</b>"))
         self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Path", "Read-only", "Megascans"])
+        self.table.setHorizontalHeaderLabels(["Path", "Read-only", "Type"])
         self.table.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         for col in (1, 2):
@@ -193,15 +200,14 @@ class SettingsDialog(QtWidgets.QDialog):
         self.table.setToolTip("Folders scanned for assets. A path can use variables such as "
                               "$AX_ASSET_LIB; node parms then keep the variable.\n"
                               "Read-only roots are browsed but never written to.\n"
-                              "Megascans: a Megascans download folder (Bridge 'Downloaded', or "
-                              "folders like 3d/ and surfaces/) browsed in place. Nothing is "
-                              "written into it; thumbnails go to your prefs folder.")
+                              + ROOT_TYPE_TIP)
         lay.addWidget(self.table, 1)
         roots = [r for r in settings.get("roots") if isinstance(r, dict)]
         if not roots and os.environ.get(_prefs.ENV_VAR):
             roots = [{"path": "$" + _prefs.ENV_VAR, "read_only": False}]
         for r in roots:
-            self._add_row(r.get("path", ""), r.get("read_only", False), r.get("megascans", False))
+            kind = r.get("kind") or ("megascans" if r.get("megascans") else "library")
+            self._add_row(r.get("path", ""), r.get("read_only", False), kind)
 
         row = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("Add folder...")
@@ -267,23 +273,29 @@ class SettingsDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
-    def _add_row(self, path, read_only, is_megascans=False):
+    def _add_row(self, path, read_only, kind="library"):
         r = self.table.rowCount()
         self.table.insertRow(r)
         item = QtWidgets.QTableWidgetItem(path)
         item.setToolTip(_prefs.expand(path))
         self.table.setItem(r, 0, item)
-        for col, on in ((1, read_only), (2, is_megascans)):
-            chk = QtWidgets.QTableWidgetItem()
-            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-            chk.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
-            self.table.setItem(r, col, chk)
+        chk = QtWidgets.QTableWidgetItem()
+        chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        chk.setCheckState(Qt.CheckState.Checked if read_only else Qt.CheckState.Unchecked)
+        self.table.setItem(r, 1, chk)
+        combo = QtWidgets.QComboBox()
+        for k in schema.ROOT_KINDS:
+            combo.addItem(schema.ROOT_KIND_LABELS[k], k)
+        combo.setCurrentIndex(max(0, combo.findData(kind)))
+        combo.setToolTip(ROOT_TYPE_TIP)
+        self.table.setCellWidget(r, 2, combo)
 
     def _browse(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Library root")
         if d:
-            is_ms = megascans.looks_like_download(d)
-            self._add_row(d.replace("\\", "/"), False, is_ms)  # Megascans roots are read-only anyway
+            kind = ("megascans" if megascans.looks_like_download(d)
+                    else "gsg" if gsg.looks_like_library(d) else "library")
+            self._add_row(d.replace("\\", "/"), False, kind)  # vendor roots are read-only anyway
 
     def _remove(self):
         for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
@@ -295,8 +307,9 @@ class SettingsDialog(QtWidgets.QDialog):
             path = (self.table.item(r, 0).text() if self.table.item(r, 0) else "").strip()
             if path:
                 ro = self.table.item(r, 1).checkState() == Qt.CheckState.Checked
-                ms = self.table.item(r, 2).checkState() == Qt.CheckState.Checked
-                roots.append({"path": path, "read_only": ro, "megascans": ms})
+                combo = self.table.cellWidget(r, 2)
+                kind = combo.currentData() if combo is not None else "library"
+                roots.append({"path": path, "read_only": ro, "kind": kind})
         order = [f.strip().lstrip(".").lower() for f in self.formats.text().split(",") if f.strip()]
         self.settings.set("roots", roots, save=False)
         self.settings.set("path_mode", self.path_mode.currentData(), save=False)

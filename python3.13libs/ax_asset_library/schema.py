@@ -20,6 +20,10 @@ FOLDER_TYPES = {v: k for k, v in TYPE_FOLDERS.items()}
 TYPE_LABELS = {"geometry": "Geometry", "material": "Material", "hdri": "HDRI", "image": "Image"}
 # Types that get a Karma-rendered thumbnail (images use the image itself).
 RENDERABLE_TYPES = ("geometry", "material", "hdri")
+# Root kinds that are third-party libraries browsed in place (read-only, cached records).
+VENDOR_KINDS = ("megascans", "gsg")
+ROOT_KINDS = ("library",) + VENDOR_KINDS
+ROOT_KIND_LABELS = {"library": "Library", "megascans": "Megascans", "gsg": "Greyscalegorilla"}
 
 # Multi-part extensions first so ".bgeo.sc" wins over ".sc".
 _MULTI_EXTS = (".bgeo.sc", ".bgeo.gz", ".bgeo.lzma", ".bgeo.bz2", ".geo.sc", ".geo.gz")

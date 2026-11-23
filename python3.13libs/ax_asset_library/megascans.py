@@ -358,9 +358,9 @@ def plan(asset):
 
 
 # --- browsing a Megascans folder in place ------------------------------------------------------
-def record_id(asset_id, asset_type, variation=None):
-    """Stable id for favorites, recents and scene nodes: megascans:<id>:<type>[:<var>]."""
-    return ":".join(["megascans", asset_id, asset_type] + ([variation] if variation else []))
+def record_id(asset_id, asset_type, variation=None, prefix="megascans"):
+    """Stable id for favorites, recents and scene nodes: <prefix>:<id>:<type>[:<var>]."""
+    return ":".join([prefix, asset_id, asset_type] + ([variation] if variation else []))
 
 
 def thumb_path(thumb_dir, rid):
@@ -368,14 +368,23 @@ def thumb_path(thumb_dir, rid):
 
 
 def records_for(asset, root, thumb_dir, thumbs, mtime):
-    """AssetRecords for one Megascans asset. `thumbs`: {file name: mtime} in thumb_dir."""
+    """AssetRecords for one Megascans asset."""
+    return build_records(asset, plan(asset), root, thumb_dir, thumbs, mtime,
+                         "megascans", "Megascans")
+
+
+def build_records(asset, items, root, thumb_dir, thumbs, mtime, prefix, note):
+    """AssetRecords for one asset of a library browsed in place (Megascans, GSG).
+
+    `items` is the asset's plan() output; `asset` needs .id .folder .preview .tags
+    .category .kind. `thumbs`: {file name: mtime} in thumb_dir."""
     from .library import AssetRecord
     created = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ") if mtime else ""
     preview = asset.preview
     out = []
-    for asset_type, name, files, info, _extra in plan(asset):
-        rid = record_id(asset.id, asset_type, info.get("variation"))
+    for asset_type, name, files, info, _extra in items:
+        rid = record_id(asset.id, asset_type, info.get("variation"), prefix)
         cache = thumb_path(thumb_dir, rid)
         cached = thumbs.get(os.path.basename(cache))
         thumb = cache if cached or not preview else preview
@@ -384,13 +393,14 @@ def records_for(asset, root, thumb_dir, thumbs, mtime):
             info = dict(info, preview=preview)  # fallback when a rendered thumbnail is deleted
         out.append(AssetRecord(
             key=_norm(asset.folder) + "|" + rid, id=rid, name=name, type=asset_type,
-            category=asset.category or asset.kind, tags=list(asset.tags),
+            category=asset.category or getattr(asset, "fallback_category", asset.kind),
+            tags=list(asset.tags),
             created=created, modified=created, asset_dir=asset.folder, root=root,
             current=1, versions=[1], files=files, missing=[], thumb=thumb,
             thumb_mtime=cached or (mtime if preview else None), info=dict(info),
-            problems=[], sidecar_mtime=mtime, source_kind="megascans",
+            problems=[], sidecar_mtime=mtime, source_kind=prefix,
             thumb_method="karma" if cached else ("image" if preview else ""),
-            version_list=[{"version": 1, "created": created, "author": "", "note": "Megascans",
+            version_list=[{"version": 1, "created": created, "author": "", "note": note,
                            "files": files}]))
     return out
 
@@ -508,17 +518,22 @@ def _thumb_index(thumb_dir):
     return out
 
 
-def scan_root(root, cached=None, thumb_dir=""):
-    """Records for every Megascans asset under `root`, without writing anything there.
+def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_folders=None):
+    """Records for every asset `reader` recognizes under `root` (Megascans by default),
+    without writing anything there. `recorder(asset, root, thumb_dir, thumbs, mtime)` makes
+    the records; folders named in `kind_folders` (3d, surfaces, ...) are walked into.
 
     `cached` is {folder key: entry} from a previous scan. An asset folder whose modification
     time is unchanged is not listed again, so a rescan of a big library only reads the
     folders above the assets. Returns (records, entries, errors).
     """
+    reader = reader or read_asset
+    recorder = recorder or records_for
+    kind_folders = KIND_ALIASES if kind_folders is None else kind_folders
     cached = cached or {}
     records, entries, errors = [], {}, []
     if not os.path.isdir(root):
-        return records, entries, ["Megascans folder not found: %s" % root]
+        return records, entries, ["Folder not found: %s" % root]
     thumbs = _thumb_index(thumb_dir) if thumb_dir else {}
 
     def visit(folder, depth, kind_hint):
@@ -529,13 +544,13 @@ def scan_root(root, cached=None, thumb_dir=""):
             errors.append(str(e))
             return
         for e in sorted(subdirs, key=lambda d: d.name.lower()):
-            hint = KIND_ALIASES.get(e.name.lower(), kind_hint)
+            hint = kind_folders.get(e.name.lower(), kind_hint)
             key = _norm(e.path)
             try:
                 mtime = e.stat().st_mtime
             except OSError:
                 continue
-            if e.name.lower() in KIND_ALIASES:     # 3d, surfaces, ...: a kind folder, not an asset
+            if e.name.lower() in kind_folders:     # 3d, surfaces, ...: a kind folder, not an asset
                 if depth < MAX_DEPTH:
                     visit(e.path, depth + 1, hint)
                 continue
@@ -553,7 +568,7 @@ def scan_root(root, cached=None, thumb_dir=""):
                 except OSError as err:
                     errors.append(str(err))
                     continue
-                asset = read_asset(e.path, names, hint)
+                asset = reader(e.path, names, hint)
                 if asset is None:
                     if depth < MAX_DEPTH:
                         visit(e.path, depth + 1, hint)
@@ -562,7 +577,7 @@ def scan_root(root, cached=None, thumb_dir=""):
                          "subdirs": content_subdirs(e.path)}
             entries[key] = entry
             try:
-                recs = records_for(asset, root, thumb_dir, thumbs, mtime)
+                recs = recorder(asset, root, thumb_dir, thumbs, mtime)
             except (OSError, ValueError, KeyError) as err:
                 errors.append("%s: %s" % (e.path, err))
                 continue

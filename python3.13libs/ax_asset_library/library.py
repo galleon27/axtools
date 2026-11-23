@@ -209,7 +209,8 @@ MEGASCANS_THUMBS = "megascans_thumbs"
 
 
 def _root_kind(root):
-    """Roots are a path (library) or (path, kind) with kind "library" or "megascans"."""
+    """Roots are a path (library) or (path, kind) with kind "library", "megascans" or
+    "gsg"."""
     if isinstance(root, (tuple, list)):
         return root[0], (root[1] or "library")
     return root, "library"
@@ -251,7 +252,7 @@ def save_index(cache_dir, root, entries, kind="library"):
 def records_from_index(cache_dir, root, kind="library"):
     """Records straight from the cache, without touching the library (instant first paint)."""
     entries = load_index(cache_dir, root, kind)
-    if kind == "megascans":
+    if kind in schema.VENDOR_KINDS:
         from . import megascans
         return megascans.records_from_entries(entries, root, megascans_thumb_dir(cache_dir))
     out = []
@@ -264,14 +265,14 @@ def records_from_index(cache_dir, root, kind="library"):
 
 
 def dedupe_megascans(records):
-    """Drop Megascans records whose id an earlier root already provided.
+    """Drop Megascans or GSG records whose id an earlier root already provided.
 
-    The same Megascans asset can sit in two Megascans roots (Bridge 'Downloaded' and a
-    downloader folder). Its id (megascans:<asset id>:<type>) keys favorites, recents, scene
-    nodes and the rendered thumbnail, so only the first root's copy is listed."""
+    The same vendor asset can sit in two roots (e.g. Bridge 'Downloaded' and a downloader
+    folder). Its id (megascans:<asset id>:<type>, gsg:<code>:<type>) keys favorites, recents,
+    scene nodes and the rendered thumbnail, so only the first root's copy is listed."""
     seen, out = set(), []
     for r in records:
-        if r.source_kind == "megascans" and r.id:
+        if r.source_kind in schema.VENDOR_KINDS and r.id:
             if r.id in seen:
                 continue
             seen.add(r.id)
@@ -282,17 +283,20 @@ def dedupe_megascans(records):
 def scan_roots(roots, cache_dir, use_cache=True):
     """Scan every root and update their index files.
 
-    `roots` holds expanded paths, or (path, kind) pairs where kind "megascans" reads a
-    Megascans download in place (see megascans.scan_root). Returns (records, errors).
+    `roots` holds expanded paths, or (path, kind) pairs where kind "megascans" or "gsg"
+    reads a Megascans download or a Greyscalegorilla library in place (megascans.scan_root,
+    gsg.scan_root; rendered thumbnails share one cache folder, ids differ by prefix).
+    Returns (records, errors).
     Safe to call from a worker thread.
     """
     records, errors = [], []
     for item in roots:
         root, kind = _root_kind(item)
         cached = load_index(cache_dir, root, kind) if use_cache else {}
-        if kind == "megascans":
-            from . import megascans
-            recs, entries, errs = megascans.scan_root(root, cached, megascans_thumb_dir(cache_dir))
+        if kind in schema.VENDOR_KINDS:
+            from . import gsg, megascans
+            scan = gsg.scan_root if kind == "gsg" else megascans.scan_root
+            recs, entries, errs = scan(root, cached, megascans_thumb_dir(cache_dir))
         else:
             recs, entries, errs = scan_root(root, cached)
         records.extend(recs)
