@@ -10,6 +10,26 @@ session backed by DeepSeek (`dev/implement-plan.ps1`).
   stop and report the mismatch instead of improvising. All other rules in this file
   still apply. Finish with a list of changed files and how each step was checked.
 
+## Code map and search rules
+- `python3.13libs/ax_asset_library/`: asset library. `library.py`, `schema.py`, `prefs.py`
+  (data); `importers.py`, `materials.py`, `textures.py`, `megascans.py`, `karma.py`,
+  `gsg.py`, `scene.py`, `variants.py` (import); `publish.py`, `manage.py`,
+  `thumbnails.py`, `dragdrop.py`; `ui/` (`panel.py`, `grid.py`, `dialogs.py`).
+- `python3.13libs/ax_type/`: type tool (`editor.py`, `layout.py`, `shaping.py`, `fonts.py`,
+  `markup.py`, `arrays.py`, `build.py`).
+- `scripts/python/`: standalone single-file tools (`ax_notes.py`, `ax_svg_import.py`,
+  `asset_manager.py`, `swatches_panel.py`, `flow_ease.py`, ...).
+- Tests: `tests/`, run with hython `-m unittest tests.test_ax_asset_library`
+  (`..._hou` variant needs hython).
+- Search with Grep scoped to `python3.13libs/` or `scripts/python/`, never the repo root.
+- Don't open `database/`, `otls/`, `gallery/`, `usd/`, `presets/` (binary or huge; denied in
+  `.claude/settings.json`). HDAs are inspected only through hython.
+- Symbol index: `C:/Users/Alex/AppData/Roaming/Python/Python314/Scripts/codemap.exe find "<name>" -f` returns `file:start-end [type] name`; then Read just that range. `codemap show <file>` lists a file's symbols. Refresh with `codemap update --all` after edits (index is in `.codemap/`, gitignored; config in `.codemaprc`).
+- Otherwise Grep for the symbol first, then Read with `offset`/`limit`. Files of 1,000+ lines
+  (`ui/panel.py`, `ax_notes.py`, `ax_svg_import.py`, `asset_manager.py`,
+  `swatches_panel.py`) are never read whole.
+- Don't re-read a file you just edited.
+
 ## Writing HDA help and documentation
 Any time you write or edit user-facing text for an HDA or tool, invoke the
 `avoid-ai-writing` skill (voice profile: technical) on it before finishing. This covers:
