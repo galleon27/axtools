@@ -5,8 +5,8 @@ import time
 import hou
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import (importers, library, manage, materials, prefs as _prefs, publish, scene,
-               schema, thumbnails, variants)
+from .. import (importers, library, manage, materials, megascans, prefs as _prefs, publish,
+               scene, schema, thumbnails, variants)
 from . import details, dialogs, grid
 
 Qt = QtCore.Qt
@@ -53,16 +53,20 @@ def icon(name):
 class _ScanSignals(QtCore.QObject):
     finished = QtCore.Signal(int, object, object)  # generation, records, errors
     cached = QtCore.Signal(int, object)            # generation, records from the index cache
+    progress = QtCore.Signal(int, str, int, int)   # generation, root, done, total
+    partial = QtCore.Signal(int, object)           # generation, records read so far
 
 
 class _ScanJob(QtCore.QRunnable):
     """Runs library.scan_roots in a worker thread, or with cache_only just reads the index
     caches (a big Megascans cache takes a moment to load). No hou calls here."""
 
-    def __init__(self, generation, roots, cache_dir, use_cache, signals, cache_only=False):
+    def __init__(self, generation, roots, cache_dir, use_cache, signals, cache_only=False,
+                 cancelled=None):
         super().__init__()
         self.generation, self.roots, self.cache_dir = generation, roots, cache_dir
         self.use_cache, self.signals, self.cache_only = use_cache, signals, cache_only
+        self.cancelled = cancelled   # () -> True once a newer scan has started
 
     def run(self):
         if self.cache_only:
@@ -75,7 +79,12 @@ class _ScanJob(QtCore.QRunnable):
             self.signals.cached.emit(self.generation, library.dedupe_megascans(records))
             return
         try:
-            records, errors = library.scan_roots(self.roots, self.cache_dir, self.use_cache)
+            records, errors = library.scan_roots(
+                self.roots, self.cache_dir, self.use_cache,
+                progress=lambda root, done, total: self.signals.progress.emit(
+                    self.generation, root, done, total),
+                partial=lambda recs: self.signals.partial.emit(self.generation, recs),
+                cancelled=self.cancelled)
         except Exception as e:  # keep the panel alive whatever the file system does
             records, errors = [], ["scan failed: %s" % e]
         self.signals.finished.emit(self.generation, records, errors)
@@ -145,6 +154,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._scanning = False
         self._last_scan = 0.0
         self._scan_errors = []
+        self._scan_progress = None
+        self._partial_shown = False
         self._select_after_scan = set()
         self._usage = {}          # record key -> scene.Usage
         self._hip_callback = None
@@ -153,6 +164,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._scan_signals = _ScanSignals()
         self._scan_signals.finished.connect(self._on_scan_finished)
         self._scan_signals.cached.connect(self._on_cache_loaded)
+        self._scan_signals.progress.connect(self._on_scan_progress)
+        self._scan_signals.partial.connect(self._on_scan_partial)
         self._cache_generation = 0
 
         try:
@@ -375,9 +388,23 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                                   self._scan_signals, cache_only=True))
 
     def _on_cache_loaded(self, generation, records):
-        # Only while the scan hasn't delivered yet: never replace fresher scan results.
-        if generation == self._cache_generation and self._scanning:
+        # Only while the scan hasn't delivered yet: never replace fresher scan results,
+        # including the partial results a scan has already sent.
+        if generation == self._cache_generation and self._scanning and not self._partial_shown:
             self._set_records(records)
+
+    def _on_scan_progress(self, generation, root, done, total):
+        if generation != self._scan_generation:
+            return  # a newer scan was started meanwhile
+        name = os.path.basename(root.rstrip("/\\")) or root
+        self._scan_progress = (name, done, total)
+        self._update_status()
+
+    def _on_scan_partial(self, generation, records):
+        if generation != self._scan_generation or not self._scanning:
+            return
+        self._set_records(records)
+        self._partial_shown = True
 
     def _guess_vendor(self, root):
         """"megascans" or "gsg" when a library root looks like that vendor's folder."""
@@ -395,10 +422,14 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         if not roots:
             self._set_records([])
             return
+        self._scan_progress = None
+        self._partial_shown = False
         self._scanning = True
         self._update_status()
-        self._pool.start(_ScanJob(self._scan_generation, roots, _prefs.cache_dir(), use_cache,
-                                  self._scan_signals))
+        generation = self._scan_generation
+        self._pool.start(_ScanJob(generation, roots, _prefs.cache_dir(), use_cache,
+                                  self._scan_signals,
+                                  cancelled=lambda: generation != self._scan_generation))
 
     def _on_rescan_clicked(self):
         full = bool(QtWidgets.QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -410,6 +441,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         if generation != self._scan_generation:
             return  # a newer scan was started meanwhile
         self._scanning = False
+        self._scan_progress = None
         self._scan_errors = errors
         self.records = records
         self._refresh_scene()
@@ -492,6 +524,24 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                             "asset.json files; open Settings and set Type to %s to browse "
                             "it in place." % (vendor, vendor))
             ri = add(None, "%s (%d)" % (label, n_root), ("scope", root, None, ""), tip)
+            if r["kind"] == "megascans":
+                # Bridge's layout: sections (3D Assets, Surfaces, ...) and their categories,
+                # no Geometry/Material level.
+                order = {label: i for i, (_k, label) in enumerate(megascans.BRIDGE_SECTIONS)}
+
+                def section_key(cat):
+                    top, _sep, rest = cat.partition("/")
+                    return (order.get(top, len(order)), top.lower(), rest.lower())
+
+                nodes = {"": ri}
+                for cat in sorted(library.categories(self.shown_records, root, None),
+                                  key=section_key):
+                    parent_cat = cat.rsplit("/", 1)[0] if "/" in cat else ""
+                    nodes[cat] = add(nodes.get(parent_cat, ri), "%s (%d)" % (
+                        cat.rsplit("/", 1)[-1], counts.get((root, None, cat), 0)),
+                        ("scope", root, None, cat))
+                ri.setExpanded(True)
+                continue
             for t in schema.ASSET_TYPES:
                 n = counts.get((root, t, ""), 0)
                 if not n:
@@ -539,7 +589,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             act.setEnabled(enabled)
             actions[act] = fn
 
-        if asset_type is None:
+        if asset_type is None and not category:
             add("Show in file browser", lambda: self._reveal(root))
             add("Rescan", self.rescan)
             menu.addSeparator()
@@ -681,7 +731,10 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         if shown != len(self.shown_records):
             parts.append("%d shown" % shown)
         if self._scanning:
-            parts.append("scanning...")
+            if self._scan_progress:
+                parts.append("scanning %s %d / %d" % self._scan_progress)
+            else:
+                parts.append("scanning...")
         rendering = len(thumbnails.karma_queue())
         if rendering:
             parts.append("rendering %d thumbnail(s)" % rendering)
@@ -729,27 +782,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     def _ask_renderer(self):
         """Menu at the cursor: which renderer to build materials for. None = cancelled."""
-        menu = QtWidgets.QMenu(self)
-        menu.addSection("Build material for")
-        last = self.settings.get("material_renderer")
         choices = materials.available_renderers()
         if not choices:
             hou.ui.displayMessage("No Karma, Octane or Redshift material nodes found.",
                                   severity=hou.severityType.Warning, title="AX Asset Library")
             return None
-        default = None  # last used renderer, else the first one
-        for key, label in choices:
-            act = menu.addAction(label)
-            act.setData(key)
-            if default is None or key == last:
-                default = act
-        menu.setActiveAction(default)
-        chosen = menu.exec(QtGui.QCursor.pos(), default)
-        menu.deleteLater()
-        if chosen is None:
-            return None
-        self.settings.set("material_renderer", chosen.data())
-        return chosen.data()
+        picked = dialogs.import_options(self, [], [], choices, self.settings)
+        return None if picked is None else picked[0]
 
     def _import_selected(self, renderer=None):
         recs = self.view.selected_records()
@@ -786,16 +825,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             linked = any(rec.type == "geometry" and variants.linked_material(rec, self.records)
                          for rec in recs)
             if linked or len(lods) > 1 or atlas:
-                dialog = dialogs.ImportOptionsDialog(
-                    sorted(lods), _resolution_order(resolutions),
-                    materials.available_renderers(), self.settings, atlas=atlas, parent=self)
-                if as_geometry is not None:
-                    dialog.trace.setChecked(as_geometry)
-                accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
-                dialog.deleteLater()
-                if not accepted:
+                picked = dialogs.import_options(
+                    self, sorted(lods), _resolution_order(resolutions),
+                    materials.available_renderers(), self.settings, atlas=atlas,
+                    as_geometry=as_geometry, allow_no_material=True)
+                if picked is None:
                     return []
-                renderer, lod, resolution, as_geometry = dialog.values()
+                renderer, lod, resolution, as_geometry = picked
                 asked = True
         if not asked and renderer is None and (
                 any(r.type == "material" for r in recs)

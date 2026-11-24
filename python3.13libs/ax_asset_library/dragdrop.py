@@ -9,7 +9,6 @@ import weakref
 
 import hou
 
-from . import materials
 
 MIME = "application/json"
 PAYLOAD_TYPE = "ax_asset_library"
@@ -101,15 +100,6 @@ class AssetDropHandler:
         return read_payload(source) is not None
 
     def choices(self, pane, source):
-        payload = read_payload(source) or {}
-        types = payload.get("types", [])
-        if types and all(t == "material" for t in types):
-            tokens, labels, helps = [], [], []
-            for key, label in materials.available_renderers():
-                tokens.append(key)
-                labels.append("Import (materials as %s)" % label)
-                helps.append("")
-            return tokens, labels, helps
         return ["import"], ["Import"], [""]
 
     def accept(self, pane, source, position, token):
@@ -119,10 +109,8 @@ class AssetDropHandler:
         panel = find_panel(payload)
         if panel is None:
             return False
-        renderers = dict(materials.available_renderers())
-        renderer = token if token in renderers else None
         return panel.import_dropped(payload["keys"], pane,
-                                    network_position(pane, position), renderer)
+                                    network_position(pane, position), None)
 
 
 def register(panel):

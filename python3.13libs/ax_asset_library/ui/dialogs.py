@@ -349,9 +349,11 @@ class SettingsDialog(QtWidgets.QDialog):
 
 
 class ImportOptionsDialog(QtWidgets.QDialog):
-    """Renderer, LOD and texture resolution for a model import."""
+    """Renderer, plus LOD / texture resolution / trace rows when they apply. Used for every
+    import (materials show only the renderer) and opens under the cursor."""
 
-    def __init__(self, lods, resolutions, renderers, settings, atlas=False, parent=None):
+    def __init__(self, lods, resolutions, renderers, settings, atlas=False,
+                 allow_no_material=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Import options")
         self.settings = settings
@@ -361,10 +363,11 @@ class ImportOptionsDialog(QtWidgets.QDialog):
         self.renderer = QtWidgets.QComboBox()
         for key, label in renderers:
             self.renderer.addItem(label, key)
-        self.renderer.addItem("No material", "none")
+        if allow_no_material:
+            self.renderer.addItem("No material", "none")
         index = self.renderer.findData(settings.get("material_renderer"))
         self.renderer.setCurrentIndex(index if index >= 0 else 0)
-        self.renderer.setToolTip("Renderer for the model's material. No material imports the "
+        self.renderer.setToolTip("Renderer for the material. No material imports the "
                                  "geometry alone.")
         form.addRow("Renderer", self.renderer)
 
@@ -374,11 +377,7 @@ class ImportOptionsDialog(QtWidgets.QDialog):
         index = self.lod.findData(settings.get("model_lod"))
         self.lod.setCurrentIndex(index if index >= 0 else 0)
         self.lod.setToolTip("LOD0 is the most detailed; higher numbers are lighter.")
-        form.addRow("LOD", self.lod)
-        self.lod.setVisible(len(lods) > 1)
-        lod_label = form.labelForField(self.lod)
-        if lod_label is not None:
-            lod_label.setVisible(len(lods) > 1)
+        self._optional_row(form, "LOD", self.lod, len(lods) > 1)
 
         self.resolution = QtWidgets.QComboBox()
         for label in resolutions:
@@ -386,11 +385,7 @@ class ImportOptionsDialog(QtWidgets.QDialog):
         index = self.resolution.findData(settings.get("model_resolution"))
         self.resolution.setCurrentIndex(index if index >= 0 else 0)
         self.resolution.setToolTip("Texture resolution used by the material.")
-        form.addRow("Texture resolution", self.resolution)
-        self.resolution.setVisible(len(resolutions) > 1)
-        res_label = form.labelForField(self.resolution)
-        if res_label is not None:
-            res_label.setVisible(len(resolutions) > 1)
+        self._optional_row(form, "Texture resolution", self.resolution, len(resolutions) > 1)
 
         lay.addLayout(form)
         self.trace = QtWidgets.QCheckBox("Trace opacity into geometry")
@@ -406,6 +401,27 @@ class ImportOptionsDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
+    @staticmethod
+    def _optional_row(form, label, widget, visible):
+        form.addRow(label, widget)
+        widget.setVisible(visible)
+        field_label = form.labelForField(widget)
+        if field_label is not None:
+            field_label.setVisible(visible)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Centre under the mouse, kept on the screen.
+        pos = QtGui.QCursor.pos()
+        rect = self.frameGeometry()
+        rect.moveCenter(pos)
+        screen = QtGui.QGuiApplication.screenAt(pos)
+        if screen is not None:
+            area = screen.availableGeometry()
+            rect.moveLeft(max(area.left(), min(rect.left(), area.right() - rect.width())))
+            rect.moveTop(max(area.top(), min(rect.top(), area.bottom() - rect.height())))
+        self.move(rect.topLeft())
+
     def values(self):
         return (self.renderer.currentData(), self.lod.currentData(),
                 self.resolution.currentData(), self.trace.isChecked())
@@ -418,6 +434,19 @@ class ImportOptionsDialog(QtWidgets.QDialog):
         self.settings.set("model_resolution", self.resolution.currentData() or "", save=False)
         self.settings.save()
         self.accept()
+
+
+def import_options(parent, lods, resolutions, renderers, settings, atlas=False,
+                   as_geometry=None, allow_no_material=False):
+    """Show ImportOptionsDialog; (renderer, lod, resolution, as_geometry) or None."""
+    dialog = ImportOptionsDialog(lods, resolutions, renderers, settings, atlas=atlas,
+                                 allow_no_material=allow_no_material, parent=parent)
+    if as_geometry is not None:
+        dialog.trace.setChecked(as_geometry)
+    accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
+    values = dialog.values() if accepted else None
+    dialog.deleteLater()
+    return values
 
 
 class PublishDialog(QtWidgets.QDialog):
