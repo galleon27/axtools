@@ -12,10 +12,14 @@ import hashlib
 import json
 import os
 import re
+import threading
+import time
 
 from . import schema
 
 INDEX_VERSION = 2  # bump when AssetRecord fields change: old caches are ignored
+INDEX_SAVE_INTERVAL_S = 30   # how often a long vendor scan saves its index while it runs
+PARTIAL_INTERVAL_S = 2       # how often a long scan sends its records so far to the panel
 
 
 class AssetRecord:
@@ -243,7 +247,8 @@ def load_index(cache_dir, root, kind="library"):
 def save_index(cache_dir, root, entries, kind="library"):
     os.makedirs(cache_dir, exist_ok=True)
     path = index_path(cache_dir, root)
-    tmp = "%s.tmp%d" % (path, os.getpid())
+    # Per thread: two scans (a superseded one still finishing) never share a temp file.
+    tmp = "%s.tmp%d_%d" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"version": INDEX_VERSION, "root": root, "kind": kind, "entries": entries}, f)
     os.replace(tmp, path)
@@ -280,7 +285,7 @@ def dedupe_megascans(records):
     return out
 
 
-def scan_roots(roots, cache_dir, use_cache=True):
+def scan_roots(roots, cache_dir, use_cache=True, progress=None, partial=None, cancelled=None):
     """Scan every root and update their index files.
 
     `roots` holds expanded paths, or (path, kind) pairs where kind "megascans" or "gsg"
@@ -288,18 +293,57 @@ def scan_roots(roots, cache_dir, use_cache=True):
     gsg.scan_root; rendered thumbnails share one cache folder, ids differ by prefix).
     Returns (records, errors).
     Safe to call from a worker thread.
+
+    `progress(root, done, total)` follows the scan of a vendor root (and is called once with
+    (1, 1) for a plain library root). `partial(records)` receives the deduplicated records
+    of everything read so far, at most every PARTIAL_INTERVAL_S; a vendor root also saves its
+    index during the scan (at most every INDEX_SAVE_INTERVAL_S), so an interrupted first scan
+    keeps what it has read. When `cancelled()` returns True (a newer scan replaced this one)
+    the scan stops; the roots read so far keep their saved index.
     """
     records, errors = [], []
+    done_records = []            # records of the roots finished so far
+
+    def stop():
+        return bool(cancelled and cancelled())
+
     for item in roots:
+        if stop():
+            break
         root, kind = _root_kind(item)
         cached = load_index(cache_dir, root, kind) if use_cache else {}
         if kind in schema.VENDOR_KINDS:
             from . import gsg, megascans
             scan = gsg.scan_root if kind == "gsg" else megascans.scan_root
-            recs, entries, errs = scan(root, cached, megascans_thumb_dir(cache_dir))
+            state = {"save_failed": False, "saved": None, "shown": None}
+
+            def on_batch(batch_records, entries, root=root, kind=kind, state=state):
+                now = time.monotonic()
+                if not state["save_failed"] and (
+                        state["saved"] is None or now - state["saved"] >= INDEX_SAVE_INTERVAL_S):
+                    state["saved"] = now
+                    try:
+                        save_index(cache_dir, root, entries, kind)
+                    except OSError as e:
+                        state["save_failed"] = True
+                        errors.append("could not write index cache: %s" % e)
+                if partial and (state["shown"] is None
+                                or now - state["shown"] >= PARTIAL_INTERVAL_S):
+                    state["shown"] = now
+                    partial(dedupe_megascans(done_records + batch_records))
+
+            recs, entries, errs = scan(
+                root, cached, megascans_thumb_dir(cache_dir), on_batch=on_batch,
+                progress=(lambda done, total: progress(root, done, total)) if progress else None,
+                cancelled=cancelled)
+            if stop():               # partial results: the batch saves already stored them
+                break
         else:
             recs, entries, errs = scan_root(root, cached)
+            if progress:
+                progress(root, 1, 1)
         records.extend(recs)
+        done_records.extend(recs)
         errors.extend(errs)
         if entries or cached:
             try:
@@ -351,13 +395,16 @@ def browsable(records):
 
 
 def tree_counts(records):
-    """{(root, type, category prefix): count}; type None = whole root, category "" = whole type."""
+    """{(root, type, category prefix): count}; type None = every type (the whole root with
+    category ""; Megascans roots list their categories without a type level)."""
     counts = {}
     for r in records:
         keys = [(r.root, None, ""), (r.root, r.type, "")]
         if r.category:
             parts = r.category.split("/")
-            keys += [(r.root, r.type, "/".join(parts[:i])) for i in range(1, len(parts) + 1)]
+            for i in range(1, len(parts) + 1):
+                prefix = "/".join(parts[:i])
+                keys += [(r.root, r.type, prefix), (r.root, None, prefix)]
         for k in keys:
             counts[k] = counts.get(k, 0) + 1
     return counts
