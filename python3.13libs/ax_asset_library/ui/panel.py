@@ -782,27 +782,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     def _ask_renderer(self):
         """Menu at the cursor: which renderer to build materials for. None = cancelled."""
-        menu = QtWidgets.QMenu(self)
-        menu.addSection("Build material for")
-        last = self.settings.get("material_renderer")
         choices = materials.available_renderers()
         if not choices:
             hou.ui.displayMessage("No Karma, Octane or Redshift material nodes found.",
                                   severity=hou.severityType.Warning, title="AX Asset Library")
             return None
-        default = None  # last used renderer, else the first one
-        for key, label in choices:
-            act = menu.addAction(label)
-            act.setData(key)
-            if default is None or key == last:
-                default = act
-        menu.setActiveAction(default)
-        chosen = menu.exec(QtGui.QCursor.pos(), default)
-        menu.deleteLater()
-        if chosen is None:
-            return None
-        self.settings.set("material_renderer", chosen.data())
-        return chosen.data()
+        picked = dialogs.import_options(self, [], [], choices, self.settings)
+        return None if picked is None else picked[0]
 
     def _import_selected(self, renderer=None):
         recs = self.view.selected_records()
@@ -839,16 +825,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             linked = any(rec.type == "geometry" and variants.linked_material(rec, self.records)
                          for rec in recs)
             if linked or len(lods) > 1 or atlas:
-                dialog = dialogs.ImportOptionsDialog(
-                    sorted(lods), _resolution_order(resolutions),
-                    materials.available_renderers(), self.settings, atlas=atlas, parent=self)
-                if as_geometry is not None:
-                    dialog.trace.setChecked(as_geometry)
-                accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
-                dialog.deleteLater()
-                if not accepted:
+                picked = dialogs.import_options(
+                    self, sorted(lods), _resolution_order(resolutions),
+                    materials.available_renderers(), self.settings, atlas=atlas,
+                    as_geometry=as_geometry, allow_no_material=True)
+                if picked is None:
                     return []
-                renderer, lod, resolution, as_geometry = dialog.values()
+                renderer, lod, resolution, as_geometry = picked
                 asked = True
         if not asked and renderer is None and (
                 any(r.type == "material" for r in recs)
