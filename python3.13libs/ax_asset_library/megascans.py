@@ -15,10 +15,12 @@ publish.plan_ingest turns assets into library assets (batch import). scan_root t
 whole Megascans folder into AssetRecords without writing anything into it (a "Megascans
 root" in the settings); thumbnails for those go to a cache folder in the user prefs.
 """
+import concurrent.futures
 import datetime
 import json
 import os
 import re
+import time
 
 from . import schema, textures
 
@@ -37,10 +39,21 @@ KIND_ALIASES = {
     "displacement": "displacement", "displacements": "displacement",
     "brush": "brush", "brushes": "brush",
 }
+# assetCategories top key (lower case) -> kind
+BRIDGE_TYPES = {"3d asset": "3d", "3d plant": "3dplant", "surface": "surface",
+                "atlas": "atlas", "decal": "decal", "imperfection": "imperfection",
+                "displacement": "displacement", "brush": "brush"}
+# Kind -> Bridge section, in Bridge's order (the panel lists Megascans roots this way)
+BRIDGE_SECTIONS = (("3d", "3D Assets"), ("3dplant", "3D Plants"), ("surface", "Surfaces"),
+                   ("decal", "Decals"), ("atlas", "Atlases"), ("imperfection", "Imperfections"),
+                   ("displacement", "Displacements"), ("brush", "Brushes"))
+SECTION_LABELS = dict(BRIDGE_SECTIONS)
 META_KEYS = ("height", "length", "width", "dimensions")
 FBX_CM_SCALE = 0.01  # Megascans FBX/OBJ files are in centimeters
 MAX_DEPTH = 4        # how deep scan_root looks for asset folders below the root
-CACHE_VERSION = 3    # bump when plan()/records_for() change: cached records are rebuilt
+CACHE_VERSION = 4    # bump when plan()/records_for() change: cached records are rebuilt
+SCAN_WORKERS = 16    # threads: the folder reads are I/O-bound (network folders)
+BATCH_SIZE = 200     # read folders per on_batch callback during a scan
 
 
 def _norm(path):
@@ -71,6 +84,21 @@ class MegascansAsset:
         cats = [str(c) for c in data.get("categories") or []]
         self.kind = KIND_ALIASES.get(cats[0].lower(), cats[0].lower()) if cats else kind_hint
         self.categories = cats[1:]
+        # Bridge's own tree, {"3D asset": {"nature": {"rock": {...}}}}: its top key is the
+        # real kind ("categories" calls decals "atlas"), the first branch is the category.
+        self.bridge_path = self.categories
+        tree = data.get("assetCategories")
+        if isinstance(tree, dict) and tree:
+            top = next(iter(tree))
+            bridge_kind = BRIDGE_TYPES.get(str(top).strip().lower())
+            if bridge_kind:
+                self.kind = bridge_kind
+                path, node = [], tree[top]
+                while isinstance(node, dict) and node:
+                    name = next(iter(node))
+                    path.append(str(name))
+                    node = node[name]
+                self.bridge_path = path
         self.tags = [str(t) for t in data.get("tags") or []]
         meta = data.get("meta") or []
         if isinstance(meta, dict):     # the trimmed form kept in the scan cache
@@ -112,8 +140,15 @@ class MegascansAsset:
 
     @property
     def category(self):
-        """Bridge categories in lower case (Megascans mixes 'Nature/Rock' and 'nature/rock')."""
-        return "/".join(schema.sanitize_name(c.lower()) for c in self.categories if c.strip())
+        """Bridge category path in lower case, without the section: 'nature/rock/cliff'.
+        Used as the folder when the asset is added to a library."""
+        return "/".join(schema.sanitize_name(c.lower()) for c in self.bridge_path if c.strip())
+
+    @property
+    def browse_category(self):
+        """Category shown in the panel: Bridge section + category, '3D Assets/nature/rock'."""
+        section = SECTION_LABELS.get(self.kind, "Other")
+        return "/".join(p for p in (section, self.category) if p)
 
     def size_m(self, variation=None):
         """Largest dimension in meters from the metadata, or None."""
@@ -330,10 +365,11 @@ def plan(asset):
     """[(asset type, name, {key: file}, info, extra files)] for one Megascans asset.
 
     Surfaces: one material. 3D assets: geometry (most detailed LOD) + material. Plants:
-    one geometry asset per variation + the atlas material. Other kinds: nothing.
+    one geometry asset per variation + the atlas material; a plant without Var* folders (a
+    flat download) is read like a 3D asset. Other kinds: nothing.
     """
     info = {"megascans_id": asset.id, "vendor_kind": asset.kind}
-    if asset.kind == "atlas":
+    if asset.kind in ("atlas", "decal"):
         size = asset.size_m()
         if size is not None:
             info["megascans_size_m"] = size
@@ -341,19 +377,24 @@ def plan(asset):
     top = [f for f in content if "/" not in asset.rel(f)]
     if asset.kind in SURFACE_KINDS:
         return _material(asset, top, info)
-    if asset.kind in MESH_KINDS:
+    def single_mesh():
         out = []
         meshes = mesh_files(top)
         if meshes:
             out.append(("geometry", asset.library_name, meshes,
                         _mesh_info(info, meshes, asset.size_m()), []))
         return out + _material(asset, top, info)
+
+    if asset.kind in MESH_KINDS:
+        return single_mesh()
     if asset.kind in PLANT_KINDS:
         out, variations = [], {}
         for f in content:
             first = asset.rel(f).split("/")[0]
             if re.fullmatch(r"var\d+", first, re.IGNORECASE):
                 variations.setdefault(first, []).append(f)
+        if not variations:
+            return single_mesh()
         for var in sorted(variations, key=lambda v: int(re.sub(r"\D", "", v) or 0)):
             meshes = mesh_files(variations[var])
             if meshes:
@@ -400,7 +441,8 @@ def build_records(asset, items, root, thumb_dir, thumbs, mtime, prefix, note):
             info = dict(info, preview=preview)  # fallback when a rendered thumbnail is deleted
         out.append(AssetRecord(
             key=_norm(asset.folder) + "|" + rid, id=rid, name=name, type=asset_type,
-            category=asset.category or getattr(asset, "fallback_category", asset.kind),
+            category=(getattr(asset, "browse_category", None) or asset.category
+                      or getattr(asset, "fallback_category", asset.kind)),
             tags=list(asset.tags),
             created=created, modified=created, asset_dir=asset.folder, root=root,
             current=1, versions=[1], files=files, missing=[], thumb=thumb,
@@ -529,7 +571,30 @@ def _thumb_index(thumb_dir):
     return out
 
 
-def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_folders=None):
+def _read_folder(path, mtime, hint, reader, recorder, root, thumb_dir, thumbs):
+    """Scan one folder that isn't in the cache, in a worker thread.
+
+    Returns ("asset", entry, records), ("dir", None, None) when it holds no asset, or
+    ("error", message, None)."""
+    try:
+        names = os.listdir(path)
+    except OSError as err:
+        return "error", str(err), None
+    asset = reader(path, names, hint)
+    if asset is None:
+        return "dir", None, None
+    subdirs = content_subdirs(path)
+    try:
+        recs = recorder(asset, root, thumb_dir, thumbs, mtime)
+    except (OSError, ValueError, KeyError) as err:
+        return "error", "%s: %s" % (path, err), None
+    entry = {"mtime": mtime, "folder": path, "subdirs": subdirs,
+             "version": CACHE_VERSION, "records": [_pack(r) for r in recs]}
+    return "asset", entry, recs
+
+
+def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_folders=None,
+              progress=None, on_batch=None, workers=SCAN_WORKERS, cancelled=None):
     """Records for every asset `reader` recognizes under `root` (Megascans by default),
     without writing anything there. `recorder(asset, root, thumb_dir, thumbs, mtime)` makes
     the records; folders named in `kind_folders` (3d, surfaces, ...) are walked into.
@@ -537,6 +602,13 @@ def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_
     `cached` is {folder key: entry} from a previous scan. An asset folder whose modification
     time is unchanged is not listed again, so a rescan of a big library only reads the
     folders above the assets. Returns (records, entries, errors).
+
+    Folders missing from the cache are read by `workers` threads (the work is I/O-bound), so
+    `reader` and `recorder` must be thread-safe: pure file reads and no shared state.
+    `progress(done, total)` is called while the scan runs; `total` grows when a folder turns
+    out to hold assets deeper down. `on_batch(records, entries)` is called every BATCH_SIZE
+    read folders with copies of the results so far. When `cancelled()` returns True the
+    scan stops reading and returns what it has so far.
     """
     reader = reader or read_asset
     recorder = recorder or records_for
@@ -546,8 +618,12 @@ def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_
     if not os.path.isdir(root):
         return records, entries, ["Folder not found: %s" % root]
     thumbs = _thumb_index(thumb_dir) if thumb_dir else {}
+    jobs = []                    # (path, key, mtime, depth, hint) of folders to read
+    done = 0
+    last_report = time.monotonic()
 
-    def visit(folder, depth, kind_hint):
+    def walk(folder, depth, kind_hint):
+        """Serial part: list a folder, resolve cached entries, queue the rest as jobs."""
         try:
             with os.scandir(folder) as it:
                 subdirs = [e for e in it if e.is_dir() and not e.name.startswith(".")]
@@ -563,7 +639,7 @@ def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_
                 continue
             if e.name.lower() in kind_folders:     # 3d, surfaces, ...: a kind folder, not an asset
                 if depth < MAX_DEPTH:
-                    visit(e.path, depth + 1, hint)
+                    walk(e.path, depth + 1, hint)
                 continue
             entry = cached.get(key)
             if _entry_current(entry, mtime):
@@ -573,28 +649,73 @@ def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_
                 except (KeyError, TypeError, ValueError, OSError) as err:
                     errors.append("%s: %s" % (e.path, err))
                 continue
-            else:
-                try:
-                    names = os.listdir(e.path)
-                except OSError as err:
-                    errors.append(str(err))
-                    continue
-                asset = reader(e.path, names, hint)
-                if asset is None:
-                    if depth < MAX_DEPTH:
-                        visit(e.path, depth + 1, hint)
-                    continue
-                entry = {"mtime": mtime, "folder": e.path,
-                         "subdirs": content_subdirs(e.path)}
-            entries[key] = entry
-            try:
-                recs = recorder(asset, root, thumb_dir, thumbs, mtime)
-            except (OSError, ValueError, KeyError) as err:
-                errors.append("%s: %s" % (e.path, err))
-                continue
-            entry["version"] = CACHE_VERSION
-            entry["records"] = [_pack(r) for r in recs]
-            records.extend(recs)
+            jobs.append((e.path, key, mtime, depth, hint))
 
-    visit(root, 1, "")
+    def handle(result, path, key, depth, hint):
+        status, entry, recs = result
+        if status == "asset":
+            entries[key] = entry
+            records.extend(recs)
+        elif status == "dir":
+            if depth < MAX_DEPTH:
+                walk(path, depth + 1, hint)
+        else:
+            errors.append(entry)
+
+    def after_job():
+        nonlocal done, last_report
+        done += 1
+        if on_batch and done % BATCH_SIZE == 0:
+            on_batch(list(records), dict(entries))
+        if progress:
+            now = time.monotonic()
+            if now - last_report >= 0.25:
+                last_report = now
+                progress(done, len(jobs))
+
+    walk(root, 1, "")
+    if progress:
+        progress(0, len(jobs))
+    def stop():
+        return bool(cancelled and cancelled())
+
+    if workers <= 1:
+        index = 0
+        while index < len(jobs) and not stop():
+            path, key, mtime, depth, hint = jobs[index]
+            index += 1
+            handle(_read_folder(path, mtime, hint, reader, recorder, root, thumb_dir, thumbs),
+                   path, key, depth, hint)
+            after_job()
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            pending = {}
+            next_job = 0
+            max_pending = workers * 4    # a short queue: waiting on 19k futures is slow
+
+            def submit_new():
+                nonlocal next_job
+                while next_job < len(jobs) and len(pending) < max_pending:
+                    path, key, mtime, depth, hint = jobs[next_job]
+                    next_job += 1
+                    future = pool.submit(_read_folder, path, mtime, hint, reader, recorder,
+                                         root, thumb_dir, thumbs)
+                    pending[future] = (path, key, depth, hint)
+
+            submit_new()
+            while pending:
+                finished, _ = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in finished:
+                    path, key, depth, hint = pending.pop(future)
+                    handle(future.result(), path, key, depth, hint)
+                    after_job()
+                if stop():               # a newer scan replaced this one
+                    for future in pending:
+                        future.cancel()
+                    break
+                submit_new()
+    if progress:
+        progress(done, len(jobs))
+    records.sort(key=lambda r: r.key)
     return records, entries, errors

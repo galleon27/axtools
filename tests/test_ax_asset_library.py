@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
@@ -660,11 +661,104 @@ class MegascansTests(unittest.TestCase):
         records, entries, errors = megascans.scan_root(self.dl)
         self.assertFalse(errors, errors)
         self.assertTrue(entries)
-        key, entry = next(iter(entries.items()))
+        # An entry with records (brush folders have none; entry order follows the threads).
+        key, entry = next((k, e) for k, e in sorted(entries.items()) if e["records"])
         entry["version"] = 2
         self.assertFalse(megascans._entry_current(entry, entry.get("mtime")))
         again = megascans.records_from_entries({key: entry}, self.dl, "")
         self.assertTrue(again)
+
+    def test_scan_root_parallel_matches_serial(self):
+        serial, serial_entries, serial_errors = megascans.scan_root(self.dl, workers=1)
+        parallel, parallel_entries, parallel_errors = megascans.scan_root(self.dl, workers=8)
+        self.assertEqual([r.id for r in serial], [r.id for r in parallel])
+        self.assertEqual(sorted(serial_entries), sorted(parallel_entries))
+        self.assertEqual(serial_errors, parallel_errors)
+
+    def test_scan_root_progress_and_batches(self):
+        batches, progress = [], []
+        with mock.patch.object(megascans, "BATCH_SIZE", 1):
+            megascans.scan_root(
+                self.dl, workers=4,
+                on_batch=lambda records, entries: batches.append((records, entries)),
+                progress=lambda done, total: progress.append((done, total)))
+        self.assertTrue(batches)
+        self.assertIsInstance(batches[-1][0], list)
+        self.assertIsInstance(batches[-1][1], dict)
+        self.assertEqual(progress[-1][0], progress[-1][1])
+        self.assertGreater(progress[-1][0], 0)
+
+    def test_scan_roots_saves_partial_index(self):
+        cache = os.path.join(self.tmp.name, "cache")
+        calls = []
+
+        class Stop(Exception):
+            pass
+
+        def partial(records):
+            calls.append(records)
+            raise Stop()
+
+        with mock.patch.object(megascans, "BATCH_SIZE", 1):
+            with self.assertRaises(Stop):
+                library.scan_roots([(self.dl, "megascans")], cache, partial=partial)
+        self.assertTrue(calls)
+        self.assertTrue(library.load_index(cache, self.dl, "megascans"))
+
+    def _bridge_asset(self, rel, aid, data, files=()):
+        """Asset with a full Bridge JSON (assetCategories) under <tmp>/bridge."""
+        d = os.path.join(self.tmp.name, "bridge", rel)
+        os.makedirs(d)
+        with open(os.path.join(d, aid + ".json"), "w") as f:
+            json.dump(dict(data, id=aid), f)
+        for fn in files:
+            open(os.path.join(d, fn), "w").close()
+        return d
+
+    def test_bridge_kind_and_category(self):
+        d = self._bridge_asset("atlases/tdfdfebc_Leakage", "tdfdfebc", {
+            "name": "Leakage", "categories": ["atlas", "Decal", "Leakage"],
+            "assetCategories": {"decal": {"leakage": {"stamp": {}, "other": {}}}}})
+        a = megascans.read_asset(d)
+        self.assertEqual(a.kind, "decal")
+        self.assertEqual(a.category, "leakage/stamp")
+        self.assertEqual(a.browse_category, "Decals/leakage/stamp")
+        d = self._bridge_asset("3d/vmnmaax_Cliff", "vmnmaax", {
+            "name": "Cliff", "categories": ["3d", "nature", "rock"],
+            "assetCategories": {"3D asset": {"nature": {"rock": {"cliff": {}}}}}})
+        self.assertEqual(megascans.read_asset(d).browse_category, "3D Assets/nature/rock/cliff")
+
+    def test_bridge_category_fallback(self):
+        surf = megascans.read_asset(os.path.join(self.dl, "surface", "rock_cliff_wdeledb"))
+        self.assertEqual(surf.category, "rock/cliff")              # from "categories"
+        self.assertEqual(surf.browse_category, "Surfaces/rock/cliff")
+
+    def test_flat_plant_has_geometry(self):
+        d = self._bridge_asset("3d/qmBr2_Grass Clumps", "qmBr2", {
+            "name": "Grass Clumps", "categories": ["3dplant", "plants", "3d"],
+            "assetCategories": {"3D plant": {"grass": {"lawn": {}}}}},
+            ["qmBr2_LOD0.fbx", "qmBr2_LOD1.fbx", "qmBr2_4K_Albedo.jpg", "qmBr2_4K_Opacity.jpg",
+             "qmBr2_4K_Normal.jpg"])
+        a = megascans.read_asset(d)
+        self.assertEqual(a.kind, "3dplant")
+        types = [t for t, _n, _f, _i, _e in megascans.plan(a)]
+        self.assertEqual(types, ["geometry", "material"])
+
+    def test_scan_root_cancelled(self):
+        records, entries, errors = megascans.scan_root(self.dl, workers=2,
+                                                       cancelled=lambda: True)
+        self.assertEqual(errors, [])
+        self.assertLessEqual(len(entries), 2 * 4)
+        records, entries, errors = megascans.scan_root(self.dl, workers=1,
+                                                       cancelled=lambda: True)
+        self.assertEqual(entries, {})
+
+    def test_tree_counts_without_type(self):
+        recs, _ = library.scan_roots([(self.dl, "megascans")],
+                                     os.path.join(self.tmp.name, "cache"))
+        counts = library.tree_counts(library.browsable(recs))
+        self.assertEqual(counts[(self.dl, None, "3D Plants")], 2)   # two plant variations
+        self.assertIn("Surfaces/rock/cliff", library.categories(recs, self.dl, None))
 
     def test_linked_material_records(self):
         recs, errors = library.scan_roots([(self.dl, "megascans")],
@@ -732,11 +826,11 @@ class MegascansTests(unittest.TestCase):
         self.assertEqual(sorted(os.walk(root)), before)                 # nothing written there
         got = sorted((r.type, r.name, r.category) for r in recs)
         self.assertEqual(got, [
-            ("geometry", "Burnt_Log_vcsaeeyfa", "3d"),
-            ("geometry", "Old_Crate_abcdefgh", "3d"),
-            ("material", "Burnt_Log_vcsaeeyfa", "3d"),
-            ("material", "Fresh_Windswept_Snow_uhpjdeyn", "surface"),
-            ("material", "Golden_Chain_sguxbeff2", "atlas")])
+            ("geometry", "Burnt_Log_vcsaeeyfa", "3D Assets"),
+            ("geometry", "Old_Crate_abcdefgh", "3D Assets"),
+            ("material", "Burnt_Log_vcsaeeyfa", "3D Assets"),
+            ("material", "Fresh_Windswept_Snow_uhpjdeyn", "Surfaces"),
+            ("material", "Golden_Chain_sguxbeff2", "Atlases")])
         log = next(r for r in recs if r.type == "geometry" and "Burnt" in r.name)
         self.assertEqual(log.id, "megascans:vcsaeeyfa:geometry")
         self.assertEqual(log.info["import_scale"], 0.01)

@@ -221,7 +221,8 @@ def records_for(asset, root, thumb_dir, thumbs, mtime):
                                    "gsg", "Greyscalegorilla")
 
 
-def scan_root(root, cached=None, thumb_dir=""):
+def scan_root(root, cached=None, thumb_dir="", progress=None, on_batch=None, cancelled=None):
     """Records for every GSG asset under `root`, without writing anything there."""
     return megascans.scan_root(root, cached, thumb_dir, reader=read_asset,
-                               recorder=records_for, kind_folders=KIND_FOLDERS)
+                               recorder=records_for, kind_folders=KIND_FOLDERS,
+                               progress=progress, on_batch=on_batch, cancelled=cancelled)

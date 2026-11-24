@@ -1,0 +1,3 @@
+languages: [python]
+exclude: ["database/**", "otls/**", "gallery/**", "usd/**", "presets/**", "ocl/**", "python3.11libs/**", "**/__pycache__/**"]
+respect_gitignore: true

@@ -141,4 +141,4 @@ def linked_material(rec, records):
 
 def is_atlas(rec):
     return rec.type == "material" and (
-        (rec.info or {}).get("vendor_kind") == "atlas" or "opacity" in rec.files)
+        (rec.info or {}).get("vendor_kind") in ("atlas", "decal") or "opacity" in rec.files)
