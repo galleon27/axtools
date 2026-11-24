@@ -97,7 +97,11 @@ def _karma(parent, name, maps, disp_scale):
         out.setNamedInput("surface", surf, 0)
         if "displacement" in maps:
             disp = disp or mat.createNode("mtlxdisplacement")
-            disp.setNamedInput("displacement", image("displacement", "default", "Raw"), 0)
+            rng = mat.createNode("mtlxrange", "displacement_range")
+            rng.setNamedInput("in", image("displacement", "default", "Raw"), 0)
+            _set(rng, "outlow", -0.5)
+            _set(rng, "outhigh", 0.5)
+            disp.setNamedInput("displacement", rng, 0)
             _set(disp, "scale", disp_scale)
             out.setNamedInput("displacement", disp, 0)
         elif disp is not None:
