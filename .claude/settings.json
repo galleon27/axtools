@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./database/**)",
+      "Read(./otls/**)",
+      "Read(./gallery/**)",
+      "Read(./usd/**)",
+      "Read(./presets/**)",
+      "Read(**/__pycache__/**)",
+      "Read(**/*.pyc)",
+      "Read(**/*.hdalc)",
+      "Read(**/*.hda)",
+      "Read(**/*.db)",
+      "Read(**/*.db-wal)"
+    ]
+  }
+}
