@@ -51,7 +51,7 @@ SECTION_LABELS = dict(BRIDGE_SECTIONS)
 META_KEYS = ("height", "length", "width", "dimensions")
 FBX_CM_SCALE = 0.01  # Megascans FBX/OBJ files are in centimeters
 MAX_DEPTH = 4        # how deep scan_root looks for asset folders below the root
-CACHE_VERSION = 4    # bump when plan()/records_for() change: cached records are rebuilt
+CACHE_VERSION = 6    # bump when plan()/records_for() change: cached records are rebuilt
 SCAN_WORKERS = 16    # threads: the folder reads are I/O-bound (network folders)
 BATCH_SIZE = 200     # read folders per on_batch callback during a scan
 
@@ -364,9 +364,10 @@ def _material(asset, files, info):
 def plan(asset):
     """[(asset type, name, {key: file}, info, extra files)] for one Megascans asset.
 
-    Surfaces: one material. 3D assets: geometry (most detailed LOD) + material. Plants:
-    one geometry asset per variation + the atlas material; a plant without Var* folders (a
-    flat download) is read like a 3D asset. Other kinds: nothing.
+    Surfaces: one material. 3D assets: geometry (most detailed LOD) + material. Plants: one
+    geometry asset holding every variation (info["variations"], Var1..VarN) + the atlas
+    material; a plant without Var* folders (a flat download) is read like a 3D asset. Other
+    kinds: nothing.
     """
     info = {"megascans_id": asset.id, "vendor_kind": asset.kind}
     if asset.kind in ("atlas", "decal"):
@@ -388,18 +389,30 @@ def plan(asset):
     if asset.kind in MESH_KINDS:
         return single_mesh()
     if asset.kind in PLANT_KINDS:
-        out, variations = [], {}
+        groups = {}
         for f in content:
             first = asset.rel(f).split("/")[0]
             if re.fullmatch(r"var\d+", first, re.IGNORECASE):
-                variations.setdefault(first, []).append(f)
-        if not variations:
+                groups.setdefault(first, []).append(f)
+        if not groups:
             return single_mesh()
-        for var in sorted(variations, key=lambda v: int(re.sub(r"\D", "", v) or 0)):
-            meshes = mesh_files(variations[var])
+        by_var = {}
+        for var in sorted(groups, key=lambda v: int(re.sub(r"\D", "", v) or 0)):
+            meshes = mesh_files(groups[var])
             if meshes:
-                out.append(("geometry", "%s_%s" % (asset.library_name, var), meshes,
-                            _mesh_info(dict(info, variation=var), meshes, asset.size_m(var)), []))
+                by_var[var] = meshes
+        out = []
+        if len(by_var) == 1:
+            # One variation left: no variation set, so it imports like a plain 3D asset.
+            var, meshes = next(iter(by_var.items()))
+            out.append(("geometry", asset.library_name, meshes,
+                        _mesh_info(info, meshes, asset.size_m(var)), []))
+        elif by_var:
+            # All variations in one record: the largest one sizes the import scale.
+            size = asset.size_m(max(by_var, key=lambda v: asset.size_m(v) or 0))
+            out.append(("geometry", asset.library_name, next(iter(by_var.values())),
+                        _mesh_info(dict(info, variations=by_var),
+                                   next(iter(by_var.values())), size or asset.size_m()), []))
         atlas = [f for f in content if asset.rel(f).lower().startswith("textures/atlas/")]
         return out + _material(asset, atlas or top, info)
     return []
@@ -429,16 +442,27 @@ def build_records(asset, items, root, thumb_dir, thumbs, mtime, prefix, note):
     from .library import AssetRecord
     created = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ") if mtime else ""
-    preview = asset.preview
     out = []
     for asset_type, name, files, info, _extra in items:
-        rid = record_id(asset.id, asset_type, info.get("variation"), prefix)
+        info = dict(info)
+        variations = info.pop("variations", None) if asset_type == "geometry" else None
+        preview = info.get("preview") or asset.preview
+        if not preview and asset_type in ("image", "hdri"):
+            preview = files.get(asset_type)      # an image previews itself
+        rid = record_id(info.get("asset_id") or asset.id, asset_type, info.get("variation"),
+                        prefix)
         cache = thumb_path(thumb_dir, rid)
         cached = thumbs.get(os.path.basename(cache))
         thumb = cache if cached or not preview else preview
         files = dict(files)
         if preview:
             info = dict(info, preview=preview)  # fallback when a rendered thumbnail is deleted
+        version = {"version": 1, "created": created, "author": "", "note": note,
+                   "files": files}
+        if variations:
+            version["variations"] = {var: dict(f) for var, f in variations.items()}
+            # The scan cache drops version_list, so info keeps the variations too (_unpack).
+            info["variations"] = {var: dict(f) for var, f in variations.items()}
         out.append(AssetRecord(
             key=_norm(asset.folder) + "|" + rid, id=rid, name=name, type=asset_type,
             category=(getattr(asset, "browse_category", None) or asset.category
@@ -449,8 +473,7 @@ def build_records(asset, items, root, thumb_dir, thumbs, mtime, prefix, note):
             thumb_mtime=cached or (mtime if preview else None), info=dict(info),
             problems=[], sidecar_mtime=mtime, source_kind=prefix,
             thumb_method="karma" if cached else ("image" if preview else ""),
-            version_list=[{"version": 1, "created": created, "author": "", "note": note,
-                           "files": files}]))
+            version_list=[version]))
     return out
 
 
@@ -486,8 +509,12 @@ def _unpack(d, root):
     from .library import AssetRecord
     rec = AssetRecord.from_dict(d)
     rec.root, rec.current, rec.versions = root, 1, [1]
-    rec.version_list = [{"version": 1, "created": rec.created, "author": "", "note": "Megascans",
-                         "files": rec.files}]
+    version = {"version": 1, "created": rec.created, "author": "", "note": "Megascans",
+               "files": rec.files}
+    variations = (rec.info or {}).get("variations")
+    if isinstance(variations, dict) and len(variations) >= 2:
+        version["variations"] = variations     # build_records keeps them in info for the cache
+    rec.version_list = [version]
     return rec
 
 
@@ -519,7 +546,7 @@ def _subdirs_unchanged(entry):
     if subdirs is None:
         # Entries from before subfolders were tracked: only plants (Var*/, Textures/Atlas/)
         # depend on nested folders, so only those are read again.
-        return not any("variation" in (d.get("info") or {}) for d in entry["records"])
+        return not any("variations" in (d.get("info") or {}) for d in entry["records"])
     for rel, mtime in subdirs.items():
         try:
             if os.stat(os.path.join(entry["folder"], rel)).st_mtime != mtime:
@@ -589,19 +616,23 @@ def _read_folder(path, mtime, hint, reader, recorder, root, thumb_dir, thumbs):
     except (OSError, ValueError, KeyError) as err:
         return "error", "%s: %s" % (path, err), None
     entry = {"mtime": mtime, "folder": path, "subdirs": subdirs,
-             "version": CACHE_VERSION, "records": [_pack(r) for r in recs]}
+             "version": CACHE_VERSION, "descend": bool(getattr(asset, "descend", False)),
+             "records": [_pack(r) for r in recs]}
     return "asset", entry, recs
 
 
 def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_folders=None,
-              progress=None, on_batch=None, workers=SCAN_WORKERS, cancelled=None):
+              skip_dirs=(), include_root=False, progress=None, on_batch=None,
+              workers=SCAN_WORKERS, cancelled=None):
     """Records for every asset `reader` recognizes under `root` (Megascans by default),
     without writing anything there. `recorder(asset, root, thumb_dir, thumbs, mtime)` makes
     the records; folders named in `kind_folders` (3d, surfaces, ...) are walked into.
 
     `cached` is {folder key: entry} from a previous scan. An asset folder whose modification
     time is unchanged is not listed again, so a rescan of a big library only reads the
-    folders above the assets. Returns (records, entries, errors).
+    folders above the assets. Subfolders named in `skip_dirs` are not walked into below an
+    asset folder (its maps/, thumbs/ and similar content folders). `include_root` also reads
+    `root` itself as a possible asset folder. Returns (records, entries, errors).
 
     Folders missing from the cache are read by `workers` threads (the work is I/O-bound), so
     `reader` and `recorder` must be thread-safe: pure file reads and no shared state.
@@ -622,11 +653,14 @@ def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_
     done = 0
     last_report = time.monotonic()
 
-    def walk(folder, depth, kind_hint):
-        """Serial part: list a folder, resolve cached entries, queue the rest as jobs."""
+    def walk(folder, depth, kind_hint, skip=False):
+        """Serial part: list a folder, resolve cached entries, queue the rest as jobs.
+
+        skip: inside an asset folder, leave its content folders (maps/, thumbs/) alone."""
         try:
             with os.scandir(folder) as it:
-                subdirs = [e for e in it if e.is_dir() and not e.name.startswith(".")]
+                subdirs = [e for e in it if e.is_dir() and not e.name.startswith(".")
+                           and not (skip and e.name.lower() in skip_dirs)]
         except OSError as e:
             errors.append(str(e))
             return
@@ -648,6 +682,8 @@ def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_
                     records.extend(_entry_records(entry, root, thumb_dir, thumbs))
                 except (KeyError, TypeError, ValueError, OSError) as err:
                     errors.append("%s: %s" % (e.path, err))
+                if entry.get("descend") and depth < MAX_DEPTH:
+                    walk(e.path, depth + 1, hint, skip=True)
                 continue
             jobs.append((e.path, key, mtime, depth, hint))
 
@@ -656,6 +692,8 @@ def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_
         if status == "asset":
             entries[key] = entry
             records.extend(recs)
+            if entry.get("descend") and depth < MAX_DEPTH:
+                walk(path, depth + 1, hint, skip=True)
         elif status == "dir":
             if depth < MAX_DEPTH:
                 walk(path, depth + 1, hint)
@@ -673,7 +711,40 @@ def scan_root(root, cached=None, thumb_dir="", reader=None, recorder=None, kind_
                 last_report = now
                 progress(done, len(jobs))
 
-    walk(root, 1, "")
+    walk_skip = False
+    if include_root:
+        # The root can hold assets itself (models or textures with no subfolder).
+        key = _norm(root)
+        try:
+            root_mtime = os.stat(root).st_mtime
+        except OSError:
+            root_mtime = None
+        entry = cached.get(key)
+        if root_mtime is not None and _entry_current(entry, root_mtime):
+            entries[key] = entry
+            try:
+                records.extend(_entry_records(entry, root, thumb_dir, thumbs))
+            except (KeyError, TypeError, ValueError, OSError) as err:
+                errors.append("%s: %s" % (root, err))
+            walk_skip = True
+            descend = bool(entry.get("descend"))
+        elif root_mtime is not None:
+            status, entry, recs = _read_folder(root, root_mtime, "", reader, recorder, root,
+                                               thumb_dir, thumbs)
+            descend = True
+            if status == "asset":
+                entries[key] = entry
+                records.extend(recs)
+                walk_skip = True
+                descend = bool(entry.get("descend"))
+            elif status == "error":
+                errors.append(entry)
+        else:
+            descend = True
+        if descend:
+            walk(root, 1, "", skip=walk_skip)
+    else:
+        walk(root, 1, "")
     if progress:
         progress(0, len(jobs))
     def stop():

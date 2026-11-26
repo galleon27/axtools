@@ -12,9 +12,9 @@ import sys
 from . import schema, library, prefs  # noqa: F401
 
 # Reload order: dependencies first.
-_SUBMODULES = ("schema", "library", "prefs", "textures", "variants", "megascans", "gsg", "karma", "thumbnails", "materials",
+_SUBMODULES = ("schema", "library", "prefs", "textures", "variants", "megascans", "folders", "gsg", "karma", "thumbnails", "materials", "material_bundle", "resources",
                "importers", "publish", "manage", "scene", "dragdrop",
-               "ui.grid", "ui.details", "ui.dialogs", "ui.panel")
+               "ui.grid", "ui.console", "ui.details", "ui.dialogs", "ui.panel")
 
 
 def create_panel():

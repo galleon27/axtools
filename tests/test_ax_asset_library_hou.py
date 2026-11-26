@@ -1,9 +1,12 @@
 """Import-context tests for AX Asset Library. Run under hython; skipped under plain Python."""
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
@@ -15,7 +18,7 @@ except ImportError:
 
 if hou is not None:
     from ax_asset_library import (importers, library, materials, prefs, publish,  # noqa: E402
-                                  schema)
+                                  schema, thumbnails, variants)
 
 _QT_APP = None
 
@@ -208,6 +211,14 @@ class ImportContextTests(unittest.TestCase):
 
 
 @unittest.skipIf(hou is None, "needs hython")
+def report_info(plan):
+    """Union of the info dicts of a plan's items."""
+    out = {}
+    for item in plan.items:
+        out.update(item.info)
+    return out
+
+
 class ImportFeatureTests(unittest.TestCase):
     """Models with material/LOD/resolution, atlas tracing, texture nodes, root variables."""
 
@@ -254,6 +265,162 @@ class ImportFeatureTests(unittest.TestCase):
         self.assertEqual(set(publish._thumb_maps(files)), {"basecolor", "normal", "roughness"})
         # The material is hidden from browsing but stays linked for imports.
         self.assertEqual([r.type for r in library.browsable(self.records)], ["geometry"])
+
+    def test_publish_and_import_materials_bundle(self):
+        from ax_asset_library import material_bundle
+        tex_dir = os.path.join(self.tmp.name, "bundle_tex")
+        os.makedirs(tex_dir)
+        png = os.path.join(tex_dir, "wood_basecolor.png")
+        write_png(png)
+
+        hou.hipFile.clear(suppress_save_prompt=True)
+        shader = hou.node("/mat").createNode("principledshader::2.0", "woodmat")
+        shader.parm("basecolor_texture").set(png)
+        src = hou.node("/obj").createNode("geo", "bundle_src")
+        box = src.createNode("box", "box1")
+        assign = src.createNode("material", "assign")
+        assign.parm("num_materials").set(1)
+        assign.parm("shop_materialpath1").set(assign.relativePathTo(shader))
+        assign.setInput(0, box)
+
+        root_dir = os.path.join(self.tmp.name, "bundle_lib")
+        os.makedirs(root_dir)
+        self.settings.set("roots", [{"path": root_dir, "read_only": False}], save=False)
+        root = self.settings.roots()[0]
+        result = publish.publish_node(assign, root, "BundleRock", formats=(),
+                                      materials=True, thumbnail_image=None)
+        self.assertFalse(result.warnings, result.warnings)
+        vdir = os.path.join(result.asset_dir, "v001")
+        self.assertTrue(os.path.isfile(os.path.join(vdir, material_bundle.BUNDLE_FILE)))
+        self.assertTrue(os.path.isfile(os.path.join(vdir, material_bundle.TEXTURE_DIR,
+                                                    "wood_basecolor.png")))
+        data = schema.load(os.path.join(result.asset_dir, schema.SIDECAR))
+        self.assertEqual(data["versions"][0]["materials"]["names"], ["woodmat"])
+
+        record, = library.scan_roots([root_dir], os.path.join(self.tmp.name, "cache_bundle"),
+                                     use_cache=False)[0]
+        self.assertIn("materials", record.version(1))
+        dst = hou.node("/obj").createNode("geo", "bundle_dst")
+        nodes, warnings = importers.import_records([record], self.settings,
+                                                   target=(None, dst))
+        self.assertFalse(warnings, warnings)
+        mnode = nodes[-1]
+        self.assertEqual(mnode.type().name(), "material")
+        subnet = dst.node("materials").node("BundleRock_materials")
+        self.assertIsNotNone(subnet)
+        loaded = subnet.node("woodmat")
+        self.assertIsNotNone(loaded)
+        texture = loaded.parm("basecolor_texture")
+        self.assertNotIn(material_bundle.PLACEHOLDER, texture.unexpandedString())
+        self.assertTrue(os.path.normcase(os.path.abspath(texture.eval())).startswith(
+            os.path.normcase(os.path.abspath(result.asset_dir))))
+        self.assertEqual(mnode.parm("group1").eval(), '@shop_materialpath="woodmat"')
+        mnode.cook(force=True)
+        values = mnode.geometry().primStringAttribValues("shop_materialpath")
+        self.assertEqual(len(values), 6)                      # every box prim
+        self.assertEqual(set(values), {loaded.path()})
+
+    def _publish_bundle_src(self, name, set_detail=False):
+        """Publish a box assigned to a Principled Shader that uses one texture twice."""
+        tex_dir = os.path.join(self.tmp.name, name + "_tex")
+        os.makedirs(tex_dir)
+        png = os.path.join(tex_dir, "wood_basecolor.png")
+        write_png(png)
+        hou.hipFile.clear(suppress_save_prompt=True)
+        shader = hou.node("/mat").createNode("principledshader::2.0", "woodmat")
+        shader.parm("basecolor_texture").set(png)
+        shader.parm("rough_texture").set(png)
+        src = hou.node("/obj").createNode("geo", name + "_src")
+        box = src.createNode("box", "box1")
+        if set_detail:
+            last = src.createNode("attribwrangle", "detail_assign")
+            last.parm("class").set(0)
+            last.parm("snippet").set('s@shop_materialpath = "%s";' % shader.path())
+            last.setInput(0, box)
+        else:
+            last = src.createNode("material", "assign")
+            last.parm("num_materials").set(1)
+            last.parm("shop_materialpath1").set(last.relativePathTo(shader))
+            last.setInput(0, box)
+        root_dir = os.path.join(self.tmp.name, name + "_lib")
+        os.makedirs(root_dir)
+        self.settings.set("roots", [{"path": root_dir, "read_only": False}], save=False)
+        root = self.settings.roots()[0]
+        result = publish.publish_node(last, root, name, formats=(), materials=True,
+                                      thumbnail_image=None)
+        return result, root_dir
+
+    def test_bundle_copies_a_shared_texture_once(self):
+        result, _root_dir = self._publish_bundle_src("Shared")
+        tex = os.listdir(os.path.join(result.asset_dir, "v001", "textures"))
+        self.assertEqual(tex, ["wood_basecolor.png"])
+        data = schema.load(os.path.join(result.asset_dir, schema.SIDECAR))
+        self.assertEqual(data["versions"][0]["materials"]["textures"],
+                         ["v001/textures/wood_basecolor.png"])
+
+    def test_bundle_detail_material_assignment(self):
+        from ax_asset_library import material_bundle
+        result, root_dir = self._publish_bundle_src("DetailRock", set_detail=True)
+        self.assertFalse(result.warnings, result.warnings)
+        record, = library.scan_roots([root_dir], os.path.join(self.tmp.name, "cache_detail"),
+                                     use_cache=False)[0]
+        dst = hou.node("/obj").createNode("geo", "detail_dst")
+        nodes, _warnings = importers.import_records([record], self.settings, target=(None, dst))
+        mnode = nodes[-1]
+        mnode.cook(force=True)
+        values = mnode.geometry().primStringAttribValues(material_bundle.MATERIAL_ATTR)
+        self.assertEqual(len(values), 6)
+        self.assertTrue(all(v.endswith("woodmat") for v in values), values)
+
+    def test_publish_without_materials_has_no_warning(self):
+        hou.hipFile.clear(suppress_save_prompt=True)
+        src = hou.node("/obj").createNode("geo", "plain_src")
+        box = src.createNode("box", "box1")
+        root_dir = os.path.join(self.tmp.name, "plain_lib")
+        os.makedirs(root_dir)
+        self.settings.set("roots", [{"path": root_dir, "read_only": False}], save=False)
+        result = publish.publish_node(box, self.settings.roots()[0], "PlainBox", formats=(),
+                                      materials=True, thumbnail_image=None)
+        self.assertEqual(result.warnings, [])
+
+    def test_add_watch_folder_component_to_library(self):
+        watch_root = os.path.join(self.tmp.name, "watch")
+        chair = os.path.join(watch_root, "cat", "Chair")
+        os.makedirs(os.path.join(chair, "maps"))
+        for name in ("Chair.usd", "geo.usd", "mtl.usd",
+                     "maps/Chair_basecolor.png", "maps/Chair_roughness.png"):
+            open(os.path.join(chair, *name.split("/")), "w").close()
+        records, errors = library.scan_roots(
+            [(watch_root, "folder")], os.path.join(self.tmp.name, "cache2"), use_cache=False)
+        self.assertFalse(errors, errors)
+        geo = next(r for r in records if r.type == "geometry")
+        self.assertEqual(geo.source_kind, "folder")
+
+        root_dir = os.path.join(self.tmp.name, "lib2")
+        os.makedirs(root_dir)
+        root = {"path": root_dir, "expanded": root_dir, "read_only": False, "var": "",
+                "kind": "library", "megascans": False}
+        plan = publish.plan_from_records([geo], records)
+        self.assertEqual(sorted(i.type for i in plan.items), ["geometry", "material"])
+        report = publish.ingest(plan, root, copy=True, read_info=False)
+        self.assertFalse(report.failed, report.failed)
+        self.assertEqual(len(report.created), 2)
+        gdir = os.path.join(root_dir, "geometry", "cat", "Chair", "v001")
+        self.assertTrue(os.path.isfile(os.path.join(gdir, "geo.usd")))       # sublayer copied
+        self.assertTrue(os.path.isfile(os.path.join(gdir, "maps",
+                                                    "Chair_basecolor.png")))
+        lib_records, errors = library.scan_roots(
+            [root_dir], os.path.join(self.tmp.name, "cache3"), use_cache=False)
+        self.assertFalse(errors, errors)
+        geos = [r for r in lib_records if r.type == "geometry"]
+        self.assertEqual(len(geos), 1)
+        self.assertIsNotNone(variants.linked_material(geos[0], lib_records))
+        # The library copy keeps source.kind "folder" but is not browsed in place: it must not
+        # be offered for "Add to library" again.
+        self.assertEqual(geos[0].source_kind, "folder")
+        self.assertFalse(library.browsed_in_place(geos[0]))
+        self.assertEqual(publish.plan_from_records(geos, lib_records).items, [])
+        self.assertNotIn("component_dir", report_info(plan))
 
     def test_model_with_material_sop(self):
         geo = hou.node("/obj").createNode("geo", "geo1")
@@ -434,6 +601,273 @@ class ImportFeatureTests(unittest.TestCase):
         nodes[-1].destroy()
         self.assertEqual(use.nodes, [])
         self.assertEqual(use.outdated, [])
+
+
+@unittest.skipIf(hou is None, "needs hython")
+class PlantVariationTests(unittest.TestCase):
+    """A Megascans plant: one geometry record holding Var1..VarN, imported either merged into
+    a single SOP with a `name` prim attribute or as a LOP variant set."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = prefs.Prefs(os.path.join(self.tmp.name, "prefs.json"))
+        hou.hipFile.clear(suppress_save_prompt=True)
+        self.cache = os.path.join(self.tmp.name, "cache")
+        os.makedirs(self.cache)
+        self.dl = os.path.join(self.tmp.name, "Downloaded")
+        self.folder = os.path.join(self.dl, "3dplant", "plant_ptest1")
+        for var, width in (("Var1", 1.0), ("Var2", 2.0)):
+            os.makedirs(os.path.join(self.folder, var))
+            geo = hou.node("/obj").createNode("geo", "src_" + var)
+            box = geo.createNode("box", "box1")
+            box.parm("sizex").set(width)
+            box.geometry().saveToFile(os.path.join(self.folder, var,
+                                                  "%s_LOD0.bgeo.sc" % var))
+            geo.destroy()
+        atlas = os.path.join(self.folder, "Textures", "Atlas")
+        os.makedirs(atlas)
+        for channel in ("Albedo", "Normal"):
+            write_png(os.path.join(atlas, "ptest1_8K_%s.png" % channel))
+        with open(os.path.join(self.folder, "ptest1.json"), "w") as f:
+            json.dump({"id": "ptest1", "name": "Test Fern", "tags": [],
+                       "categories": ["3dplant"],
+                       "meta": [{"key": "dimensions", "value": [
+                           {"variation": 1, "length": "0.26m", "width": "0.24m",
+                            "height": "0.1m"},
+                           {"variation": 2, "length": "0.52m", "width": "0.48m",
+                            "height": "0.2m"}]}]}, f)
+        self.settings.set("roots", [{"path": self.dl, "read_only": False,
+                                     "kind": "megascans"}], save=False)
+        self.records, errors = library.scan_roots([(self.dl, "megascans")], self.cache,
+                                                  use_cache=False)
+        self.assertFalse(errors, errors)
+
+    def _plant(self):
+        """The plant's single geometry record (all variations in one record)."""
+        recs = [r for r in self.records if r.type == "geometry"]
+        self.assertEqual(len(recs), 1)
+        return recs[0]
+
+    def test_plant_is_one_record_with_variations(self):
+        rec = self._plant()
+        self.assertEqual(rec.id, "megascans:ptest1:geometry")
+        self.assertTrue(rec.files["bgeo.sc"].endswith("Var1_LOD0.bgeo.sc"))
+        self.assertEqual(sorted(rec.variations_for()), ["Var1", "Var2"])
+        self.assertTrue(rec.variations_for()["Var2"]["bgeo.sc"].endswith("Var2_LOD0.bgeo.sc"))
+        self.assertEqual(next(r for r in self.records if r.type == "material")
+                         .variations_for(), {})
+
+    def test_ingest_keeps_the_variation_set(self):
+        root_dir = os.path.join(self.tmp.name, "library")
+        os.makedirs(root_dir)
+        root = {"path": root_dir, "expanded": root_dir, "read_only": False, "var": "",
+                "kind": "library", "megascans": False}
+        plan = publish.plan_ingest([self.folder])
+        self.assertEqual(sorted(item.type for item in plan.items), ["geometry", "material"])
+        report = publish.ingest(plan, root, copy=True, read_info=False)
+        self.assertFalse(report.failed, report.failed)
+        recs, errors = library.scan_roots([root_dir], os.path.join(self.tmp.name, "cache2"),
+                                          use_cache=False)
+        self.assertFalse(errors, errors)
+        rec = next(r for r in recs if r.type == "geometry")
+        self.assertEqual(sorted(rec.variations_for()), ["Var1", "Var2"])
+        for files in rec.variations_for().values():
+            for path in files.values():
+                self.assertTrue(os.path.isfile(path), path)
+        data = schema.load(os.path.join(rec.asset_dir, schema.SIDECAR))
+        self.assertEqual(sorted(data["versions"][0]["variations"]), ["Var1", "Var2"])
+        self.assertEqual(sorted(data["versions"][0]["files"]), ["bgeo.sc"])
+        self.assertEqual(sorted(os.listdir(os.path.join(rec.asset_dir, "v001"))),
+                         ["Var1_LOD0.bgeo.sc", "Var2_LOD0.bgeo.sc"])
+        # The library copy still imports as a variation set.
+        stage = hou.node("/stage")
+        nodes, warnings = importers.import_records([rec], self.settings, target=(None, stage))
+        self.assertFalse(warnings, warnings)
+        self.assertEqual(nodes[-1].type().name(), "subnet")
+
+    def test_sop_merge_with_name_attribute(self):
+        rec = self._plant()
+        rec.info["import_scale"] = 0.01          # bgeo has no scale: set it to exercise the node
+        geo = hou.node("/obj").createNode("geo", "geo1")
+        nodes, warnings = importers.import_records([rec], self.settings, target=(None, geo))
+        self.assertFalse(warnings, warnings)
+        merge = nodes[-1]
+        self.assertEqual(merge.type().name(), "merge")
+        self.assertEqual([n.type().name() for n in merge.inputs()], ["name", "name"])
+        named = merge.input(0)                   # Var1's chain: loader -> scale -> pack -> name
+        self.assertEqual(named.parm("attribname").eval(), "name")
+        self.assertEqual(named.parm("class").eval(), 0)          # menu index 0 = Primitive
+        self.assertEqual(named.parm("name1").eval(), "Var1")
+        self.assertEqual(named.userData(importers.UD_VARIATION), "Var1")
+        self.assertEqual(merge.input(1).parm("name1").eval(), "Var2")
+        self.assertEqual(named.input(0).type().name(), "pack")
+        self.assertEqual(named.input(0).input(0).type().name(), "xform")
+        self.assertAlmostEqual(named.input(0).input(0).parm("scale").eval(), 0.01)
+        self.assertEqual(named.input(0).input(0).input(0).type().name(), "file")
+        self.assertEqual(merge.userData(importers.UD_ID), rec.id)
+        merge.cook(force=True)
+        widths = {prim.attribValue("name"): prim.boundingBox().sizevec().x()
+                  for prim in merge.geometry().prims()}
+        self.assertEqual(sorted(widths), ["Var1", "Var2"])
+        self.assertAlmostEqual(widths["Var1"], 0.01, places=4)   # 1 m box, cm->m scale
+        self.assertAlmostEqual(widths["Var2"], 0.02, places=4)
+
+    def test_obj_variations(self):
+        rec = self._plant()
+        nodes, warnings = importers.import_records([rec], self.settings,
+                                                   target=(None, hou.node("/obj")))
+        self.assertFalse(warnings, warnings)
+        obj = nodes[-1]
+        self.assertEqual(obj.type().name(), "geo")
+        self.assertEqual(obj.userData(importers.UD_ID), rec.id)
+        merge = next(n for n in obj.children() if n.type().name() == "merge")
+        self.assertTrue(merge.isDisplayFlagSet())
+        self.assertTrue(merge.isRenderFlagSet())
+        self.assertEqual(sorted(n.name() for n in obj.children() if n.type().name() == "file"),
+                         ["Test_Fern_ptest1_Var1", "Test_Fern_ptest1_Var2"])
+
+    def test_lop_variant_set(self):
+        from pxr import Usd, UsdGeom
+        rec = self._plant()
+        stage = hou.node("/stage")
+        nodes, warnings = importers.import_records([rec], self.settings, target=(None, stage))
+        self.assertFalse(warnings, warnings)
+        sub = nodes[-1]
+        self.assertEqual(sub.type().name(), "subnet")     # references and variants inside
+        self.assertEqual(len(nodes), 1)
+        self.assertFalse([c for c in stage.children() if c != sub])
+        sel = sub.node("output0").input(0)
+        self.assertEqual(sel.type().name(), "setvariant")
+        add = sel.input(0)                       # the Var2 Add Variant, last in the chain
+        self.assertEqual(add.type().name(), "addvariant")
+        prim = "/assets/" + schema.sanitize_name(rec.name)
+        self.assertEqual(add.parm("primpath").eval(), prim)
+        self.assertEqual(add.parm("variantset").eval(), importers.VARIATION_SET)
+        self.assertEqual(add.parm("variantprimpath").eval(), prim)
+        self.assertEqual(add.parm("variantname").eval(), "Var2")
+        self.assertTrue(add.input(1).type().name().startswith("reference"))
+        self.assertTrue(add.input(1).parm("filepath1").eval().endswith("Var2_LOD0.bgeo.sc"))
+        first = add.input(0)                     # the Var1 Add Variant starts the chain
+        self.assertEqual(first.parm("variantname").eval(), "Var1")
+        self.assertTrue(first.input(1).parm("filepath1").eval().endswith("Var1_LOD0.bgeo.sc"))
+        self.assertEqual(sel.parm("primpattern1").eval(), prim)
+        self.assertEqual(sel.parm("variantset1").eval(), importers.VARIATION_SET)
+        self.assertEqual(sel.parm("variantname1").eval(), "Var1")
+        sub.setDisplayFlag(True)
+        sub.cook(force=True)
+        usd = sub.stage()
+        usd_prim = usd.GetPrimAtPath(prim)
+        self.assertTrue(usd_prim.IsValid())
+        vset = usd_prim.GetVariantSets().GetVariantSet(importers.VARIATION_SET)
+        self.assertEqual(sorted(vset.GetVariantNames()), ["Var1", "Var2"])
+        self.assertEqual(vset.GetVariantSelection(), "Var1")
+
+        def width(node):
+            usd = node.stage()
+            mesh = next(p for p in Usd.PrimRange(usd.GetPrimAtPath(prim))
+                        if p.IsA(UsdGeom.Mesh))
+            xs = [q[0] for q in UsdGeom.Mesh(mesh).GetPointsAttr().Get()]
+            return max(xs) - min(xs)
+
+        self.assertAlmostEqual(width(sub), 1.0, places=4)     # Var1 selected by default
+        # A cooked LOP stage is read-only, so the other variation is shown by a second
+        # Set Variant LOP on the same chain rather than by changing the selection.
+        other = sub.createNode("setvariant", "pick_Var2")
+        other.setInput(0, add)
+        other.parm("primpattern1").set(prim)
+        other.parm("variantset1").set(importers.VARIATION_SET)
+        other.parm("variantname1").set("Var2")
+        other.cook(force=True)
+        self.assertAlmostEqual(width(other), 2.0, places=4)   # switching swaps the geometry
+
+    def test_lop_variants_keep_the_anchor_chain(self):
+        rec = self._plant()
+        stage = hou.node("/stage")
+        anchor = stage.createNode("reference", "existing")
+        anchor.setDisplayFlag(True)
+        anchor.setSelected(True, clear_all_selected=True)
+        nodes, warnings = importers.import_records([rec], self.settings, target=(None, stage))
+        self.assertFalse(warnings, warnings)
+        sub = nodes[-1]
+        self.assertEqual(sub.input(0), anchor)                    # the anchor feeds the subnet
+        first = sub.node("output0").input(0).input(0).input(0)   # Var1's Add Variant
+        self.assertEqual(first.input(0), anchor)                 # wired through the subnet input
+        self.assertTrue(sub.isDisplayFlagSet())                   # whole chain in the viewport
+        self.assertFalse(anchor.isDisplayFlagSet())
+
+
+@unittest.skipIf(hou is None, "needs hython")
+class LoaderAndPreviewTests(unittest.TestCase):
+    """USD geometry goes through the USD Import SOP; EXR/HDR previews through iconvert."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = prefs.Prefs(os.path.join(self.tmp.name, "prefs.json"))
+        hou.hipFile.clear(suppress_save_prompt=True)
+
+    def test_usd_geometry_loads_with_usdimport(self):
+        path = os.path.join(self.tmp.name, "box.usda")
+        with open(path, "w") as f:
+            f.write('#usda 1.0\ndef Mesh "box"\n{\n'
+                    "    int[] faceVertexCounts = [4]\n"
+                    "    int[] faceVertexIndices = [0, 1, 2, 3]\n"
+                    "    point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)]\n"
+                    "}\n")
+        rec = library.AssetRecord(key="usd1", id="usd:1", name="Box Usd", type="geometry",
+                                  root=self.tmp.name, current=1, versions=[1],
+                                  files={"usd": path})
+        geo = hou.node("/obj").createNode("geo", "geo1")
+        nodes, warnings = importers.import_records([rec], self.settings, target=(None, geo))
+        self.assertFalse(warnings, warnings)
+        node = nodes[-1]
+        self.assertEqual(node.type().name(), "usdimport")
+        self.assertTrue(node.parm("filepath1").eval().endswith("box.usda"))
+        self.assertEqual(node.userData(importers.UD_ID), "usd:1")
+        node.cook(force=True)
+        self.assertGreater(len(node.geometry().prims()), 0)
+
+    def test_preview_path_converts_exr(self):
+        qt_app()
+        from PySide6 import QtGui
+        png = os.path.join(self.tmp.name, "chip.png")
+        write_png(png)
+        tool = thumbnails.find_tool("iconvert")
+        self.assertIsNotNone(tool, "iconvert not found in $HFS/bin")
+        exr = os.path.join(self.tmp.name, "chip.exr")
+        subprocess.run([tool, png, exr], check=True)
+        previews = os.path.join(self.tmp.name, "previews")
+        with mock.patch.object(thumbnails, "preview_cache_dir", lambda: previews):
+            self.assertEqual(thumbnails.preview_path(png), png)    # Qt reads PNG directly
+            jpg = thumbnails.preview_path(exr)
+            self.assertTrue(jpg.endswith(".jpg"), jpg)
+            self.assertTrue(os.path.isfile(jpg))
+            self.assertFalse(QtGui.QImage(jpg).isNull())
+            self.assertEqual(thumbnails.preview_path(exr), jpg)    # second call: cached
+            thumbnails.clear_preview_cache()
+            self.assertFalse(os.path.isfile(jpg))
+            self.assertEqual(thumbnails.preview_path(exr), jpg)    # rebuilt on demand
+            self.assertTrue(os.path.isfile(jpg))
+
+    def test_preview_path_retries_a_fixed_file(self):
+        qt_app()
+        bad = os.path.join(self.tmp.name, "bad.exr")
+        with open(bad, "wb") as f:
+            f.write(b"not an image")
+        previews = os.path.join(self.tmp.name, "previews")
+        with mock.patch.object(thumbnails, "preview_cache_dir", lambda: previews):
+            with self.assertRaises(thumbnails.ThumbnailError):
+                thumbnails.preview_path(bad)
+            with self.assertRaises(thumbnails.ThumbnailError):
+                thumbnails.preview_path(bad)           # unchanged file: not converted again
+            png = os.path.join(self.tmp.name, "chip.png")
+            write_png(png)
+            good = os.path.join(self.tmp.name, "good.exr")
+            subprocess.run([thumbnails.find_tool("iconvert"), png, good], check=True)
+            shutil.copyfile(good, bad)                 # same path, new content and mtime
+            self.assertTrue(os.path.isfile(thumbnails.preview_path(bad)))
+
 
 
 @unittest.skipIf(hou is None, "needs hython")

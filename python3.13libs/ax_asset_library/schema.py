@@ -21,9 +21,10 @@ TYPE_LABELS = {"geometry": "Geometry", "material": "Material", "hdri": "HDRI", "
 # Types that get a Karma-rendered thumbnail (images use the image itself).
 RENDERABLE_TYPES = ("geometry", "material", "hdri")
 # Root kinds that are third-party libraries browsed in place (read-only, cached records).
-VENDOR_KINDS = ("megascans", "gsg")
+VENDOR_KINDS = ("megascans", "gsg", "folder")
 ROOT_KINDS = ("library",) + VENDOR_KINDS
-ROOT_KIND_LABELS = {"library": "Library", "megascans": "Megascans", "gsg": "Greyscalegorilla"}
+ROOT_KIND_LABELS = {"library": "Library", "megascans": "Megascans", "gsg": "Greyscalegorilla",
+                    "folder": "Folder (watch)"}
 
 COLOR_LABELS = (("red", "Red", (220, 60, 60)), ("orange", "Orange", (235, 140, 40)),
                 ("yellow", "Yellow", (230, 205, 50)), ("green", "Green", (80, 180, 80)),
@@ -214,16 +215,29 @@ def next_version(data):
     return max([v["version"] for v in data.get("versions", [])] or [0]) + 1
 
 
-def add_version(data, files, note="", author="", number=None):
-    """Append a version with `files` ({key: path relative to the asset folder}); make it current."""
+def add_version(data, files, note="", author="", number=None, materials=None,
+                variations=None):
+    """Append a version with `files` ({key: path relative to the asset folder}); make it current.
+
+    `materials` is the bundle info from material_bundle.write() (saved node names, bundle and
+    texture paths), stored in the version entry when given.
+
+    `variations` is {variation name: {key: path relative to the asset folder}} for assets that
+    hold several versions of one model (a Megascans plant's Var1..VarN); `files` stays the
+    primary set (Var1), so thumbnails, LOD menus and `file_for` keep working."""
     number = number or next_version(data)
-    data["versions"].append({
+    version = {
         "version": number,
         "created": now_iso(),
         "author": author,
         "files": dict(files),
         "note": note,
-    })
+    }
+    if materials:
+        version["materials"] = dict(materials)
+    if variations:
+        version["variations"] = {var: dict(f) for var, f in variations.items()}
+    data["versions"].append(version)
     data["current"] = number
     return number
 

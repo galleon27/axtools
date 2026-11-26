@@ -46,6 +46,12 @@ def lod_files(files):
     return {rank: out[rank] for rank in sorted(out)}
 
 
+def variation_order(name):
+    """Sort key for plant variation names, keeping Var2 before Var10."""
+    digits = "".join(ch for ch in str(name) if ch.isdigit())
+    return (int(digits) if digits else 0, str(name).lower())
+
+
 def _resolution_variants(path):
     """{resolution number: file} for one channel's file, found by name in its folder."""
     base = os.path.basename(path)
@@ -119,24 +125,29 @@ def pick_resolution(available_labels, wanted):
 
 
 def linked_material(rec, records):
-    """The material record for a geometry record, or None."""
+    """The material record for a geometry record, or None.
+
+    Library assets copied from a vendor use their stored megascans_id / gsg_id / folder_id;
+    records browsed in place fall back to the id prefix (vendor:asset:type)."""
+    info = rec.info or {}
+    ids = [(key, info.get(key)) for key in ("megascans_id", "gsg_id", "folder_id")
+           if info.get(key)]
+    if ids:
+        candidates = [other for other in records if other.type == "material"
+                      and other is not rec
+                      and any((other.info or {}).get(key) == value for key, value in ids)]
+        for other in candidates:
+            if os.path.normcase(os.path.normpath(other.root)) == \
+                    os.path.normcase(os.path.normpath(rec.root)):
+                return other
+        if candidates:
+            return candidates[0]
     if rec.source_kind in schema.VENDOR_KINDS:
         prefix = rec.id.split(":")[:2] if rec.id else []
         for other in records:
             if other.type == "material" and other.id and other.id.split(":")[:2] == prefix:
                 return other
-        return None
-    info = rec.info or {}
-    ids = [(key, info.get(key)) for key in ("megascans_id", "gsg_id") if info.get(key)]
-    if not ids:
-        return None
-    candidates = [other for other in records if other.type == "material" and other is not rec
-                  and any((other.info or {}).get(key) == value for key, value in ids)]
-    for other in candidates:
-        if os.path.normcase(os.path.normpath(other.root)) == \
-                os.path.normcase(os.path.normpath(rec.root)):
-            return other
-    return candidates[0] if candidates else None
+    return None
 
 
 def is_atlas(rec):

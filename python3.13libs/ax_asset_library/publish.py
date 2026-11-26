@@ -8,7 +8,8 @@ import tempfile
 
 import hou
 
-from . import gsg, karma, library, megascans, schema, textures, thumbnails, variants
+from . import (gsg, karma, library, material_bundle, megascans, schema, textures,
+               thumbnails, variants)
 
 # Files copied along with a geometry file of the same name (OBJ materials).
 COMPANION_EXTS = {".obj": (".mtl",)}
@@ -148,7 +149,7 @@ class IngestItem:
     """One asset to create: type, name, {key: source file}, optional thumbnail source."""
 
     def __init__(self, asset_type, name, files, thumb=None, extra=(), info=None,
-                 category="", tags=(), source=None):
+                 category="", tags=(), source=None, tree=None, variations=None):
         self.type = asset_type
         self.name = schema.sanitize_name(name)
         self.files = dict(files)
@@ -158,6 +159,10 @@ class IngestItem:
         self.category = category        # sub-category under the one chosen in the dialog
         self.tags = list(tags)
         self.source = dict(source or {"kind": "ingest"})
+        self.tree = tree                # folder copied whole, keeping relative paths
+        # {variation: {key: source file}} for assets with several model variations (a
+        # Megascans plant); files holds the primary one (Var1).
+        self.variations = {var: dict(f) for var, f in (variations or {}).items()}
 
     @property
     def first(self):
@@ -209,9 +214,11 @@ def plan_ingest(paths):
             plan.skipped.append((asset.folder, "Megascans %s asset: nothing to import"
                                  % (asset.kind or "unknown")))
         for asset_type, name, files, info, extra in made:
+            info = dict(info)
+            variations = info.pop("variations", None)
             plan.items.append(IngestItem(
                 asset_type, name, files, asset.preview, extra=extra, info=info,
-                category=asset.category, tags=asset.tags,
+                category=asset.category, tags=asset.tags, variations=variations,
                 source={"kind": "megascans", "megascans_id": asset.id,
                         "origin_path": asset.folder.replace("\\", "/")}))
     gsg_assets, paths = gsg.find_assets(paths)
@@ -267,6 +274,37 @@ def plan_ingest(paths):
     return plan
 
 
+def plan_from_records(recs, records_all):
+    """IngestPlan that copies browsed vendor assets (watch folders, Megascans, GSG) into the
+    library, keeping their ids and a geometry record's linked material.
+
+    A USD component's whole folder is copied (`tree`), so its sublayers and textures stay
+    relative to each other."""
+    plan = IngestPlan()
+    seen = set()
+    for rec in recs:
+        if not library.browsed_in_place(rec):
+            continue
+        linked = variants.linked_material(rec, records_all) \
+            if rec.type == "geometry" else None
+        for item_rec in [rec] + ([linked] if linked is not None else []):
+            if item_rec.key in seen:
+                continue
+            seen.add(item_rec.key)
+            info = {k: v for k, v in (item_rec.info or {}).items()
+                    if k not in ("preview", "base_tags", "base_description",
+                                 "component_dir", "asset_id", "variations")}
+            thumb = item_rec.thumb if item_rec.thumb and os.path.isfile(item_rec.thumb) \
+                else None
+            plan.items.append(IngestItem(
+                item_rec.type, item_rec.name, item_rec.files, thumb=thumb, info=info,
+                category=item_rec.category, tags=item_rec.tags,
+                source={"kind": item_rec.source_kind, "origin_path": item_rec.asset_dir},
+                tree=(item_rec.info or {}).get("component_dir"),
+                variations=(item_rec.variations_for() if item_rec.type == "geometry" else None)))
+    return plan
+
+
 # --- writing assets ---------------------------------------------------------------------
 def _write_asset(root, category, item, tags, copy, read_info, report):
     category = "/".join(c for c in (category, clean_category(item.category)) if c)
@@ -306,10 +344,22 @@ def _fill_asset(asset_dir, category, item, tags, copy, read_info, report):
                             tags=list(tags) + item.tags, author=author())
     data["source"].update(origin_path=item.first.replace("\\", "/"))
     data["source"].update(item.source)
+    # A USD component is copied with its sublayers and textures, so relative paths survive.
+    if copy and item.tree:
+        shutil.copytree(item.tree, vdir, dirs_exist_ok=True)
 
-    version_files, sizes, used = {}, {}, set()
-    for key, f in item.files.items():
-        if copy:
+    version_files, sizes, used, copied = {}, {}, set(), {}
+
+    def dest(f):
+        """Where a source file lands in v001; a file listed twice (Var1 and files) is copied once."""
+        src = os.path.normcase(os.path.abspath(f))
+        done = copied.get(src)
+        if done is not None:
+            return done
+        if copy and item.tree:
+            dst = os.path.join(vdir, os.path.relpath(os.path.abspath(f),
+                                                     os.path.abspath(item.tree)))
+        elif copy:
             dst = _copy_into(vdir, f, used)
             for ext in COMPANION_EXTS.get(schema.file_ext(f), ()):
                 comp = os.path.splitext(f)[0] + ext
@@ -317,13 +367,24 @@ def _fill_asset(asset_dir, category, item, tags, copy, read_info, report):
                     _copy_into(vdir, comp, used)
         else:
             dst = os.path.abspath(f)
+        copied[src] = dst
+        return dst
+
+    for key, f in item.files.items():
+        dst = dest(f)
         version_files[key] = schema.relpath(asset_dir, dst)
         sizes[key] = os.path.getsize(dst)
+    variations = {}
+    for var, files in item.variations.items():
+        rel = {key: schema.relpath(asset_dir, dest(f)) for key, f in files.items()}
+        if rel:
+            variations[var] = rel
     extra = []
     for f in item.extra:
         dst = _copy_into(vdir, f, used) if copy else os.path.abspath(f)
         extra.append(schema.relpath(asset_dir, dst))
-    schema.add_version(data, version_files, note="ingested", author=data["author"])
+    schema.add_version(data, version_files, note="ingested", author=data["author"],
+                       variations=variations or None)
     data["info"].update(item.info)
     data["info"]["file_sizes"] = sizes
     data["info"]["formats"] = sorted({schema.format_key(f) for f in item.files.values()})
@@ -496,7 +557,7 @@ def existing_asset(root, category, name):
 
 def publish_node(node, root, name, category="", tags=None, description="", note="",
                  formats=("bgeo.sc",), center=False, ground=False, unpack=False,
-                 thumbnail_image=None, asset_dir=None):
+                 thumbnail_image=None, asset_dir=None, materials=False):
     """Save a node's geometry as a new asset, or as a new version of the asset of that name.
 
     `asset_dir` targets an existing asset folder directly (new version of a known asset).
@@ -537,6 +598,15 @@ def publish_node(node, root, name, category="", tags=None, description="", note=
     result = None
     try:
         files, sizes, warnings = {}, {}, []
+        materials_info = None
+        if materials:
+            sop = node
+            if node.type().category() == hou.objNodeTypeCategory():
+                sop = node.displayNode()
+            materials_info, mat_warnings, rename = material_bundle.write(vdir, sop, geo)
+            warnings.extend(mat_warnings)
+            if materials_info:
+                material_bundle.rewrite_attr(geo, rename)
         for fmt in ["bgeo.sc"] + [f for f in formats if f != "bgeo.sc"]:
             path = os.path.join(vdir, "%s.%s" % (name, fmt))
             try:
@@ -549,7 +619,16 @@ def publish_node(node, root, name, category="", tags=None, description="", note=
             files[fmt] = schema.relpath(asset_dir, path)
             sizes[fmt] = os.path.getsize(path)
 
-        schema.add_version(data, files, note=note, author=author(), number=number)
+        if materials_info:
+            # The sidecar stores paths relative to the asset folder, not the version folder.
+            label = schema.version_label(number)
+            materials_info = {
+                "file": label + "/" + materials_info["file"],
+                "names": list(materials_info["names"]),
+                "textures": [label + "/" + p for p in materials_info["textures"]],
+            }
+        schema.add_version(data, files, note=note, author=author(), number=number,
+                           materials=materials_info)
         bb = geo.boundingBox()
         bounds = [list(bb.minvec()), list(bb.maxvec())]
         data["info"].update(bounds=bounds, file_sizes=sizes, formats=sorted(files),
@@ -589,8 +668,7 @@ def _queue(asset_dir, name, workdir, writer, settings, key=None, target=None):
 
 def megascans_thumb(rec):
     """Thumbnail file of a record from a Megascans or GSG root (in the prefs cache), else None."""
-    if (rec.source_kind not in schema.VENDOR_KINDS or not rec.id
-            or not rec.id.startswith(rec.source_kind + ":")):
+    if not library.browsed_in_place(rec):
         return None
     from . import prefs
     return megascans.thumb_path(library.megascans_thumb_dir(prefs.cache_dir()), rec.id)

@@ -4,7 +4,7 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import schema
+from .. import schema, thumbnails, variants
 from ..schema import RENDERABLE_TYPES
 
 Qt = QtCore.Qt
@@ -45,7 +45,12 @@ class Preview(QtWidgets.QLabel):
     def set_image(self, path):
         self._pix = None
         if path and os.path.isfile(path):
-            pix = QtGui.QPixmap(path)
+            readable = path
+            try:
+                readable = thumbnails.preview_path(path)   # a cached JPG for EXR/HDR/RAT
+            except (thumbnails.ThumbnailError, OSError):
+                readable = None
+            pix = QtGui.QPixmap(readable) if readable else QtGui.QPixmap()
             self._pix = pix if not pix.isNull() else None
         self._update()
 
@@ -264,7 +269,7 @@ class DetailsPane(QtWidgets.QWidget):
         if self.btn_meta_save.isEnabled():
             self.meta_save_requested.emit(*self._meta_values())
 
-    def _fill_meta(self, rec, editable):
+    def _fill_meta(self, rec, editable, vendor=False):
         self._editable = editable
         for w in (self.tags_edit, self.desc_edit):
             w.blockSignals(True)
@@ -273,8 +278,13 @@ class DetailsPane(QtWidgets.QWidget):
         for w in (self.tags_edit, self.desc_edit):
             w.blockSignals(False)
             w.setReadOnly(not editable)
-        self.btn_meta_save.setToolTip("Write tags and description to the asset's asset.json." if
-                                      editable else "This asset is in a read-only library root.")
+        if not editable:
+            tip = "This asset is in a read-only library root."
+        elif vendor:
+            tip = "Tags and description are stored in your preferences, not in the folder."
+        else:
+            tip = "Write tags and description to the asset's asset.json."
+        self.btn_meta_save.setToolTip(tip)
         self._meta_changed()
 
     def _fill_scene(self, rec, use):
@@ -291,13 +301,16 @@ class DetailsPane(QtWidgets.QWidget):
         self.btn_scene_update.setText("Update to %s" % schema.version_label(rec.current))
         self.scene_box.show()
 
-    def set_records(self, records, rendering=False, usage=None, editable=True):
-        """usage: scene.Usage of the single selected record, or None if not in the scene."""
+    def set_records(self, records, rendering=False, usage=None, editable=True,
+                    vendor=False):
+        """usage: scene.Usage of the single selected record, or None if not in the scene.
+
+        vendor: a read-only vendor root, whose tags live in the user's prefs."""
         n = len(records)
         self._rec = records[0] if n == 1 else None
         self.meta_box.setVisible(n == 1)
         if n == 1:
-            self._fill_meta(records[0], editable)
+            self._fill_meta(records[0], editable, vendor)
             self._fill_scene(records[0], usage)
         else:
             self.scene_box.hide()
@@ -347,6 +360,10 @@ class DetailsPane(QtWidgets.QWidget):
             row("Channels", html.escape(", ".join(sorted(rec.files))))
         else:
             row("Formats", html.escape(", ".join(sorted(rec.files))))
+        variations = rec.variations_for() if rec.type == "geometry" else {}
+        if variations:
+            names = sorted(variations, key=variants.variation_order)
+            row("Variations", "%d: %s" % (len(names), html.escape(", ".join(names))))
         res = info.get("resolution")
         if isinstance(res, list) and len(res) == 2:
             row("Resolution", "%d x %d" % tuple(res))

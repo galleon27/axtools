@@ -46,6 +46,8 @@ DEFAULTS = {
     # per-user collections (asset ids), kept here so a shared library never gets write conflicts
     "favorites": [],
     "color_labels": {},            # asset id -> color label key
+    "asset_meta": {},              # asset id -> {"tags": [..], "description": str}
+    "smart_searches": [],          # [{"name": str, "query": str}]
     "recent": [],                  # [[asset id, iso time], ...], newest first
     "recent_limit": 50,
     "last_ingest_dir": "",
@@ -55,6 +57,7 @@ DEFAULTS = {
     "publish_center": False,
     "publish_ground": False,
     "publish_unpack": False,
+    "publish_materials": True,     # save assigned materials and copy their textures
     "publish_thumbnail": "karma",  # "karma", "image" or "none"
     # Karma thumbnails
     "thumb_renderer": "BRAY_HdKarma",
@@ -220,11 +223,73 @@ def set_color_label(settings, asset_ids, key):
     settings.set("color_labels", labels)
 
 
+def asset_meta(settings):
+    """{asset id: {"tags": [...], "description": str}} added by the user, bad entries dropped."""
+    stored = settings.get("asset_meta")
+    if not isinstance(stored, dict):
+        return {}
+    out = {}
+    for asset_id, meta in stored.items():
+        if not asset_id or not isinstance(meta, dict):
+            continue
+        tags = schema.clean_tags(meta.get("tags") or [])
+        description = meta.get("description")
+        description = description.strip() if isinstance(description, str) else ""
+        out[asset_id] = {"tags": tags, "description": description}
+    return out
+
+
+def set_asset_meta(settings, asset_id, tags, description, base_tags=None,
+                   base_description=None):
+    """Store the user's tags and description for an asset browsed in place and save.
+
+    The entry replaces the scanned tags and description (an empty entry clears them). When
+    both equal the scanned `base_tags` / `base_description`, the entry is removed instead."""
+    meta = settings.get("asset_meta")
+    meta = dict(meta) if isinstance(meta, dict) else {}
+    tags = schema.clean_tags(tags or [])
+    description = (description or "").strip()
+    if base_tags is not None and tags == schema.clean_tags(base_tags) \
+            and description == (base_description or "").strip():
+        meta.pop(asset_id, None)
+    else:
+        meta[asset_id] = {"tags": tags, "description": description}
+    settings.set("asset_meta", meta)
+
+
 def set_favorite(settings, asset_ids, on):
     favs = [f for f in settings.get("favorites") if f not in asset_ids]
     if on:
         favs.extend(asset_ids)
     settings.set("favorites", favs)
+
+
+def smart_searches(settings):
+    """Saved searches, in the order they were saved: [{"name": str, "query": str}]."""
+    out = []
+    for item in settings.get("smart_searches") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        query = str(item.get("query") or "").strip()
+        if name and query:
+            out.append({"name": name, "query": query})
+    return out
+
+
+def save_smart_search(settings, name, query):
+    """Add a saved search; a search with the same name is replaced."""
+    name, query = (name or "").strip(), (query or "").strip()
+    if not name or not query:
+        return
+    items = [s for s in smart_searches(settings) if s["name"].lower() != name.lower()]
+    items.append({"name": name, "query": query})
+    settings.set("smart_searches", items)
+
+
+def remove_smart_search(settings, name):
+    items = [s for s in smart_searches(settings) if s["name"].lower() != (name or "").lower()]
+    settings.set("smart_searches", items)
 
 
 def recent(settings):

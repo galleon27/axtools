@@ -38,7 +38,10 @@ class _LoadJob(QtCore.QRunnable):
         self.key, self.path, self.signals = key, path, signals
 
     def run(self):
-        img = QtGui.QImage(self.path)
+        try:
+            img = QtGui.QImage(thumbnails.preview_path(self.path))   # JPG for EXR/HDR/RAT
+        except (thumbnails.ThumbnailError, OSError):
+            img = QtGui.QImage()
         if not img.isNull() and max(img.width(), img.height()) > 512:
             img = img.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio,
                              Qt.TransformationMode.SmoothTransformation)
@@ -50,12 +53,14 @@ class ThumbCache(QtCore.QObject):
 
     changed = QtCore.Signal()
     MAX_IMAGES = 800
+    MAX_BYTES = 384 * 1024 * 1024    # images and pixmaps together; the oldest go first
 
     def __init__(self):
         super().__init__()
         self._images = collections.OrderedDict()   # (path, mtime) -> QImage (null = unreadable)
         self._pixmaps = {}                         # (path, mtime, size) -> QPixmap
         self._pending = set()
+        self.hits = self.misses = 0
         self._pool = QtCore.QThreadPool()
         self._pool.setMaxThreadCount(3)
         self._signals = _LoadSignals()
@@ -66,6 +71,7 @@ class ThumbCache(QtCore.QObject):
         self._notify.timeout.connect(self.changed.emit)
 
     def clear(self):
+        self.hits = self.misses = 0
         self._images.clear()
         self._pixmaps.clear()
         self.changed.emit()
@@ -78,9 +84,11 @@ class ThumbCache(QtCore.QObject):
         pkey = (path, mtime, size)
         pix = self._pixmaps.get(pkey)
         if pix is not None:
+            self.hits += 1
             return pix
         img = self._images.get(key)
         if img is None:
+            self.misses += 1
             if key not in self._pending:
                 self._pending.add(key)
                 self._pool.start(_LoadJob(key, path, self._signals))
@@ -98,9 +106,23 @@ class ThumbCache(QtCore.QObject):
     def _on_done(self, key, img):
         self._pending.discard(key)
         self._images[key] = img
-        while len(self._images) > self.MAX_IMAGES:
+        while len(self._images) > self.MAX_IMAGES or (
+                len(self._images) > 1 and self._bytes() > self.MAX_BYTES):
             self._images.popitem(last=False)
         self._notify.start()
+
+    def _bytes(self):
+        return (sum(i.sizeInBytes() for i in self._images.values())
+                + sum(p.width() * p.height() * 4 for p in self._pixmaps.values()))
+
+    def stats(self):
+        """Numbers for the resource console (called from the GUI thread)."""
+        return {"images": len(self._images),
+                "image_bytes": sum(i.sizeInBytes() for i in self._images.values()),
+                "pixmaps": len(self._pixmaps),
+                "pixmap_bytes": sum(p.width() * p.height() * 4 for p in self._pixmaps.values()),
+                "limit": self.MAX_BYTES, "pending": len(self._pending),
+                "hits": self.hits, "misses": self.misses}
 
 
 _CACHE = None

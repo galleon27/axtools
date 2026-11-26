@@ -17,7 +17,7 @@ import time
 
 from . import schema
 
-INDEX_VERSION = 2  # bump when AssetRecord fields change: old caches are ignored
+INDEX_VERSION = 3  # bump when AssetRecord fields change: old caches are ignored
 INDEX_SAVE_INTERVAL_S = 30   # how often a long vendor scan saves its index while it runs
 PARTIAL_INTERVAL_S = 2       # how often a long scan sends its records so far to the panel
 
@@ -82,6 +82,17 @@ class AssetRecord:
         v = self.version(number)
         return v["files"] if v else {}
 
+    def variations_for(self, number=None):
+        """{variation: {key: absolute path}} of a version, or {} when it has fewer than two.
+
+        Megascans plants list one geometry record and keep Var1..VarN in the version entry;
+        Var1 is the same set as files_for()."""
+        v = self.version(self.current if number is None else number)
+        variations = v.get("variations") if v else None
+        if not isinstance(variations, dict) or len(variations) < 2:
+            return {}
+        return variations
+
     def __repr__(self):
         return "<AssetRecord %s %s/%s>" % (self.type, self.category, self.name)
 
@@ -95,6 +106,29 @@ def norm_path(path):
 _norm = norm_path
 
 
+def _version_dict(asset_dir, v):
+    """One version_list entry: absolute file paths, plus the material bundle and the
+    variation sets when there are any."""
+    entry = {"version": v["version"], "created": v.get("created", ""),
+             "author": v.get("author", ""), "note": v.get("note", ""),
+             "files": {k: schema.resolve(asset_dir, p)
+                       for k, p in v.get("files", {}).items()}}
+    materials = v.get("materials")
+    if isinstance(materials, dict):
+        entry["materials"] = {
+            "file": schema.resolve(asset_dir, materials.get("file", "")),
+            "names": list(materials.get("names") or []),
+            "textures": [schema.resolve(asset_dir, p)
+                         for p in materials.get("textures") or []],
+        }
+    variations = v.get("variations")
+    if isinstance(variations, dict) and len(variations) >= 2:
+        entry["variations"] = {
+            var: {k: schema.resolve(asset_dir, p) for k, p in files.items()}
+            for var, files in variations.items() if isinstance(files, dict)}
+    return entry
+
+
 def _record_from_sidecar(data, asset_dir, root, category, folder_type, mtime):
     problems = schema.validate(data)
     atype = data.get("type")
@@ -104,9 +138,7 @@ def _record_from_sidecar(data, asset_dir, root, category, folder_type, mtime):
     files = {k: schema.resolve(asset_dir, v) for k, v in cur.get("files", {}).items()}
     thumb_info = data.get("thumbnail") or {}
     thumb_rel = thumb_info.get("file") or schema.THUMB
-    version_list = [{"version": v["version"], "created": v.get("created", ""),
-                     "author": v.get("author", ""), "note": v.get("note", ""),
-                     "files": {k: schema.resolve(asset_dir, p) for k, p in v.get("files", {}).items()}}
+    version_list = [_version_dict(asset_dir, v)
                     for v in sorted(data.get("versions", []), key=lambda v: v["version"])]
     return AssetRecord(
         key=_norm(os.path.join(asset_dir, schema.SIDECAR)),
@@ -135,6 +167,12 @@ def _broken_record(asset_dir, root, category, folder_type, mtime, error):
 def _refresh_dynamic(rec):
     """File-existence data that can change without the sidecar changing."""
     rec.missing = sorted(k for k, p in rec.files.items() if not os.path.exists(p))
+    if rec.type in ("image", "hdri") and rec.thumb and not os.path.exists(rec.thumb):
+        source = rec.files.get(rec.type)    # no thumbnail file: an image previews itself
+        if not source:
+            source = next((p for p in rec.files.values() if schema.is_image(p)), None)
+        if source:
+            rec.thumb, rec.thumb_method = source, "image"
     try:
         rec.thumb_mtime = os.path.getmtime(rec.thumb) if rec.thumb else None
     except OSError:
@@ -213,8 +251,8 @@ MEGASCANS_THUMBS = "megascans_thumbs"
 
 
 def _root_kind(root):
-    """Roots are a path (library) or (path, kind) with kind "library", "megascans" or
-    "gsg"."""
+    """Roots are a path (library) or (path, kind) with kind "library", "megascans",
+    "gsg" or "folder" (a watch folder)."""
     if isinstance(root, (tuple, list)):
         return root[0], (root[1] or "library")
     return root, "library"
@@ -270,11 +308,12 @@ def records_from_index(cache_dir, root, kind="library"):
 
 
 def dedupe_megascans(records):
-    """Drop Megascans or GSG records whose id an earlier root already provided.
+    """Drop vendor records whose id an earlier root already provided.
 
     The same vendor asset can sit in two roots (e.g. Bridge 'Downloaded' and a downloader
-    folder). Its id (megascans:<asset id>:<type>, gsg:<code>:<type>) keys favorites, recents,
-    scene nodes and the rendered thumbnail, so only the first root's copy is listed."""
+    folder, or the same watch folder added twice). Its id (megascans:<asset id>:<type>,
+    gsg:<code>:<type>, folder:<folder id>:<type>) keys favorites, recents, scene nodes and
+    the rendered thumbnail, so only the first root's copy is listed."""
     seen, out = set(), []
     for r in records:
         if r.source_kind in schema.VENDOR_KINDS and r.id:
@@ -288,9 +327,10 @@ def dedupe_megascans(records):
 def scan_roots(roots, cache_dir, use_cache=True, progress=None, partial=None, cancelled=None):
     """Scan every root and update their index files.
 
-    `roots` holds expanded paths, or (path, kind) pairs where kind "megascans" or "gsg"
-    reads a Megascans download or a Greyscalegorilla library in place (megascans.scan_root,
-    gsg.scan_root; rendered thumbnails share one cache folder, ids differ by prefix).
+    `roots` holds expanded paths, or (path, kind) pairs where kind "megascans", "gsg" or
+    "folder" reads a Megascans download, a Greyscalegorilla library or a watch folder in
+    place (megascans.scan_root, gsg.scan_root, folders.scan_root; rendered thumbnails share
+    one cache folder, ids differ by prefix).
     Returns (records, errors).
     Safe to call from a worker thread.
 
@@ -313,8 +353,9 @@ def scan_roots(roots, cache_dir, use_cache=True, progress=None, partial=None, ca
         root, kind = _root_kind(item)
         cached = load_index(cache_dir, root, kind) if use_cache else {}
         if kind in schema.VENDOR_KINDS:
-            from . import gsg, megascans
-            scan = gsg.scan_root if kind == "gsg" else megascans.scan_root
+            from . import folders, gsg, megascans
+            scan = {"megascans": megascans.scan_root, "gsg": gsg.scan_root,
+                    "folder": folders.scan_root}[kind]
             state = {"save_failed": False, "saved": None, "shown": None}
 
             def on_batch(batch_records, entries, root=root, kind=kind, state=state):
@@ -388,6 +429,42 @@ def companion_keys(records):
             and _vendor_prefix(r) in geo}
 
 
+def browsed_in_place(rec):
+    """True for a record read from a vendor or watch-folder root, False for a library asset.
+
+    Library copies of vendor assets keep source.kind "megascans", "gsg" or "folder" but have
+    their own uuid ids; records browsed in place have ids "<kind>:<asset>:<type>"."""
+    return bool(rec.source_kind in schema.VENDOR_KINDS and rec.id
+                and rec.id.startswith(rec.source_kind + ":"))
+
+
+def apply_meta(records, meta):
+    """Show the user's tags and description on records browsed in place (watch folders,
+    Megascans, GSG).
+
+    A stored entry replaces the scanned tags and description, so scanned tags can be removed.
+    The scanned values are kept in info["base_tags"] / info["base_description"] on the first
+    call, so a later call updates the same records without a rescan. rec.info is replaced,
+    never changed in place: the scan thread may be writing the same dict to the index cache.
+    `meta` is prefs.asset_meta()."""
+    meta = meta if isinstance(meta, dict) else {}
+    for rec in records:
+        if not browsed_in_place(rec):
+            continue
+        info = rec.info if isinstance(rec.info, dict) else {}
+        if "base_tags" not in info or "base_description" not in info:
+            info = dict(info, base_tags=list(info.get("base_tags", rec.tags) or []),
+                        base_description=info.get("base_description", rec.description) or "")
+            rec.info = info
+        stored = meta.get(rec.id)
+        if stored is None:
+            rec.tags = list(info["base_tags"])
+            rec.description = info["base_description"]
+        else:
+            rec.tags = schema.clean_tags(list(stored.get("tags") or []))
+            rec.description = stored.get("description") or ""
+
+
 def browsable(records):
     """Records the panel lists: all but companion_keys()."""
     hidden = companion_keys(records)
@@ -427,7 +504,7 @@ TYPE_ALIASES = {
     "hdri": "hdri", "hdr": "hdri", "env": "hdri",
     "img": "image", "image": "image",
 }
-QUERY_FIELDS = ("type", "tag", "cat", "name", "fmt", "fav", "label")
+QUERY_FIELDS = ("type", "tag", "cat", "name", "fmt", "fav", "label", "root", "kind")
 _YES = ("1", "yes", "y", "true", "on")
 
 _TOKEN = re.compile(r'(-)?(?:([A-Za-z]+):)?(?:"([^"]*)"?|(\S+))')
@@ -438,6 +515,8 @@ class Query:
 
     Free words must all match (name, tags, category or description). Field tokens:
         type:hdri   tag:rock   cat:trees   name:oak   fmt:abc
+    root:<folder name> limits records to roots whose folder name contains the text;
+    kind:folder|gsg|megascans|library filters by root kind.
     fav:1 keeps favorites (asset ids in `favorites`); label:red, label:any and label:none
     filter color labels (asset ids in `labels`).
     A leading '-' excludes: -tag:wip, -broken. Quotes group words: tag:"red oak".
@@ -487,6 +566,10 @@ class Query:
         if field == "fmt":
             v = value.lstrip(".")
             return any(k == v or k.startswith(v) for k in rec.files)
+        if field == "root":
+            return value in os.path.basename(rec.root or "").lower()
+        if field == "kind":
+            return value == (rec.source_kind if browsed_in_place(rec) else "library")
         if field == "label":
             label = self.labels.get(rec.id or "", "")
             if value in ("any", "1"):
