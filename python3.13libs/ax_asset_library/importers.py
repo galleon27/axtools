@@ -463,10 +463,11 @@ def _variations_sop(parent, rec, sets, settings, version, base):
 
 def _variations_lop(network, rec, sets, settings, version, pos, prim, anchor=None):
     """One Reference LOP per variation, each added as a variant of the `variation` variant set
-    on `prim` by its own Add Variant LOP, then a Set Variant LOP selecting the first one.
+    on `prim` by its own Add Variant LOP.
 
-    All of them sit in one Subnet LOP named after the asset, so the network stays tidy; the
-    anchor feeds the subnet. Returns the subnet."""
+    The references and Add Variants sit in one Subnet LOP named after the asset, so the
+    network stays tidy; the anchor feeds the subnet. A Set Variant LOP outside it selects the
+    first variation. Returns the Set Variant node."""
     sub = network.createNode("subnet", unique_name(network, rec.name))
     sub.setPosition(pos)
     _wire_lop(sub, anchor)       # also hands the display flag to the subnet
@@ -494,21 +495,23 @@ def _variations_lop(network, rec, sets, settings, version, pos, prim, anchor=Non
             add.parm(parm).set(value)
         add.setPosition(x)
         last = add
-    sel = sub.createNode("setvariant", unique_name(sub, rec.name + "_variation"))
-    sel.setInput(0, last)
+    out = sub.node("output0")
+    if out is not None:
+        out.setInput(0, last)
+        out.setPosition(last.position() + hou.Vector2(0, -1))
+    last.setDisplayFlag(True)
+    # The Set Variant LOP sits outside the subnet, so the chosen variant is easy to change.
+    sel = network.createNode("setvariant", unique_name(network, rec.name + "_variation"))
+    sel.setInput(0, sub)
     for parm, value in (("primpattern1", prim), ("variantset1", VARIATION_SET),
                         ("variantname1", sets[0][0])):
         if sel.parm(parm) is None:
             raise AssetImportError("%s has no %s parameter." % (sel.type().name(), parm))
         sel.parm(parm).set(value)
-    sel.setPosition(last.position() + hou.Vector2(0, -1))
-    out = sub.node("output0")
-    if out is not None:
-        out.setInput(0, sel)
-        out.setPosition(sel.position() + hou.Vector2(0, -1))
+    sel.setPosition(pos + hou.Vector2(0, -1))
     sel.setDisplayFlag(True)
-    _tag_node(sub, rec, settings, version)
-    return sub
+    _tag_node(sel, rec, settings, version)
+    return sel
 
 
 def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):

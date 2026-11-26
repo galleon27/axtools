@@ -684,7 +684,7 @@ class PlantVariationTests(unittest.TestCase):
         stage = hou.node("/stage")
         nodes, warnings = importers.import_records([rec], self.settings, target=(None, stage))
         self.assertFalse(warnings, warnings)
-        self.assertEqual(nodes[-1].type().name(), "subnet")
+        self.assertEqual(nodes[-1].type().name(), "setvariant")
 
     def test_sop_merge_with_name_attribute(self):
         rec = self._plant()
@@ -733,13 +733,13 @@ class PlantVariationTests(unittest.TestCase):
         stage = hou.node("/stage")
         nodes, warnings = importers.import_records([rec], self.settings, target=(None, stage))
         self.assertFalse(warnings, warnings)
-        sub = nodes[-1]
-        self.assertEqual(sub.type().name(), "subnet")     # references and variants inside
+        sel = nodes[-1]
+        self.assertEqual(sel.type().name(), "setvariant")  # outside the subnet
         self.assertEqual(len(nodes), 1)
-        self.assertFalse([c for c in stage.children() if c != sub])
-        sel = sub.node("output0").input(0)
-        self.assertEqual(sel.type().name(), "setvariant")
-        add = sel.input(0)                       # the Var2 Add Variant, last in the chain
+        sub = sel.input(0)
+        self.assertEqual(sub.type().name(), "subnet")     # references and variants inside
+        self.assertEqual({c.name() for c in stage.children()}, {sel.name(), sub.name()})
+        add = sub.node("output0").input(0)                       # the Var2 Add Variant, last in the chain
         self.assertEqual(add.type().name(), "addvariant")
         prim = "/assets/" + schema.sanitize_name(rec.name)
         self.assertEqual(add.parm("primpath").eval(), prim)
@@ -754,9 +754,9 @@ class PlantVariationTests(unittest.TestCase):
         self.assertEqual(sel.parm("primpattern1").eval(), prim)
         self.assertEqual(sel.parm("variantset1").eval(), importers.VARIATION_SET)
         self.assertEqual(sel.parm("variantname1").eval(), "Var1")
-        sub.setDisplayFlag(True)
-        sub.cook(force=True)
-        usd = sub.stage()
+        sel.setDisplayFlag(True)
+        sel.cook(force=True)
+        usd = sel.stage()
         usd_prim = usd.GetPrimAtPath(prim)
         self.assertTrue(usd_prim.IsValid())
         vset = usd_prim.GetVariantSets().GetVariantSet(importers.VARIATION_SET)
@@ -770,11 +770,11 @@ class PlantVariationTests(unittest.TestCase):
             xs = [q[0] for q in UsdGeom.Mesh(mesh).GetPointsAttr().Get()]
             return max(xs) - min(xs)
 
-        self.assertAlmostEqual(width(sub), 1.0, places=4)     # Var1 selected by default
+        self.assertAlmostEqual(width(sel), 1.0, places=4)     # Var1 selected by default
         # A cooked LOP stage is read-only, so the other variation is shown by a second
         # Set Variant LOP on the same chain rather than by changing the selection.
-        other = sub.createNode("setvariant", "pick_Var2")
-        other.setInput(0, add)
+        other = stage.createNode("setvariant", "pick_Var2")
+        other.setInput(0, sub)
         other.parm("primpattern1").set(prim)
         other.parm("variantset1").set(importers.VARIATION_SET)
         other.parm("variantname1").set("Var2")
@@ -789,11 +789,12 @@ class PlantVariationTests(unittest.TestCase):
         anchor.setSelected(True, clear_all_selected=True)
         nodes, warnings = importers.import_records([rec], self.settings, target=(None, stage))
         self.assertFalse(warnings, warnings)
-        sub = nodes[-1]
+        sel = nodes[-1]
+        sub = sel.input(0)
         self.assertEqual(sub.input(0), anchor)                    # the anchor feeds the subnet
-        first = sub.node("output0").input(0).input(0).input(0)   # Var1's Add Variant
+        first = sub.node("output0").input(0).input(0)            # Var1's Add Variant
         self.assertEqual(first.input(0), anchor)                 # wired through the subnet input
-        self.assertTrue(sub.isDisplayFlagSet())                   # whole chain in the viewport
+        self.assertTrue(sel.isDisplayFlagSet())                   # whole chain in the viewport
         self.assertFalse(anchor.isDisplayFlagSet())
 
 
