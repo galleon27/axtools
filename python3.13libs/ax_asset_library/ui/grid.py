@@ -23,6 +23,7 @@ FAV_COLOR = QtGui.QColor(240, 200, 60)
 SCENE_COLOR = QtGui.QColor(90, 190, 110)
 OUTDATED_COLOR = QtGui.QColor(230, 150, 40)
 SELECT_COLOR = QtGui.QColor("#33AADD")
+MAX_THUMB = 320    # largest grid cell (size slider maximum); thumbnails are kept at this size
 
 
 # --- thumbnail cache ---------------------------------------------------------------------
@@ -33,18 +34,16 @@ class _LoadSignals(QtCore.QObject):
 class _LoadJob(QtCore.QRunnable):
     """Reads one thumbnail in a worker thread. QImage is thread-safe; QPixmap is not."""
 
-    def __init__(self, key, path, signals):
+    def __init__(self, key, path, signals, started):
         super().__init__()
-        self.key, self.path, self.signals = key, path, signals
+        self.key, self.path, self.signals, self.started = key, path, signals, started
 
     def run(self):
+        self.started.add(self.key)
         try:
-            img = QtGui.QImage(thumbnails.preview_path(self.path))   # JPG for EXR/HDR/RAT
+            img = thumbnails.display_image(self.path, MAX_THUMB)   # cached JPG for big/EXR files
         except (thumbnails.ThumbnailError, OSError):
             img = QtGui.QImage()
-        if not img.isNull() and max(img.width(), img.height()) > 512:
-            img = img.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio,
-                             Qt.TransformationMode.SmoothTransformation)
         self.signals.done.emit(self.key, img)
 
 
@@ -52,7 +51,7 @@ class ThumbCache(QtCore.QObject):
     """Module-level cache of thumbnail images, plus scaled pixmaps for the current cell size."""
 
     changed = QtCore.Signal()
-    MAX_IMAGES = 800
+    MAX_IMAGES = 2000
     MAX_BYTES = 384 * 1024 * 1024    # images and pixmaps together; the oldest go first
 
     def __init__(self):
@@ -60,9 +59,11 @@ class ThumbCache(QtCore.QObject):
         self._images = collections.OrderedDict()   # (path, mtime) -> QImage (null = unreadable)
         self._pixmaps = {}                         # (path, mtime, size) -> QPixmap
         self._pending = set()
+        self._started = set()                      # keys a worker thread has picked up
+        self._image_bytes = self._pix_bytes = 0
         self.hits = self.misses = 0
         self._pool = QtCore.QThreadPool()
-        self._pool.setMaxThreadCount(3)
+        self._pool.setMaxThreadCount(max(3, min(8, QtCore.QThread.idealThreadCount() - 2)))
         self._signals = _LoadSignals()
         self._signals.done.connect(self._on_done)
         self._notify = QtCore.QTimer()
@@ -72,9 +73,19 @@ class ThumbCache(QtCore.QObject):
 
     def clear(self):
         self.hits = self.misses = 0
+        self._pool.clear()
         self._images.clear()
         self._pixmaps.clear()
+        self._pending.clear()
+        self._started.clear()
+        self._image_bytes = self._pix_bytes = 0
         self.changed.emit()
+
+    def cancel_pending(self):
+        """Drop queued loads no worker has started (cells that scrolled or switched away);
+        the next paint asks again for the cells now on screen."""
+        self._pool.clear()
+        self._pending &= self._started
 
     def pixmap(self, path, mtime, size):
         """Scaled square pixmap, or None while loading / when there is no thumbnail."""
@@ -91,36 +102,40 @@ class ThumbCache(QtCore.QObject):
             self.misses += 1
             if key not in self._pending:
                 self._pending.add(key)
-                self._pool.start(_LoadJob(key, path, self._signals))
+                self._pool.start(_LoadJob(key, path, self._signals, self._started))
             return None
         self._images.move_to_end(key)
         if img.isNull():
             return None
         if len(self._pixmaps) > self.MAX_IMAGES:
             self._pixmaps.clear()
+            self._pix_bytes = 0
         pix = QtGui.QPixmap.fromImage(img.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
                                                  Qt.TransformationMode.SmoothTransformation))
         self._pixmaps[pkey] = pix
+        self._pix_bytes += pix.width() * pix.height() * 4
         return pix
 
     def _on_done(self, key, img):
         self._pending.discard(key)
+        self._started.discard(key)
+        old = self._images.get(key)
+        if old is not None:
+            self._image_bytes -= old.sizeInBytes()
         self._images[key] = img
+        self._image_bytes += img.sizeInBytes()
         while len(self._images) > self.MAX_IMAGES or (
-                len(self._images) > 1 and self._bytes() > self.MAX_BYTES):
-            self._images.popitem(last=False)
+                len(self._images) > 1 and self._image_bytes + self._pix_bytes > self.MAX_BYTES):
+            _k, dropped = self._images.popitem(last=False)
+            self._image_bytes -= dropped.sizeInBytes()
         self._notify.start()
-
-    def _bytes(self):
-        return (sum(i.sizeInBytes() for i in self._images.values())
-                + sum(p.width() * p.height() * 4 for p in self._pixmaps.values()))
 
     def stats(self):
         """Numbers for the resource console (called from the GUI thread)."""
         return {"images": len(self._images),
-                "image_bytes": sum(i.sizeInBytes() for i in self._images.values()),
+                "image_bytes": self._image_bytes,
                 "pixmaps": len(self._pixmaps),
-                "pixmap_bytes": sum(p.width() * p.height() * 4 for p in self._pixmaps.values()),
+                "pixmap_bytes": self._pix_bytes,
                 "limit": self.MAX_BYTES, "pending": len(self._pending),
                 "hits": self.hits, "misses": self.misses}
 
@@ -172,6 +187,7 @@ class AssetModel(QtCore.QAbstractListModel):
         self._drag_payload = drag_payload
 
     def set_records(self, records):
+        thumb_cache().cancel_pending()   # the old folder's queued thumbnails are not wanted
         self.beginResetModel()
         self.records = list(records)
         self.endResetModel()
@@ -454,7 +470,11 @@ class AssetView(QtWidgets.QListView):
         self.delegate = AssetDelegate(self)
         self.setItemDelegate(self.delegate)
         thumb_cache().changed.connect(self.viewport().update)
+        self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
         thumbnails.karma_queue().changed.connect(self.viewport().update)
+
+    def _on_scrolled(self, _value):
+        thumb_cache().cancel_pending()   # the repaint re-requests only the visible cells
 
     def set_thumb_size(self, size):
         self.delegate.size = int(size)

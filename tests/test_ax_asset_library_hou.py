@@ -869,6 +869,44 @@ class LoaderAndPreviewTests(unittest.TestCase):
             shutil.copyfile(good, bad)                 # same path, new content and mtime
             self.assertTrue(os.path.isfile(thumbnails.preview_path(bad)))
 
+    def test_display_image_caches_large_files(self):
+        qt_app()
+        big = os.path.join(self.tmp.name, "big.png")
+        write_png(big, size=(2000, 1000))
+        small = os.path.join(self.tmp.name, "small.png")
+        write_png(small)
+        previews = os.path.join(self.tmp.name, "previews")
+        with mock.patch.object(thumbnails, "preview_cache_dir", lambda: previews):
+            img = thumbnails.display_image(big, 320)
+            self.assertEqual((img.width(), img.height()), (320, 160))
+            self.assertEqual(len(os.listdir(previews)), 1)
+            img = thumbnails.display_image(big, 320)         # second call: from the cache
+            self.assertEqual((img.width(), img.height()), (320, 160))
+            self.assertEqual(len(os.listdir(previews)), 1)
+            self.assertEqual(thumbnails.display_image(small, 320).width(), 64)
+            self.assertEqual(len(os.listdir(previews)), 1)   # small files write no copy
+            self.assertTrue(thumbnails.display_image(os.path.join(self.tmp.name, "gone.png")).isNull())
+
+    def test_display_image_new_mtime(self):
+        qt_app()
+        big = os.path.join(self.tmp.name, "big.png")
+        write_png(big, size=(2000, 1000))
+        previews = os.path.join(self.tmp.name, "previews")
+        with mock.patch.object(thumbnails, "preview_cache_dir", lambda: previews):
+            thumbnails.display_image(big, 320)
+            stamp = os.path.getmtime(big) + 10
+            os.utime(big, (stamp, stamp))
+            thumbnails.display_image(big, 320)
+            self.assertEqual(len(os.listdir(previews)), 2)
+
+    def test_thumb_cache_cancel_pending(self):
+        qt_app()
+        from ax_asset_library.ui import grid
+        cache = grid.ThumbCache()
+        cache._pending.update({"a", "b"})
+        cache._started.add("a")
+        cache.cancel_pending()
+        self.assertEqual(cache._pending, {"a"})
 
 
 @unittest.skipIf(hou is None, "needs hython")

@@ -3,6 +3,9 @@ Karma render queue that produces them for geometry.
 
 Qt reads the common 8-bit formats directly. EXR, HDR and RAT go through Houdini's
 `iconvert` first (no tone mapping yet, so bright HDRIs can look clipped).
+
+The grid and details pane read through `display_image`, which keeps a small JPG copy of
+any large source image in the preview cache dir, so big files are decoded only once.
 """
 import collections
 import hashlib
@@ -10,6 +13,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 from PySide6 import QtCore, QtGui
@@ -152,6 +156,72 @@ def preview_path(path):
             pass
     _PREVIEWS[path] = dst
     return dst
+
+
+# --- display images for the grid and details pane -----------------------------------------
+GRID_MAX = 512    # longest side of the cached copies (the details pane shows up to 512)
+
+
+def read_scaled(path, size):
+    """QImage of `path` fitted inside size x size (aspect kept, never upscaled). The decoder
+    downsamples while reading where it can, so big JPGs are cheap. Null when unreadable."""
+    reader = QtGui.QImageReader(path)
+    reader.setAutoTransform(True)
+    src = reader.size()
+    if src.isValid() and max(src.width(), src.height()) > size:
+        src.scale(size, size, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+        reader.setScaledSize(src)
+    return reader.read()
+
+
+def display_image(path, size=GRID_MAX):
+    """QImage fitted inside `size` for showing `path`; null when unreadable.
+
+    Files Qt can't read go through `preview_path` (iconvert; raises ThumbnailError). Large
+    Qt-readable files get a JPG copy in the preview cache dir, named by path and mtime."""
+    if not path:
+        return QtGui.QImage()
+    if schema.file_ext(path) not in schema.QT_IMAGE_EXTS:
+        return read_scaled(preview_path(path), size)
+    head = QtGui.QImageReader(path).size()
+    if head.isValid() and max(head.width(), head.height()) <= GRID_MAX:
+        return read_scaled(path, size)
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return QtGui.QImage()
+    key = "grid|%s|%.6f" % (os.path.normcase(path), stamp)
+    dst = os.path.join(preview_cache_dir(), hashlib.sha1(key.encode("utf-8")).hexdigest()[:16] + ".jpg")
+    if os.path.isfile(dst):
+        img = read_scaled(dst, size)
+        if not img.isNull():
+            return img
+    img = read_scaled(path, GRID_MAX)
+    if img.isNull():
+        return img
+    out = img
+    if out.hasAlphaChannel():   # JPG has no alpha: flatten on the grid's cell color
+        out = QtGui.QImage(img.size(), QtGui.QImage.Format.Format_RGB32)
+        out.fill(QtGui.QColor(30, 30, 30))
+        painter = QtGui.QPainter(out)
+        painter.drawImage(0, 0, img)
+        painter.end()
+    tmp = "%s.%d.tmp" % (dst, threading.get_ident())
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if out.save(tmp, "JPG", 90):
+            os.replace(tmp, dst)
+    except OSError:
+        pass   # a failed cache write still shows the image
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if max(out.width(), out.height()) > size:
+        out = out.scaled(size, size, QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                         QtCore.Qt.TransformationMode.SmoothTransformation)
+    return out
 
 
 def store_thumbnail(asset_dir, image_path, method):
