@@ -241,7 +241,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         bar.addWidget(self.sort_combo)
 
         self.size_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setRange(64, 320)
+        self.size_slider.setRange(64, grid.MAX_THUMB)
         self.size_slider.setFixedWidth(100)
         self.size_slider.setToolTip("Thumbnail size.")
         self.size_slider.valueChanged.connect(self._on_size_changed)

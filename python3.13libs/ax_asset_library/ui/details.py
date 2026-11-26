@@ -45,13 +45,12 @@ class Preview(QtWidgets.QLabel):
     def set_image(self, path):
         self._pix = None
         if path and os.path.isfile(path):
-            readable = path
             try:
-                readable = thumbnails.preview_path(path)   # a cached JPG for EXR/HDR/RAT
+                img = thumbnails.display_image(path)   # cached copy for big files and EXR/HDR/RAT
             except (thumbnails.ThumbnailError, OSError):
-                readable = None
-            pix = QtGui.QPixmap(readable) if readable else QtGui.QPixmap()
-            self._pix = pix if not pix.isNull() else None
+                img = QtGui.QImage()
+            if not img.isNull():
+                self._pix = QtGui.QPixmap.fromImage(img)
         self._update()
 
     def hasHeightForWidth(self):
