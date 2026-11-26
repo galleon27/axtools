@@ -215,11 +215,16 @@ def next_version(data):
     return max([v["version"] for v in data.get("versions", [])] or [0]) + 1
 
 
-def add_version(data, files, note="", author="", number=None, materials=None):
+def add_version(data, files, note="", author="", number=None, materials=None,
+                variations=None):
     """Append a version with `files` ({key: path relative to the asset folder}); make it current.
 
     `materials` is the bundle info from material_bundle.write() (saved node names, bundle and
-    texture paths), stored in the version entry when given."""
+    texture paths), stored in the version entry when given.
+
+    `variations` is {variation name: {key: path relative to the asset folder}} for assets that
+    hold several versions of one model (a Megascans plant's Var1..VarN); `files` stays the
+    primary set (Var1), so thumbnails, LOD menus and `file_for` keep working."""
     number = number or next_version(data)
     version = {
         "version": number,
@@ -230,6 +235,8 @@ def add_version(data, files, note="", author="", number=None, materials=None):
     }
     if materials:
         version["materials"] = dict(materials)
+    if variations:
+        version["variations"] = {var: dict(f) for var, f in variations.items()}
     data["versions"].append(version)
     data["current"] = number
     return number

@@ -46,6 +46,12 @@ def lod_files(files):
     return {rank: out[rank] for rank in sorted(out)}
 
 
+def variation_order(name):
+    """Sort key for plant variation names, keeping Var2 before Var10."""
+    digits = "".join(ch for ch in str(name) if ch.isdigit())
+    return (int(digits) if digits else 0, str(name).lower())
+
+
 def _resolution_variants(path):
     """{resolution number: file} for one channel's file, found by name in its folder."""
     base = os.path.basename(path)

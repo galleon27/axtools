@@ -17,15 +17,22 @@ from . import variants
 UD_ID = "ax_asset_id"
 UD_VERSION = "ax_asset_version"
 UD_ROOT = "ax_asset_root"
+UD_VARIATION = "ax_asset_variation"
 
 # SOP loader per extension; everything else goes through the File SOP, which reads
-# bgeo, obj, fbx, ply and USD files.
-SOP_LOADERS = {".abc": ("alembic", "fileName")}
+# bgeo, obj, fbx and ply files. USD files need the USD Import SOP.
+SOP_LOADERS = {".abc": ("alembic", "fileName"),
+               ".usd": ("usdimport", "filepath1"),
+               ".usda": ("usdimport", "filepath1"),
+               ".usdc": ("usdimport", "filepath1"),
+               ".usdz": ("usdimport", "filepath1")}
 DEFAULT_SOP_LOADER = ("file", "file")
 LOP_REFERENCE_TYPES = ("reference::2.0", "reference")
 LOP_DOME_TYPES = ("domelight::3.0", "domelight::2.0", "domelight")
 DOME_TEXTURE_PARMS = ("xn__inputstexturefile_r3ah", "texture_file")
 TYPE_KEYS = {"hdri": ["hdri"], "image": ["image"]}
+# Variant set and prim path holding a model's variations (Megascans plants).
+VARIATION_SET = "variation"
 
 CONTEXT_LABELS = {"sop": "SOP", "obj": "OBJ", "lop": "LOP", "vop": "material network",
                   None: "/mat"}
@@ -190,12 +197,16 @@ def _lop_type(names):
     raise AssetImportError("No LOP node type found among: %s" % ", ".join(names))
 
 
-def _tag_node(node, rec, settings, version):
+def _tag_node(node, rec, settings, version, variation=None):
     root = settings.root_for(rec.root)
     node.setUserData(UD_ID, rec.id or "")
     node.setUserData(UD_VERSION, str(version))
     node.setUserData(UD_ROOT, root["path"] if root else rec.root)  # "$AX_ASSET_LIB" when typed so
-    node.setComment("%s %s" % (rec.name, schema.version_label(version)))
+    if variation:
+        node.setUserData(UD_VARIATION, str(variation))
+    node.setComment("%s %s" % (rec.name, schema.version_label(version))
+                    if not variation else "%s %s (%s)" % (rec.name, variation,
+                                                          schema.version_label(version)))
     node.setGenericFlag(hou.nodeFlag.DisplayComment, True)
 
 
@@ -245,14 +256,30 @@ def parm_path_for(rec, settings):
 
 
 # --- geometry -------------------------------------------------------------------------
-def _geo_files(rec, version, opts):
-    """The record's files, or the picked LOD's files when opts has one."""
-    files = rec.files_for(version)
+def _picked_lod(files, opts):
+    """`files` at the LOD rank picked in opts (all files when no LOD was picked)."""
     lod = opts.get("lod")
     if lod is not None:
         lods = variants.lod_files(files)
         files = lods[variants.pick_lod(list(lods), lod)]
     return files
+
+
+def _geo_files(rec, version, opts):
+    """The record's files, or the picked LOD's files when opts has one."""
+    return _picked_lod(rec.files_for(version), opts)
+
+
+def variation_sets(rec, version, opts):
+    """[(variation, {key: path})] for a model, each at the picked LOD.
+
+    A model without variations gives [(None, its files)].
+    """
+    sets = rec.variations_for(version)
+    if not sets:
+        return [(None, _geo_files(rec, version, opts))]
+    return [(var, _picked_lod(sets[var], opts))
+            for var in sorted(sets, key=variants.variation_order)]
 
 
 def _material_maps(mrec, settings, opts):
@@ -349,9 +376,9 @@ def _bundle_material_sop(parent, nodes, name):
     return node
 
 
-def _sop_loader(parent, rec, path, parm_value):
+def _sop_loader(parent, rec, path, parm_value, name=None):
     node_type, parm = SOP_LOADERS.get(schema.file_ext(path), DEFAULT_SOP_LOADER)
-    node = parent.createNode(node_type, unique_name(parent, rec.name))
+    node = parent.createNode(node_type, unique_name(parent, name or rec.name))
     if _set_first(node, (parm,), parm_value) is None:
         raise AssetImportError("%s has no '%s' parameter." % (node.type().name(), parm))
     return node
@@ -372,13 +399,13 @@ def _import_scale(rec):
     return scale if scale > 0 else 1.0
 
 
-def _sop_scale(parent, loader, rec):
+def _sop_scale(parent, loader, rec, name=None):
     """Transform SOP after the loader when the asset has an import scale (Megascans FBX
     are in centimeters). Returns the last node of the chain."""
     scale = _import_scale(rec)
     if scale == 1.0:
         return loader
-    xf = parent.createNode("xform", unique_name(parent, rec.name + "_scale"))
+    xf = parent.createNode("xform", unique_name(parent, name or rec.name + "_scale"))
     xf.parm("scale").set(scale)
     xf.setInput(0, loader)
     xf.setComment("import scale %g" % scale)
@@ -402,11 +429,93 @@ def _import_bundle(bundle, container, parent, rec, settings, version):
     return mnode
 
 
+def _variations_sop(parent, rec, sets, settings, version, base):
+    """One loader per variation, each scaled, packed and tagged with a prim string attribute
+    `name`, merged into one SOP node. Returns the merge node."""
+    nodes = []
+    for i, (var, files) in enumerate(sets):
+        path, value = file_for(rec, settings, version, files)
+        x = base + hou.Vector2(i * 2.5, 0)
+        loader = _sop_loader(parent, rec, path, value, "%s_%s" % (rec.name, var))
+        loader.setPosition(x)
+        _tag_node(loader, rec, settings, version, var)
+        last = _sop_scale(parent, loader, rec, "%s_%s_scale" % (rec.name, var))
+        if last is not loader:
+            last.setPosition(x + hou.Vector2(0, -1))
+        pack = parent.createNode("pack", unique_name(parent, "%s_%s_pack" % (rec.name, var)))
+        pack.setInput(0, last)
+        pack.setPosition(last.position() + hou.Vector2(0, -1))
+        named = parent.createNode("name", unique_name(parent, "%s_%s_name" % (rec.name, var)))
+        _set_first(named, ("attribname",), "name")
+        _set_first(named, ("class",), "primitive")
+        _set_first(named, ("name1",), var)
+        named.setInput(0, pack)
+        named.setPosition(pack.position() + hou.Vector2(0, -1))
+        _tag_node(named, rec, settings, version, var)
+        nodes.append(named)
+    merge = parent.createNode("merge", unique_name(parent, rec.name + "_variations"))
+    for i, node in enumerate(nodes):
+        merge.setInput(i, node)
+    merge.setPosition(nodes[-1].position() + hou.Vector2(0, -1))
+    _tag_node(merge, rec, settings, version)
+    return merge
+
+
+def _variations_lop(network, rec, sets, settings, version, pos, prim, anchor=None):
+    """One Reference LOP per variation, each added as a variant of the `variation` variant set
+    on `prim` by its own Add Variant LOP, then a Set Variant LOP selecting the first one.
+
+    All of them sit in one Subnet LOP named after the asset, so the network stays tidy; the
+    anchor feeds the subnet. Returns the subnet."""
+    sub = network.createNode("subnet", unique_name(network, rec.name))
+    sub.setPosition(pos)
+    _wire_lop(sub, anchor)       # also hands the display flag to the subnet
+    inner = sub.indirectInputs()[0] if sub.inputs() else None
+    last = inner
+    for i, (var, files) in enumerate(sets):
+        path, value = file_for(rec, settings, version, files)
+        x = hou.Vector2(i * 2.5, 0)
+        ref = sub.createNode(_lop_type(LOP_REFERENCE_TYPES),
+                             unique_name(sub, "%s_%s" % (rec.name, var)))
+        if _set_first(ref, ("filepath1", "filepath"), value) is None:
+            raise AssetImportError("%s has no file path parameter." % ref.type().name())
+        _set_first(ref, ("primpath1", "primpath"), prim)
+        ref.setPosition(x + hou.Vector2(0, 3))
+        _tag_node(ref, rec, settings, version, var)
+        add = sub.createNode("addvariant", unique_name(sub, "%s_%s_variant"
+                                                       % (rec.name, var)))
+        add.setInput(1, ref)     # input 1 holds the stage the variant is copied from
+        if last is not None:     # input 0 keeps the variants added before this one
+            add.setInput(0, last)
+        for parm, value in (("primpath", prim), ("variantset", VARIATION_SET),
+                            ("variantprimpath", prim), ("variantname", var)):
+            if add.parm(parm) is None:
+                raise AssetImportError("%s has no %s parameter." % (add.type().name(), parm))
+            add.parm(parm).set(value)
+        add.setPosition(x)
+        last = add
+    sel = sub.createNode("setvariant", unique_name(sub, rec.name + "_variation"))
+    sel.setInput(0, last)
+    for parm, value in (("primpattern1", prim), ("variantset1", VARIATION_SET),
+                        ("variantname1", sets[0][0])):
+        if sel.parm(parm) is None:
+            raise AssetImportError("%s has no %s parameter." % (sel.type().name(), parm))
+        sel.parm(parm).set(value)
+    sel.setPosition(last.position() + hou.Vector2(0, -1))
+    out = sub.node("output0")
+    if out is not None:
+        out.setInput(0, sel)
+        out.setPosition(sel.position() + hou.Vector2(0, -1))
+    sel.setDisplayFlag(True)
+    _tag_node(sub, rec, settings, version)
+    return sub
+
+
 def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     if ctx not in ALLOWED_CONTEXTS["geometry"]:
         raise AssetImportError("geometry imports into %s." % TYPE_WHERE["geometry"])
-    files = _geo_files(rec, version, opts)
-    path, value = file_for(rec, settings, version, files)
+    sets = variation_sets(rec, version, opts)
+    path, value = file_for(rec, settings, version, sets[0][1])
     mrec = None
     if opts.get("renderer") and opts.get("records_all"):
         mrec = variants.linked_material(rec, opts["records_all"])
@@ -414,12 +523,15 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     bundle = picked.get("materials") if mrec is None else None
 
     if ctx == "sop":
-        node = _sop_loader(network, rec, path, value)
-        node.setPosition(pos)
-        _tag_node(node, rec, settings, version)
-        last = _sop_scale(network, node, rec)
-        if last is not node:
-            last.setPosition(pos + hou.Vector2(0, -1))
+        if len(sets) > 1:
+            last = _variations_sop(network, rec, sets, settings, version, pos)
+        else:
+            node = _sop_loader(network, rec, path, value)
+            node.setPosition(pos)
+            _tag_node(node, rec, settings, version)
+            last = _sop_scale(network, node, rec)
+            if last is not node:
+                last.setPosition(pos + hou.Vector2(0, -1))
         if mrec is not None:
             mat = _build_linked_material(mrec, ctx, network, settings, opts,
                                          container=network)
@@ -440,8 +552,12 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
         geo = network.createNode("geo", unique_name(network, rec.name))
         for child in geo.children():  # some setups add a default File SOP
             child.destroy()
-        loader = _sop_loader(geo, rec, path, value)
-        last = _sop_scale(geo, loader, rec)
+        loader = None
+        if len(sets) > 1:
+            last = _variations_sop(geo, rec, sets, settings, version, hou.Vector2(0, 0))
+        else:
+            loader = _sop_loader(geo, rec, path, value)
+            last = _sop_scale(geo, loader, rec)
         last.setDisplayFlag(True)
         last.setRenderFlag(True)
         if mrec is not None:
@@ -462,30 +578,35 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
         geo.layoutChildren()
         geo.setPosition(pos)
         _tag_node(geo, rec, settings, version)
-        _tag_node(loader, rec, settings, version)
+        if loader is not None:
+            _tag_node(loader, rec, settings, version)
         return geo
 
     # LOP: Reference LOP; Houdini's USD plugins read bgeo and abc files as layers too.
     # Bundled materials are left unused here: they import into SOP and OBJ networks.
-    ref = network.createNode(_lop_type(LOP_REFERENCE_TYPES), unique_name(network, rec.name))
-    if _set_first(ref, ("filepath1", "filepath"), value) is None:
-        raise AssetImportError("%s has no file path parameter." % ref.type().name())
     prim = "/assets/" + schema.sanitize_name(rec.name)
-    _set_first(ref, ("primpath1", "primpath"), prim)
-    _wire_lop(ref, anchor)
-    ref.setPosition(pos)
-    _tag_node(ref, rec, settings, version)
-    last = ref
+    if len(sets) > 1:
+        last = _variations_lop(network, rec, sets, settings, version, pos, prim, anchor)
+    else:
+        ref = network.createNode(_lop_type(LOP_REFERENCE_TYPES),
+                                 unique_name(network, rec.name))
+        if _set_first(ref, ("filepath1", "filepath"), value) is None:
+            raise AssetImportError("%s has no file path parameter." % ref.type().name())
+        _set_first(ref, ("primpath1", "primpath"), prim)
+        _wire_lop(ref, anchor)
+        ref.setPosition(pos)
+        _tag_node(ref, rec, settings, version)
+        last = ref
     scale = _import_scale(rec)
     if scale != 1.0:
         xf = network.createNode("xform", unique_name(network, rec.name + "_scale"))
         xf.parm("primpattern").set(prim)
         xf.parm("scale").set(scale)
-        xf.setInput(0, ref)
-        xf.setPosition(pos + hou.Vector2(0, -1))
+        xf.setInput(0, last)
+        xf.setPosition(last.position() + hou.Vector2(0, -1))
         xf.setComment("import scale %g" % scale)
         xf.setGenericFlag(hou.nodeFlag.DisplayComment, True)
-        if ref.isDisplayFlagSet():
+        if last.isDisplayFlagSet():
             xf.setDisplayFlag(True)
         last = xf
     if mrec is not None:
@@ -721,7 +842,10 @@ def import_records(records, settings, version=None, renderer=None, target=None,
                                 % (rec.name, schema.TYPE_LABELS.get(rec.type, rec.type)))
                 continue
             use = version or rec.current
-            missing = sorted(k for k, p in rec.files_for(use).items() if not os.path.exists(p))
+            load_files = dict(rec.files_for(use))
+            for var_files in rec.variations_for(use).values():
+                load_files.update(var_files)
+            missing = sorted(k for k, p in load_files.items() if not os.path.exists(p))
             if missing:
                 warnings.append("%s: missing file(s) %s." % (rec.name, ", ".join(missing)))
             try:

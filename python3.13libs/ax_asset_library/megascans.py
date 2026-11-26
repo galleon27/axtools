@@ -51,7 +51,7 @@ SECTION_LABELS = dict(BRIDGE_SECTIONS)
 META_KEYS = ("height", "length", "width", "dimensions")
 FBX_CM_SCALE = 0.01  # Megascans FBX/OBJ files are in centimeters
 MAX_DEPTH = 4        # how deep scan_root looks for asset folders below the root
-CACHE_VERSION = 5    # bump when plan()/records_for() change: cached records are rebuilt
+CACHE_VERSION = 6    # bump when plan()/records_for() change: cached records are rebuilt
 SCAN_WORKERS = 16    # threads: the folder reads are I/O-bound (network folders)
 BATCH_SIZE = 200     # read folders per on_batch callback during a scan
 
@@ -364,9 +364,10 @@ def _material(asset, files, info):
 def plan(asset):
     """[(asset type, name, {key: file}, info, extra files)] for one Megascans asset.
 
-    Surfaces: one material. 3D assets: geometry (most detailed LOD) + material. Plants:
-    one geometry asset per variation + the atlas material; a plant without Var* folders (a
-    flat download) is read like a 3D asset. Other kinds: nothing.
+    Surfaces: one material. 3D assets: geometry (most detailed LOD) + material. Plants: one
+    geometry asset holding every variation (info["variations"], Var1..VarN) + the atlas
+    material; a plant without Var* folders (a flat download) is read like a 3D asset. Other
+    kinds: nothing.
     """
     info = {"megascans_id": asset.id, "vendor_kind": asset.kind}
     if asset.kind in ("atlas", "decal"):
@@ -388,18 +389,30 @@ def plan(asset):
     if asset.kind in MESH_KINDS:
         return single_mesh()
     if asset.kind in PLANT_KINDS:
-        out, variations = [], {}
+        groups = {}
         for f in content:
             first = asset.rel(f).split("/")[0]
             if re.fullmatch(r"var\d+", first, re.IGNORECASE):
-                variations.setdefault(first, []).append(f)
-        if not variations:
+                groups.setdefault(first, []).append(f)
+        if not groups:
             return single_mesh()
-        for var in sorted(variations, key=lambda v: int(re.sub(r"\D", "", v) or 0)):
-            meshes = mesh_files(variations[var])
+        by_var = {}
+        for var in sorted(groups, key=lambda v: int(re.sub(r"\D", "", v) or 0)):
+            meshes = mesh_files(groups[var])
             if meshes:
-                out.append(("geometry", "%s_%s" % (asset.library_name, var), meshes,
-                            _mesh_info(dict(info, variation=var), meshes, asset.size_m(var)), []))
+                by_var[var] = meshes
+        out = []
+        if len(by_var) == 1:
+            # One variation left: no variation set, so it imports like a plain 3D asset.
+            var, meshes = next(iter(by_var.items()))
+            out.append(("geometry", asset.library_name, meshes,
+                        _mesh_info(info, meshes, asset.size_m(var)), []))
+        elif by_var:
+            # All variations in one record: the largest one sizes the import scale.
+            size = asset.size_m(max(by_var, key=lambda v: asset.size_m(v) or 0))
+            out.append(("geometry", asset.library_name, next(iter(by_var.values())),
+                        _mesh_info(dict(info, variations=by_var),
+                                   next(iter(by_var.values())), size or asset.size_m()), []))
         atlas = [f for f in content if asset.rel(f).lower().startswith("textures/atlas/")]
         return out + _material(asset, atlas or top, info)
     return []
@@ -431,7 +444,11 @@ def build_records(asset, items, root, thumb_dir, thumbs, mtime, prefix, note):
         "%Y-%m-%dT%H:%M:%SZ") if mtime else ""
     out = []
     for asset_type, name, files, info, _extra in items:
+        info = dict(info)
+        variations = info.pop("variations", None) if asset_type == "geometry" else None
         preview = info.get("preview") or asset.preview
+        if not preview and asset_type in ("image", "hdri"):
+            preview = files.get(asset_type)      # an image previews itself
         rid = record_id(info.get("asset_id") or asset.id, asset_type, info.get("variation"),
                         prefix)
         cache = thumb_path(thumb_dir, rid)
@@ -440,6 +457,12 @@ def build_records(asset, items, root, thumb_dir, thumbs, mtime, prefix, note):
         files = dict(files)
         if preview:
             info = dict(info, preview=preview)  # fallback when a rendered thumbnail is deleted
+        version = {"version": 1, "created": created, "author": "", "note": note,
+                   "files": files}
+        if variations:
+            version["variations"] = {var: dict(f) for var, f in variations.items()}
+            # The scan cache drops version_list, so info keeps the variations too (_unpack).
+            info["variations"] = {var: dict(f) for var, f in variations.items()}
         out.append(AssetRecord(
             key=_norm(asset.folder) + "|" + rid, id=rid, name=name, type=asset_type,
             category=(getattr(asset, "browse_category", None) or asset.category
@@ -450,8 +473,7 @@ def build_records(asset, items, root, thumb_dir, thumbs, mtime, prefix, note):
             thumb_mtime=cached or (mtime if preview else None), info=dict(info),
             problems=[], sidecar_mtime=mtime, source_kind=prefix,
             thumb_method="karma" if cached else ("image" if preview else ""),
-            version_list=[{"version": 1, "created": created, "author": "", "note": note,
-                           "files": files}]))
+            version_list=[version]))
     return out
 
 
@@ -487,8 +509,12 @@ def _unpack(d, root):
     from .library import AssetRecord
     rec = AssetRecord.from_dict(d)
     rec.root, rec.current, rec.versions = root, 1, [1]
-    rec.version_list = [{"version": 1, "created": rec.created, "author": "", "note": "Megascans",
-                         "files": rec.files}]
+    version = {"version": 1, "created": rec.created, "author": "", "note": "Megascans",
+               "files": rec.files}
+    variations = (rec.info or {}).get("variations")
+    if isinstance(variations, dict) and len(variations) >= 2:
+        version["variations"] = variations     # build_records keeps them in info for the cache
+    rec.version_list = [version]
     return rec
 
 
@@ -520,7 +546,7 @@ def _subdirs_unchanged(entry):
     if subdirs is None:
         # Entries from before subfolders were tracked: only plants (Var*/, Textures/Atlas/)
         # depend on nested folders, so only those are read again.
-        return not any("variation" in (d.get("info") or {}) for d in entry["records"])
+        return not any("variations" in (d.get("info") or {}) for d in entry["records"])
     for rel, mtime in subdirs.items():
         try:
             if os.stat(os.path.join(entry["folder"], rel)).st_mtime != mtime:

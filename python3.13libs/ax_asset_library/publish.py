@@ -149,7 +149,7 @@ class IngestItem:
     """One asset to create: type, name, {key: source file}, optional thumbnail source."""
 
     def __init__(self, asset_type, name, files, thumb=None, extra=(), info=None,
-                 category="", tags=(), source=None, tree=None):
+                 category="", tags=(), source=None, tree=None, variations=None):
         self.type = asset_type
         self.name = schema.sanitize_name(name)
         self.files = dict(files)
@@ -160,6 +160,9 @@ class IngestItem:
         self.tags = list(tags)
         self.source = dict(source or {"kind": "ingest"})
         self.tree = tree                # folder copied whole, keeping relative paths
+        # {variation: {key: source file}} for assets with several model variations (a
+        # Megascans plant); files holds the primary one (Var1).
+        self.variations = {var: dict(f) for var, f in (variations or {}).items()}
 
     @property
     def first(self):
@@ -211,9 +214,11 @@ def plan_ingest(paths):
             plan.skipped.append((asset.folder, "Megascans %s asset: nothing to import"
                                  % (asset.kind or "unknown")))
         for asset_type, name, files, info, extra in made:
+            info = dict(info)
+            variations = info.pop("variations", None)
             plan.items.append(IngestItem(
                 asset_type, name, files, asset.preview, extra=extra, info=info,
-                category=asset.category, tags=asset.tags,
+                category=asset.category, tags=asset.tags, variations=variations,
                 source={"kind": "megascans", "megascans_id": asset.id,
                         "origin_path": asset.folder.replace("\\", "/")}))
     gsg_assets, paths = gsg.find_assets(paths)
@@ -288,14 +293,15 @@ def plan_from_records(recs, records_all):
             seen.add(item_rec.key)
             info = {k: v for k, v in (item_rec.info or {}).items()
                     if k not in ("preview", "base_tags", "base_description",
-                                 "component_dir", "asset_id")}
+                                 "component_dir", "asset_id", "variations")}
             thumb = item_rec.thumb if item_rec.thumb and os.path.isfile(item_rec.thumb) \
                 else None
             plan.items.append(IngestItem(
                 item_rec.type, item_rec.name, item_rec.files, thumb=thumb, info=info,
                 category=item_rec.category, tags=item_rec.tags,
                 source={"kind": item_rec.source_kind, "origin_path": item_rec.asset_dir},
-                tree=(item_rec.info or {}).get("component_dir")))
+                tree=(item_rec.info or {}).get("component_dir"),
+                variations=(item_rec.variations_for() if item_rec.type == "geometry" else None)))
     return plan
 
 
@@ -342,8 +348,14 @@ def _fill_asset(asset_dir, category, item, tags, copy, read_info, report):
     if copy and item.tree:
         shutil.copytree(item.tree, vdir, dirs_exist_ok=True)
 
-    version_files, sizes, used = {}, {}, set()
-    for key, f in item.files.items():
+    version_files, sizes, used, copied = {}, {}, set(), {}
+
+    def dest(f):
+        """Where a source file lands in v001; a file listed twice (Var1 and files) is copied once."""
+        src = os.path.normcase(os.path.abspath(f))
+        done = copied.get(src)
+        if done is not None:
+            return done
         if copy and item.tree:
             dst = os.path.join(vdir, os.path.relpath(os.path.abspath(f),
                                                      os.path.abspath(item.tree)))
@@ -355,13 +367,24 @@ def _fill_asset(asset_dir, category, item, tags, copy, read_info, report):
                     _copy_into(vdir, comp, used)
         else:
             dst = os.path.abspath(f)
+        copied[src] = dst
+        return dst
+
+    for key, f in item.files.items():
+        dst = dest(f)
         version_files[key] = schema.relpath(asset_dir, dst)
         sizes[key] = os.path.getsize(dst)
+    variations = {}
+    for var, files in item.variations.items():
+        rel = {key: schema.relpath(asset_dir, dest(f)) for key, f in files.items()}
+        if rel:
+            variations[var] = rel
     extra = []
     for f in item.extra:
         dst = _copy_into(vdir, f, used) if copy else os.path.abspath(f)
         extra.append(schema.relpath(asset_dir, dst))
-    schema.add_version(data, version_files, note="ingested", author=data["author"])
+    schema.add_version(data, version_files, note="ingested", author=data["author"],
+                       variations=variations or None)
     data["info"].update(item.info)
     data["info"]["file_sizes"] = sizes
     data["info"]["formats"] = sorted({schema.format_key(f) for f in item.files.values()})

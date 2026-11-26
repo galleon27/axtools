@@ -17,7 +17,7 @@ import time
 
 from . import schema
 
-INDEX_VERSION = 2  # bump when AssetRecord fields change: old caches are ignored
+INDEX_VERSION = 3  # bump when AssetRecord fields change: old caches are ignored
 INDEX_SAVE_INTERVAL_S = 30   # how often a long vendor scan saves its index while it runs
 PARTIAL_INTERVAL_S = 2       # how often a long scan sends its records so far to the panel
 
@@ -82,6 +82,17 @@ class AssetRecord:
         v = self.version(number)
         return v["files"] if v else {}
 
+    def variations_for(self, number=None):
+        """{variation: {key: absolute path}} of a version, or {} when it has fewer than two.
+
+        Megascans plants list one geometry record and keep Var1..VarN in the version entry;
+        Var1 is the same set as files_for()."""
+        v = self.version(self.current if number is None else number)
+        variations = v.get("variations") if v else None
+        if not isinstance(variations, dict) or len(variations) < 2:
+            return {}
+        return variations
+
     def __repr__(self):
         return "<AssetRecord %s %s/%s>" % (self.type, self.category, self.name)
 
@@ -96,7 +107,8 @@ _norm = norm_path
 
 
 def _version_dict(asset_dir, v):
-    """One version_list entry: absolute file paths, plus the material bundle when there is one."""
+    """One version_list entry: absolute file paths, plus the material bundle and the
+    variation sets when there are any."""
     entry = {"version": v["version"], "created": v.get("created", ""),
              "author": v.get("author", ""), "note": v.get("note", ""),
              "files": {k: schema.resolve(asset_dir, p)
@@ -109,6 +121,11 @@ def _version_dict(asset_dir, v):
             "textures": [schema.resolve(asset_dir, p)
                          for p in materials.get("textures") or []],
         }
+    variations = v.get("variations")
+    if isinstance(variations, dict) and len(variations) >= 2:
+        entry["variations"] = {
+            var: {k: schema.resolve(asset_dir, p) for k, p in files.items()}
+            for var, files in variations.items() if isinstance(files, dict)}
     return entry
 
 
@@ -150,6 +167,12 @@ def _broken_record(asset_dir, root, category, folder_type, mtime, error):
 def _refresh_dynamic(rec):
     """File-existence data that can change without the sidecar changing."""
     rec.missing = sorted(k for k, p in rec.files.items() if not os.path.exists(p))
+    if rec.type in ("image", "hdri") and rec.thumb and not os.path.exists(rec.thumb):
+        source = rec.files.get(rec.type)    # no thumbnail file: an image previews itself
+        if not source:
+            source = next((p for p in rec.files.values() if schema.is_image(p)), None)
+        if source:
+            rec.thumb, rec.thumb_method = source, "image"
     try:
         rec.thumb_mtime = os.path.getmtime(rec.thumb) if rec.thumb else None
     except OSError:

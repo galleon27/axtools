@@ -4,7 +4,7 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import schema
+from .. import schema, thumbnails, variants
 from ..schema import RENDERABLE_TYPES
 
 Qt = QtCore.Qt
@@ -45,7 +45,12 @@ class Preview(QtWidgets.QLabel):
     def set_image(self, path):
         self._pix = None
         if path and os.path.isfile(path):
-            pix = QtGui.QPixmap(path)
+            readable = path
+            try:
+                readable = thumbnails.preview_path(path)   # a cached JPG for EXR/HDR/RAT
+            except (thumbnails.ThumbnailError, OSError):
+                readable = None
+            pix = QtGui.QPixmap(readable) if readable else QtGui.QPixmap()
             self._pix = pix if not pix.isNull() else None
         self._update()
 
@@ -355,6 +360,10 @@ class DetailsPane(QtWidgets.QWidget):
             row("Channels", html.escape(", ".join(sorted(rec.files))))
         else:
             row("Formats", html.escape(", ".join(sorted(rec.files))))
+        variations = rec.variations_for() if rec.type == "geometry" else {}
+        if variations:
+            names = sorted(variations, key=variants.variation_order)
+            row("Variations", "%d: %s" % (len(names), html.escape(", ".join(names))))
         res = info.get("resolution")
         if isinstance(res, list) and len(res) == 2:
             row("Resolution", "%d x %d" % tuple(res))

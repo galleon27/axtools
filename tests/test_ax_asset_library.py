@@ -180,6 +180,10 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(by_name["Sunset"].category, "")
         self.assertIsNotNone(by_name["Boulder"].thumb_mtime)
         self.assertIsNone(by_name["Oak_A"].thumb_mtime)
+        # A missing thumb.jpg: an HDRI/image previews its own file.
+        self.assertTrue(by_name["Sunset"].thumb.endswith("sunset.exr"))
+        self.assertEqual(by_name["Sunset"].thumb_method, "image")
+        self.assertIsNotNone(by_name["Sunset"].thumb_mtime)
         self.assertEqual(by_name["Oak_A"].primary_key(prefs.GEO_FORMAT_ORDER), "usd")
         self.assertTrue(os.path.isabs(by_name["Oak_A"].primary_file(["abc"])))
         self.assertTrue(os.path.exists(library.index_path(self.cache, self.root)))
@@ -291,6 +295,8 @@ class VariantsTests(unittest.TestCase):
         self.assertEqual(variants.pick_lod([0, 1, 3], 5), 3)
         self.assertEqual(variants.pick_lod([2, 3], 0), 2)
         self.assertEqual(variants.lod_label(-1), "Full")
+        self.assertEqual(sorted(["Var10", "Var2", "Var1"], key=variants.variation_order),
+                         ["Var1", "Var2", "Var10"])
 
     def test_resolution_sets_and_pick(self):
         with tempfile.TemporaryDirectory() as d:
@@ -650,11 +656,15 @@ class MegascansTests(unittest.TestCase):
 
         plant = megascans.plan(by["xefmcgrqx"])
         names = [(k, n) for k, n, _f, _i, _e in plant]
-        self.assertEqual(names, [("geometry", "Small_Balsam_xefmcgrqx_Var1"),
-                                 ("geometry", "Small_Balsam_xefmcgrqx_Var2"),
+        self.assertEqual(names, [("geometry", "Small_Balsam_xefmcgrqx"),
                                  ("material", "Small_Balsam_xefmcgrqx")])
-        self.assertEqual(plant[0][3]["megascans_size_m"], 0.26)
-        self.assertNotIn("Billboard", plant[2][2]["basecolor"])  # atlas, not billboard
+        geo_files, geo_info = plant[0][2], plant[0][3]
+        self.assertEqual(sorted(geo_files), ["fbx"])              # Var1 at its most detailed LOD
+        self.assertTrue(geo_files["fbx"].endswith("Var1_LOD0.fbx"))
+        self.assertEqual(sorted(geo_info["variations"]), ["Var1", "Var2"])
+        self.assertTrue(geo_info["variations"]["Var2"]["fbx"].endswith("Var2_LOD0.fbx"))
+        self.assertEqual(geo_info["megascans_size_m"], 0.26)
+        self.assertNotIn("Billboard", plant[1][2]["basecolor"])  # atlas, not billboard
         self.assertEqual(megascans.plan(by["xyzbrush"]), [])
 
     def test_cache_entry_usable_while_rebuilding(self):
@@ -757,7 +767,7 @@ class MegascansTests(unittest.TestCase):
         recs, _ = library.scan_roots([(self.dl, "megascans")],
                                      os.path.join(self.tmp.name, "cache"))
         counts = library.tree_counts(library.browsable(recs))
-        self.assertEqual(counts[(self.dl, None, "3D Plants")], 2)   # two plant variations
+        self.assertEqual(counts[(self.dl, None, "3D Plants")], 1)   # all variations, one record
         self.assertIn("Surfaces/rock/cliff", library.categories(recs, self.dl, None))
 
     def test_linked_material_records(self):
@@ -869,12 +879,28 @@ class MegascansTests(unittest.TestCase):
         self.assertTrue(megascans.looks_like_download(self._downloader_layout()))
         self.assertTrue(megascans.looks_like_download(self.tmp.name))   # holds "Downloaded"
 
+    def test_plant_variations_in_one_record(self):
+        cache = os.path.join(self.tmp.name, "cache")
+        recs, errors = library.scan_roots([(self.dl, "megascans")], cache)
+        self.assertFalse(errors, errors)
+        geo = next(r for r in recs if r.type == "geometry" and "Small_Balsam" in r.name)
+        self.assertEqual(geo.id, "megascans:xefmcgrqx:geometry")
+        self.assertTrue(geo.files["fbx"].endswith("Var1_LOD0.fbx"))
+        self.assertEqual(sorted(geo.variations_for()), ["Var1", "Var2"])
+        self.assertTrue(geo.variations_for()["Var2"]["fbx"].endswith("Var2_LOD0.fbx"))
+        self.assertEqual(next(r for r in recs if r.type == "material").variations_for(), {})
+        # The scan cache keeps the variation set (info["variations"] -> version entry).
+        for again in (library.scan_roots([(self.dl, "megascans")], cache)[0],
+                      library.records_from_index(cache, self.dl, "megascans")):
+            rec = next(r for r in again if r.id == geo.id)
+            self.assertEqual(sorted(rec.variations_for()), ["Var1", "Var2"])
+
     def test_nested_folder_change_rescans_asset(self):
         cache = os.path.join(self.tmp.name, "cache")
         plant = os.path.join(self.dl, "3dplant", "plant_xefmcgrqx")
         names = lambda recs: sorted(r.name for r in recs if "Small_Balsam" in r.name)
         recs, _ = library.scan_roots([(self.dl, "megascans")], cache)
-        self.assertEqual(len(names(recs)), 3)
+        self.assertEqual(len(names(recs)), 2)            # one geometry (Var1..N) + atlas material
         # Files added inside Var2/ (an existing folder) don't change the asset folder's mtime.
         var3 = os.path.join(plant, "Var2", "Var2_LOD0.abc")
         st = os.stat(plant).st_mtime
@@ -882,8 +908,10 @@ class MegascansTests(unittest.TestCase):
         os.utime(os.path.join(plant, "Var2"), (st + 10, st + 10))
         os.utime(plant, (st, st))
         recs, _ = library.scan_roots([(self.dl, "megascans")], cache)
-        var2 = next(r for r in recs if r.name.endswith("_Var2"))
-        self.assertIn("abc", var2.files)
+        geo = next(r for r in recs if r.type == "geometry" and "Small_Balsam" in r.name)
+        var2 = geo.variations_for(1)["Var2"]
+        self.assertIn("abc", var2)
+        self.assertTrue(var2["abc"].endswith("Var2_LOD0.abc"))
 
     def test_same_asset_in_two_roots_listed_once(self):
         cache = os.path.join(self.tmp.name, "cache")
@@ -1431,6 +1459,43 @@ class PrefsTests(unittest.TestCase):
             p = prefs.Prefs(path)
             self.assertEqual(p.get("thumb_size"), prefs.DEFAULTS["thumb_size"])
             self.assertEqual(p.get("sort"), "added")
+
+
+class ResourcesTests(unittest.TestCase):
+    def test_fmt_bytes(self):
+        from ax_asset_library import resources
+        self.assertEqual(resources.fmt_bytes(512), "512 B")
+        self.assertEqual(resources.fmt_bytes(1536), "1.5 KB")
+        self.assertEqual(resources.fmt_bytes(5 * 1024 ** 2), "5.0 MB")
+
+    def test_disk_usage_and_clear_index(self):
+        from ax_asset_library import resources
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel, size in (("index_a.json", 10), ("index_b.json", 5),
+                              ("megascans_thumbs/x.jpg", 7), ("previews/y.jpg", 3),
+                              ("prefs.json", 99)):
+                path = os.path.join(tmp, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b"x" * size)
+            usage = resources.disk_usage(tmp)
+            self.assertEqual(usage["scan index"], (2, 15))
+            self.assertEqual(usage["rendered thumbnails"], (1, 7))
+            self.assertEqual(usage["image previews"], (1, 3))
+            lines = resources.report_lines(tmp, {"images": 2, "image_bytes": 2048,
+                                                 "pixmaps": 1, "pixmap_bytes": 1024,
+                                                 "limit": 1 << 30, "pending": 0,
+                                                 "hits": 3, "misses": 1}, records=4)
+            self.assertTrue(any(l.startswith("Records") and l.endswith("4") for l in lines))
+            self.assertTrue(any("= 75%" in l for l in lines))
+            resources.clear_index(tmp)
+            self.assertEqual(resources.disk_usage(tmp)["scan index"], (0, 0))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "prefs.json")))
+
+    def test_process_memory_is_a_number_or_none(self):
+        from ax_asset_library import resources
+        mem = resources.process_memory()
+        self.assertTrue(mem is None or mem > 1024 * 1024)
 
 
 if __name__ == "__main__":

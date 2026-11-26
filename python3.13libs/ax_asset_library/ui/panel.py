@@ -7,7 +7,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import (importers, library, manage, materials, megascans, prefs as _prefs, publish,
                scene, schema, thumbnails, variants)
-from . import details, dialogs, grid
+from . import console, details, dialogs, grid
 
 Qt = QtCore.Qt
 ScopeRole = Qt.ItemDataRole.UserRole + 10
@@ -350,10 +350,23 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self.splitter.setStretchFactor(2, 0)
         root.addWidget(self.splitter, 1)
 
+        self.console = console.ResourceConsole(lambda: len(self.records))
+        self.console.setVisible(False)
+        root.addWidget(self.console)
+
+        status_row = QtWidgets.QHBoxLayout()
         self.status = QtWidgets.QLabel()
         self.status.setContentsMargins(6, 2, 6, 3)
         self.status.setStyleSheet("color: #9aa0a8;")
-        root.addWidget(self.status)
+        status_row.addWidget(self.status, 1)
+        self.btn_console = QtWidgets.QToolButton()
+        self.btn_console.setText("Resources")
+        self.btn_console.setCheckable(True)
+        self.btn_console.setAutoRaise(True)
+        self.btn_console.setToolTip("Show memory use and cache sizes of the asset browser.")
+        self.btn_console.toggled.connect(self.console.setVisible)
+        status_row.addWidget(self.btn_console)
+        root.addLayout(status_row)
 
         for keys, fn in (("Ctrl+F", self.search.setFocus), ("F5", self.rescan)):
             sc = QtGui.QShortcut(QtGui.QKeySequence(keys), self)
@@ -449,6 +462,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         full = bool(QtWidgets.QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
         if full:
             grid.clear_cache()
+            thumbnails.clear_preview_cache()
         self.rescan(use_cache=not full)
 
     def _on_scan_finished(self, generation, records, errors):
@@ -913,6 +927,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             for rec in recs:
                 if rec.type == "geometry":
                     lods.update(variants.lod_files(rec.files))
+                    for files in rec.variations_for().values():   # ranks any variation has
+                        lods.update(variants.lod_files(files))
                     mrec = variants.linked_material(rec, self.records)
                     if mrec is not None:
                         resolutions.update(variants.resolution_sets(mrec.files_for(mrec.current)))

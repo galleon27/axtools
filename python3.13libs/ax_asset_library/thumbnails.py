@@ -5,6 +5,7 @@ Qt reads the common 8-bit formats directly. EXR, HDR and RAT go through Houdini'
 `iconvert` first (no tone mapping yet, so bright HDRIs can look clipped).
 """
 import collections
+import hashlib
 import os
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ import time
 
 from PySide6 import QtCore, QtGui
 
-from . import karma, schema
+from . import karma, prefs, schema
 
 THUMB_SIZE = 512
 _CREATE_NO_WINDOW = 0x08000000  # keep a console from flashing up on Windows
@@ -97,6 +98,59 @@ def make_thumbnail(src, dst, size=THUMB_SIZE):
     if not img.save(tmp, "JPG", 90):
         raise ThumbnailError("Could not write %s." % dst)
     os.replace(tmp, dst)
+    return dst
+
+
+# --- previews for files Qt can't read ------------------------------------------------------
+_PREVIEWS = {}    # source path -> cached JPG written for it
+_FAILED = {}      # source path -> mtime of a file that failed to convert
+
+
+def preview_cache_dir():
+    return os.path.join(prefs.cache_dir(), "previews")
+
+
+def clear_preview_cache():
+    """Forget and delete the JPGs made for EXR/HDR/RAT previews."""
+    _PREVIEWS.clear()
+    _FAILED.clear()
+    shutil.rmtree(preview_cache_dir(), ignore_errors=True)
+
+
+def preview_path(path):
+    """A file Qt can show for `path`: `path` itself for 8-bit images, else a cached JPG.
+
+    The JPG is written with iconvert into the prefs cache dir; its name follows the file's
+    mtime, so a replaced file never shows the old preview. Raises ThumbnailError when the
+    conversion fails (the grid then shows the type letter).
+    """
+    if not path or schema.file_ext(path) in schema.QT_IMAGE_EXTS:
+        return path
+    cached = _PREVIEWS.get(path)
+    if cached and os.path.isfile(cached):
+        return cached
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return path
+    if _FAILED.get(path) == stamp:   # same broken file: no second iconvert call
+        raise ThumbnailError("Can't read %s." % path)
+    key = "%s|%.6f" % (os.path.normcase(path), stamp)
+    dst = os.path.join(preview_cache_dir(),
+                       hashlib.sha1(key.encode("utf-8")).hexdigest()[:16] + ".jpg")
+    if not os.path.isfile(dst):
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            make_thumbnail(path, dst)
+        except (ThumbnailError, OSError):
+            _FAILED[path] = stamp
+            raise
+    if cached and cached != dst:      # the file changed: drop the old preview
+        try:
+            os.remove(cached)
+        except OSError:
+            pass
+    _PREVIEWS[path] = dst
     return dst
 
 

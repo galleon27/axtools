@@ -44,6 +44,14 @@ def node_version(node):
         return 0
 
 
+def node_variation(node):
+    """The plant variation a node loads ('Var2'), or "" for nodes without one."""
+    try:
+        return node.userData(importers.UD_VARIATION) or ""
+    except (hou.ObjectWasDeleted, hou.Error):
+        return ""
+
+
 class Usage:
     """How one asset is used in the scene."""
 
@@ -103,9 +111,16 @@ def _same_resolution(files, current, cache):
     return sets.get(pick, files)
 
 
-def _geometry_value(rec, settings, version, current):
-    """Parm value for a geometry loader, keeping the format the node loads now if possible."""
-    files = _same_lod(rec.files_for(version), current)
+def _geometry_value(rec, settings, version, current, variation=None):
+    """Parm value for a geometry loader, keeping the format the node loads now if possible.
+
+    A node the importers tagged with a variation (one plant variation) loads that
+    variation's files.
+    """
+    files = rec.files_for(version)
+    if variation:
+        files = rec.variations_for(version).get(variation) or files
+    files = _same_lod(files, current)
     key = schema.format_key(current) if current else None
     if key in files:
         return importers.to_parm(rec, settings, files[key])
@@ -130,6 +145,7 @@ def _update_node(node, rec, settings, version, warnings):
     the node can't use that version (a warning says why) and must keep its version tag.
     """
     changed = False
+    variation = node_variation(node)
     for name in FILE_PARMS:
         parm = node.parm(name)
         if parm is None:
@@ -139,7 +155,7 @@ def _update_node(node, rec, settings, version, warnings):
             files = rec.files_for(version)
             value = importers.to_parm(rec, settings, files["hdri"]) if "hdri" in files else None
         else:
-            value = _geometry_value(rec, settings, version, current)
+            value = _geometry_value(rec, settings, version, current, variation)
         if value is None:
             warnings.append("%s: %s has no file in %s." % (node.path(), rec.name,
                                                              schema.version_label(version)))
@@ -208,7 +224,10 @@ def update_nodes(rec, nodes, settings, version=None):
             node.setUserData(importers.UD_VERSION, str(use))
             root = settings.root_for(rec.root)
             node.setUserData(importers.UD_ROOT, root["path"] if root else rec.root)
-            node.setComment("%s %s" % (rec.name, schema.version_label(use)))
+            variation = node_variation(node)
+            node.setComment("%s %s (%s)" % (rec.name, variation, schema.version_label(use))
+                            if variation else
+                            "%s %s" % (rec.name, schema.version_label(use)))
     return changed, warnings
 
 
