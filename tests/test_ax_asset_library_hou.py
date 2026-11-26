@@ -15,7 +15,7 @@ except ImportError:
 
 if hou is not None:
     from ax_asset_library import (importers, library, materials, prefs, publish,  # noqa: E402
-                                  schema)
+                                  schema, variants)
 
 _QT_APP = None
 
@@ -208,6 +208,14 @@ class ImportContextTests(unittest.TestCase):
 
 
 @unittest.skipIf(hou is None, "needs hython")
+def report_info(plan):
+    """Union of the info dicts of a plan's items."""
+    out = {}
+    for item in plan.items:
+        out.update(item.info)
+    return out
+
+
 class ImportFeatureTests(unittest.TestCase):
     """Models with material/LOD/resolution, atlas tracing, texture nodes, root variables."""
 
@@ -254,6 +262,162 @@ class ImportFeatureTests(unittest.TestCase):
         self.assertEqual(set(publish._thumb_maps(files)), {"basecolor", "normal", "roughness"})
         # The material is hidden from browsing but stays linked for imports.
         self.assertEqual([r.type for r in library.browsable(self.records)], ["geometry"])
+
+    def test_publish_and_import_materials_bundle(self):
+        from ax_asset_library import material_bundle
+        tex_dir = os.path.join(self.tmp.name, "bundle_tex")
+        os.makedirs(tex_dir)
+        png = os.path.join(tex_dir, "wood_basecolor.png")
+        write_png(png)
+
+        hou.hipFile.clear(suppress_save_prompt=True)
+        shader = hou.node("/mat").createNode("principledshader::2.0", "woodmat")
+        shader.parm("basecolor_texture").set(png)
+        src = hou.node("/obj").createNode("geo", "bundle_src")
+        box = src.createNode("box", "box1")
+        assign = src.createNode("material", "assign")
+        assign.parm("num_materials").set(1)
+        assign.parm("shop_materialpath1").set(assign.relativePathTo(shader))
+        assign.setInput(0, box)
+
+        root_dir = os.path.join(self.tmp.name, "bundle_lib")
+        os.makedirs(root_dir)
+        self.settings.set("roots", [{"path": root_dir, "read_only": False}], save=False)
+        root = self.settings.roots()[0]
+        result = publish.publish_node(assign, root, "BundleRock", formats=(),
+                                      materials=True, thumbnail_image=None)
+        self.assertFalse(result.warnings, result.warnings)
+        vdir = os.path.join(result.asset_dir, "v001")
+        self.assertTrue(os.path.isfile(os.path.join(vdir, material_bundle.BUNDLE_FILE)))
+        self.assertTrue(os.path.isfile(os.path.join(vdir, material_bundle.TEXTURE_DIR,
+                                                    "wood_basecolor.png")))
+        data = schema.load(os.path.join(result.asset_dir, schema.SIDECAR))
+        self.assertEqual(data["versions"][0]["materials"]["names"], ["woodmat"])
+
+        record, = library.scan_roots([root_dir], os.path.join(self.tmp.name, "cache_bundle"),
+                                     use_cache=False)[0]
+        self.assertIn("materials", record.version(1))
+        dst = hou.node("/obj").createNode("geo", "bundle_dst")
+        nodes, warnings = importers.import_records([record], self.settings,
+                                                   target=(None, dst))
+        self.assertFalse(warnings, warnings)
+        mnode = nodes[-1]
+        self.assertEqual(mnode.type().name(), "material")
+        subnet = dst.node("materials").node("BundleRock_materials")
+        self.assertIsNotNone(subnet)
+        loaded = subnet.node("woodmat")
+        self.assertIsNotNone(loaded)
+        texture = loaded.parm("basecolor_texture")
+        self.assertNotIn(material_bundle.PLACEHOLDER, texture.unexpandedString())
+        self.assertTrue(os.path.normcase(os.path.abspath(texture.eval())).startswith(
+            os.path.normcase(os.path.abspath(result.asset_dir))))
+        self.assertEqual(mnode.parm("group1").eval(), '@shop_materialpath="woodmat"')
+        mnode.cook(force=True)
+        values = mnode.geometry().primStringAttribValues("shop_materialpath")
+        self.assertEqual(len(values), 6)                      # every box prim
+        self.assertEqual(set(values), {loaded.path()})
+
+    def _publish_bundle_src(self, name, set_detail=False):
+        """Publish a box assigned to a Principled Shader that uses one texture twice."""
+        tex_dir = os.path.join(self.tmp.name, name + "_tex")
+        os.makedirs(tex_dir)
+        png = os.path.join(tex_dir, "wood_basecolor.png")
+        write_png(png)
+        hou.hipFile.clear(suppress_save_prompt=True)
+        shader = hou.node("/mat").createNode("principledshader::2.0", "woodmat")
+        shader.parm("basecolor_texture").set(png)
+        shader.parm("rough_texture").set(png)
+        src = hou.node("/obj").createNode("geo", name + "_src")
+        box = src.createNode("box", "box1")
+        if set_detail:
+            last = src.createNode("attribwrangle", "detail_assign")
+            last.parm("class").set(0)
+            last.parm("snippet").set('s@shop_materialpath = "%s";' % shader.path())
+            last.setInput(0, box)
+        else:
+            last = src.createNode("material", "assign")
+            last.parm("num_materials").set(1)
+            last.parm("shop_materialpath1").set(last.relativePathTo(shader))
+            last.setInput(0, box)
+        root_dir = os.path.join(self.tmp.name, name + "_lib")
+        os.makedirs(root_dir)
+        self.settings.set("roots", [{"path": root_dir, "read_only": False}], save=False)
+        root = self.settings.roots()[0]
+        result = publish.publish_node(last, root, name, formats=(), materials=True,
+                                      thumbnail_image=None)
+        return result, root_dir
+
+    def test_bundle_copies_a_shared_texture_once(self):
+        result, _root_dir = self._publish_bundle_src("Shared")
+        tex = os.listdir(os.path.join(result.asset_dir, "v001", "textures"))
+        self.assertEqual(tex, ["wood_basecolor.png"])
+        data = schema.load(os.path.join(result.asset_dir, schema.SIDECAR))
+        self.assertEqual(data["versions"][0]["materials"]["textures"],
+                         ["v001/textures/wood_basecolor.png"])
+
+    def test_bundle_detail_material_assignment(self):
+        from ax_asset_library import material_bundle
+        result, root_dir = self._publish_bundle_src("DetailRock", set_detail=True)
+        self.assertFalse(result.warnings, result.warnings)
+        record, = library.scan_roots([root_dir], os.path.join(self.tmp.name, "cache_detail"),
+                                     use_cache=False)[0]
+        dst = hou.node("/obj").createNode("geo", "detail_dst")
+        nodes, _warnings = importers.import_records([record], self.settings, target=(None, dst))
+        mnode = nodes[-1]
+        mnode.cook(force=True)
+        values = mnode.geometry().primStringAttribValues(material_bundle.MATERIAL_ATTR)
+        self.assertEqual(len(values), 6)
+        self.assertTrue(all(v.endswith("woodmat") for v in values), values)
+
+    def test_publish_without_materials_has_no_warning(self):
+        hou.hipFile.clear(suppress_save_prompt=True)
+        src = hou.node("/obj").createNode("geo", "plain_src")
+        box = src.createNode("box", "box1")
+        root_dir = os.path.join(self.tmp.name, "plain_lib")
+        os.makedirs(root_dir)
+        self.settings.set("roots", [{"path": root_dir, "read_only": False}], save=False)
+        result = publish.publish_node(box, self.settings.roots()[0], "PlainBox", formats=(),
+                                      materials=True, thumbnail_image=None)
+        self.assertEqual(result.warnings, [])
+
+    def test_add_watch_folder_component_to_library(self):
+        watch_root = os.path.join(self.tmp.name, "watch")
+        chair = os.path.join(watch_root, "cat", "Chair")
+        os.makedirs(os.path.join(chair, "maps"))
+        for name in ("Chair.usd", "geo.usd", "mtl.usd",
+                     "maps/Chair_basecolor.png", "maps/Chair_roughness.png"):
+            open(os.path.join(chair, *name.split("/")), "w").close()
+        records, errors = library.scan_roots(
+            [(watch_root, "folder")], os.path.join(self.tmp.name, "cache2"), use_cache=False)
+        self.assertFalse(errors, errors)
+        geo = next(r for r in records if r.type == "geometry")
+        self.assertEqual(geo.source_kind, "folder")
+
+        root_dir = os.path.join(self.tmp.name, "lib2")
+        os.makedirs(root_dir)
+        root = {"path": root_dir, "expanded": root_dir, "read_only": False, "var": "",
+                "kind": "library", "megascans": False}
+        plan = publish.plan_from_records([geo], records)
+        self.assertEqual(sorted(i.type for i in plan.items), ["geometry", "material"])
+        report = publish.ingest(plan, root, copy=True, read_info=False)
+        self.assertFalse(report.failed, report.failed)
+        self.assertEqual(len(report.created), 2)
+        gdir = os.path.join(root_dir, "geometry", "cat", "Chair", "v001")
+        self.assertTrue(os.path.isfile(os.path.join(gdir, "geo.usd")))       # sublayer copied
+        self.assertTrue(os.path.isfile(os.path.join(gdir, "maps",
+                                                    "Chair_basecolor.png")))
+        lib_records, errors = library.scan_roots(
+            [root_dir], os.path.join(self.tmp.name, "cache3"), use_cache=False)
+        self.assertFalse(errors, errors)
+        geos = [r for r in lib_records if r.type == "geometry"]
+        self.assertEqual(len(geos), 1)
+        self.assertIsNotNone(variants.linked_material(geos[0], lib_records))
+        # The library copy keeps source.kind "folder" but is not browsed in place: it must not
+        # be offered for "Add to library" again.
+        self.assertEqual(geos[0].source_kind, "folder")
+        self.assertFalse(library.browsed_in_place(geos[0]))
+        self.assertEqual(publish.plan_from_records(geos, lib_records).items, [])
+        self.assertNotIn("component_dir", report_info(plan))
 
     def test_model_with_material_sop(self):
         geo = hou.node("/obj").createNode("geo", "geo1")

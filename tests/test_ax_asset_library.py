@@ -13,8 +13,8 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "python3.13libs"))
 
-from ax_asset_library import (gsg, karma, library, manage, megascans, prefs,  # noqa: E402
-                              schema, textures, variants)
+from ax_asset_library import (folders, gsg, karma, library, manage, megascans,  # noqa: E402
+                              prefs, schema, textures, variants)
 
 
 def make_gsg_library(root):
@@ -1017,6 +1017,133 @@ class GsgTests(unittest.TestCase):
         self.assertEqual([r.id for r in recs].count("gsg:HC006_A003:hdri"), 1)
 
 
+class FoldersTests(unittest.TestCase):
+    """Watch folders: folders with no metadata file, recognized from their file names."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "watch")
+
+        def files(rel, names):
+            d = os.path.join(self.root, *rel.split("/"))
+            os.makedirs(d, exist_ok=True)
+            for n in names:
+                p = os.path.join(d, n)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "w").close()
+            return d
+
+        self.chair = files("cat/Chair", ["Chair.usd", "geo.usd", "mtl.usd", "thumbnail.png",
+                                         "maps/Chair_basecolor.png", "maps/Chair_roughness.png"])
+        self.props = files("props", ["Rock.abc", "Rock.bgeo.sc", "Rock_preview.jpg", "Pot.fbx"])
+        self.tex = files("tex", ["Brick_basecolor.jpg", "Brick_roughness.jpg",
+                                 "Brick_normal.jpg"])
+        self.lamp = files("a/b/Lamp", ["Lamp.usdc"])
+        self.mixed = files("mixed", ["Tree.abc"])
+        files("mixed/sub", ["Bush.abc"])
+
+        self.records, self.entries, self.errors = folders.scan_root(self.root)
+        self.assertFalse(self.errors, self.errors)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _in(self, folder, asset_type=None):
+        return [r for r in self.records if os.path.normcase(r.asset_dir)
+                == os.path.normcase(folder) and (asset_type is None or r.type == asset_type)]
+
+    def _write(self, root, rels):
+        for rel in rels:
+            path = os.path.join(root, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").close()
+
+    def test_unrelated_texture_set_stays_standalone(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(d, ["props/Rock.abc", "props/Pot.fbx", "props/Brick_basecolor.jpg",
+                            "props/Brick_roughness.jpg"])
+            recs, _entries, errors = folders.scan_root(d)
+            self.assertFalse(errors, errors)
+            shown = library.browsable(recs)
+            self.assertEqual(sorted((r.type, r.name) for r in shown),
+                             [("geometry", "Pot"), ("geometry", "Rock"),
+                              ("material", "Brick")])
+            rock = next(r for r in recs if r.name == "Rock")
+            self.assertIsNone(variants.linked_material(rock, recs))
+
+    def test_texture_set_named_like_model_is_linked(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(d, ["m/Chair.fbx", "m/Chair_basecolor.jpg", "m/Chair_roughness.jpg",
+                            "m/Lamp.fbx"])
+            recs, _entries, _errors = folders.scan_root(d)
+            self.assertEqual([r.name for r in library.browsable(recs)], ["Chair", "Lamp"])
+            chair = next(r for r in recs if r.name == "Chair")
+            self.assertEqual(variants.linked_material(chair, recs).name, "Chair")
+
+    def test_files_in_the_root_itself(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(d, ["a.abc"])
+            recs, entries, _e = folders.scan_root(d)
+            self.assertEqual([r.name for r in recs], ["a"])
+            self.assertEqual(recs[0].category, "")
+            self._write(d, ["sub/b.abc"])
+            stamp = os.stat(d).st_mtime + 5              # file system clocks can be coarse
+            os.utime(d, (stamp, stamp))
+            recs, _entries, _e = folders.scan_root(d, entries)    # root entry is stale now
+            self.assertEqual(sorted(r.name for r in recs), ["a", "b"])
+            _r2, e2, _ = folders.scan_root(d)
+            recs, _e3, _ = folders.scan_root(d, e2)                  # all from the cache
+            self.assertEqual(sorted(r.name for r in recs), ["a", "b"])
+
+    def test_usd_component_with_model_textures(self):
+        listing = self._in(self.chair)
+        self.assertEqual([r.type for r in library.browsable(listing)], ["geometry"])
+        geo, = self._in(self.chair, "geometry")
+        self.assertEqual(geo.category, "cat")
+        self.assertEqual(sorted(geo.files), ["usd"])
+        self.assertEqual((geo.info.get("component_dir") or "").lower(), self.chair.lower())
+        self.assertEqual(os.path.basename(geo.thumb), "thumbnail.png")
+        hidden = library.companion_keys(listing)
+        mat, = self._in(self.chair, "material")
+        self.assertIn(mat.key, hidden)
+        self.assertIn("basecolor", mat.info["channels"])
+        self.assertIs(variants.linked_material(geo, listing), mat)
+
+    def test_geometry_groups_and_previews(self):
+        geos = self._in(self.props, "geometry")
+        self.assertEqual(sorted(r.name for r in geos), ["Pot", "Rock"])
+        rock = next(r for r in geos if r.name == "Rock")
+        pot = next(r for r in geos if r.name == "Pot")
+        self.assertEqual(sorted(rock.files), ["abc", "bgeo.sc"])
+        self.assertEqual(os.path.basename(rock.thumb), "Rock_preview.jpg")
+        self.assertNotEqual(rock.id, pot.id)
+        self.assertEqual(self._in(self.props, "material"), [])
+
+    def test_texture_folder(self):
+        mat, = self._in(self.tex, "material")
+        self.assertEqual(mat.name, "Brick")
+        self.assertEqual(sorted(mat.info["channels"]), ["basecolor", "normal", "roughness"])
+
+    def test_component_category(self):
+        geo, = self._in(self.lamp, "geometry")
+        self.assertEqual(geo.category, "a/b")
+
+    def test_descends_into_subfolders(self):
+        names = {r.name for r in self.records}
+        self.assertTrue({"Tree", "Bush"} <= names)
+
+    def test_second_scan_reuses_entries(self):
+        again, _entries, errors = folders.scan_root(self.root, self.entries)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(r.key for r in again), sorted(r.key for r in self.records))
+
+    def test_detection(self):
+        self.assertTrue(folders.looks_like_library(self.root))
+        lib = os.path.join(self.tmp.name, "lib")
+        make_asset(lib, "geometry", "rocks", "Boulder")
+        self.assertFalse(folders.looks_like_library(lib))
+
+
 class ManageTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1132,6 +1259,56 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(self.names("http:x"), [])  # unknown field = plain word
         self.assertEqual(self.names("BIG boulder"), ["Big Boulder"])
 
+    def test_asset_meta_tags(self):
+        scanned = {"tool": "x"}
+        rec = library.AssetRecord(id="folder:rock:geometry", name="Rock",
+                                  source_kind="folder", tags=["scanned"],
+                                  description="from disk", info=scanned)
+        meta = {"folder:rock:geometry": {"tags": ["pool"], "description": ""}}
+        library.apply_meta([rec], meta)
+        self.assertEqual(rec.tags, ["pool"])               # the entry replaces scanned tags
+        self.assertEqual(rec.description, "")              # a cleared description stays cleared
+        self.assertTrue(library.Query("tag:pool").matches(rec))
+        self.assertEqual(scanned, {"tool": "x"})            # the scan thread's dict is untouched
+        library.apply_meta([rec], {"folder:rock:geometry": {"tags": ["scanned", "pool"],
+                                                           "description": "wet"}})
+        self.assertEqual(rec.tags, ["scanned", "pool"])
+        self.assertEqual(rec.description, "wet")
+        library.apply_meta([rec], {"folder:rock:geometry": {"tags": [], "description": ""}})
+        self.assertEqual(rec.tags, [])                      # scanned tag removed
+        library.apply_meta([rec], {})
+        self.assertEqual(rec.tags, ["scanned"])             # no entry: scanned values again
+        self.assertEqual(rec.description, "from disk")
+        self.assertFalse(library.Query("tag:pool").matches(rec))
+
+    def test_apply_meta_skips_library_assets(self):
+        rec = library.AssetRecord(id="6f1c-uuid", name="Rock", source_kind="megascans",
+                                  tags=["a"], info={})
+        library.apply_meta([rec], {"6f1c-uuid": {"tags": ["x"], "description": ""}})
+        self.assertEqual(rec.tags, ["a"])
+        self.assertNotIn("base_tags", rec.info)
+
+    def test_root_and_kind_fields(self):
+        recs = [library.AssetRecord(id="megascans:a:geometry", name="A",
+                                    root="D:/libs/MegaScanLib", source_kind="megascans"),
+                library.AssetRecord(id="uuid-b", name="B", root="D:/libs/MyAssets",
+                                    source_kind=""),
+                library.AssetRecord(id="folder:c:geometry", name="C",
+                                    root="D:/libs/WatchProj", source_kind="folder"),
+                # ingested from Megascans into a library: a library asset
+                library.AssetRecord(id="uuid-d", name="D", root="D:/libs/MyAssets",
+                                    source_kind="megascans")]
+
+        def names(text):
+            q = library.Query(text)
+            return [r.name for r in recs if q.matches(r)]
+
+        self.assertEqual(names("root:scan"), ["A"])
+        self.assertEqual(names("kind:folder"), ["C"])
+        self.assertEqual(names("kind:library"), ["B", "D"])
+        self.assertEqual(names("kind:megascans"), ["A"])
+        self.assertEqual(names("kind:gsg"), [])
+
 
 class LabelTests(unittest.TestCase):
     def test_set_and_clear(self):
@@ -1161,6 +1338,46 @@ class LabelTests(unittest.TestCase):
 
 
 class PrefsTests(unittest.TestCase):
+    def test_asset_meta(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.json")
+            s = prefs.Prefs(path)
+            prefs.set_asset_meta(s, "folder:rock:geometry", ["Pool", "pool", " "], " wet rock ")
+            self.assertEqual(prefs.asset_meta(s),
+                             {"folder:rock:geometry": {"tags": ["pool"],
+                                                       "description": "wet rock"}})
+            prefs.set_asset_meta(s, "folder:rock:geometry", [], "")   # cleared: an override
+            self.assertEqual(prefs.asset_meta(prefs.Prefs(path)),
+                             {"folder:rock:geometry": {"tags": [], "description": ""}})
+            prefs.set_asset_meta(s, "folder:rock:geometry", ["Scanned"], "",
+                                 base_tags=["scanned"], base_description="")
+            self.assertEqual(prefs.asset_meta(prefs.Prefs(path)), {})  # same as scanned
+
+    def test_smart_searches(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.json")
+            s = prefs.Prefs(path)
+            prefs.save_smart_search(s, "Trees", "cat:trees")
+            prefs.save_smart_search(s, "Rocks", "tag:rock")
+            self.assertEqual([x["name"] for x in prefs.smart_searches(s)], ["Trees", "Rocks"])
+            prefs.save_smart_search(s, "trees", "type:geo")      # same name: replaced
+            self.assertEqual(prefs.smart_searches(prefs.Prefs(path)),
+                             [{"name": "Rocks", "query": "tag:rock"},
+                              {"name": "trees", "query": "type:geo"}])
+            prefs.remove_smart_search(s, "ROCKS")
+            self.assertEqual(prefs.smart_searches(s),
+                             [{"name": "trees", "query": "type:geo"}])
+
+    def test_bad_asset_meta_entries_dropped(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.json")
+            with open(path, "w") as f:
+                json.dump({"asset_meta": {"good": {"tags": ["A"], "description": ""},
+                                          "empty": {"tags": []}, "bad": "x", "": {}}}, f)
+            self.assertEqual(prefs.asset_meta(prefs.Prefs(path)),
+                             {"good": {"tags": ["a"], "description": ""},
+                              "empty": {"tags": [], "description": ""}})
+
     def test_roots_and_parm_path(self):
         with tempfile.TemporaryDirectory() as d:
             os.environ[prefs.ENV_VAR] = d

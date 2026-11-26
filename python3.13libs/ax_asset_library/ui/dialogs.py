@@ -3,7 +3,8 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import gsg, karma, library, megascans, prefs as _prefs, publish, schema, variants
+from .. import (folders, gsg, karma, library, megascans, prefs as _prefs, publish, schema,
+                variants)
 
 Qt = QtCore.Qt
 
@@ -12,9 +13,10 @@ VENDOR_INGEST_NOTE = (
     "metadata files, and categories go under the one above. Their textures are large, so "
     "files stay where they are unless you tick Copy.")
 ROOT_TYPE_TIP = (
-    "Type: Library (folders with asset.json), Megascans (a Megascans download) or "
-    "Greyscalegorilla (a GSG library folder). Megascans and Greyscalegorilla roots are "
-    "browsed in place and read-only; thumbnails go to your prefs folder.")
+    "Type: Library (folders with asset.json), Megascans (a Megascans download), "
+    "Greyscalegorilla (a GSG library folder), or Folder (watch) for a plain folder of "
+    "models, USD components or textures. Vendor and watch-folder roots are browsed in "
+    "place; thumbnails go to your prefs folder.")
 
 
 class IngestDialog(QtWidgets.QDialog):
@@ -296,8 +298,9 @@ class SettingsDialog(QtWidgets.QDialog):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Library root")
         if d:
             kind = ("megascans" if megascans.looks_like_download(d)
-                    else "gsg" if gsg.looks_like_library(d) else "library")
-            var = {"megascans": "MEGASCANS", "gsg": "GSG"}.get(kind, "")
+                    else "gsg" if gsg.looks_like_library(d)
+                    else "folder" if folders.looks_like_library(d) else "library")
+            var = {"megascans": "MEGASCANS", "gsg": "GSG", "folder": "FOLDER"}.get(kind, "")
             used = {(self.table.item(r, 0).text() if self.table.item(r, 0) else "").strip().upper()
                     for r in range(self.table.rowCount())}
             base, n = var, 2
@@ -521,6 +524,12 @@ class PublishDialog(QtWidgets.QDialog):
         fmt_row.addStretch()
         form.addRow("Formats", fmt_row)
 
+        self.materials_check = QtWidgets.QCheckBox("Include materials")
+        self.materials_check.setChecked(settings.get("publish_materials"))
+        self.materials_check.setToolTip("Save the assigned materials and copy their textures "
+                                        "into the asset folder.")
+        form.addRow("", self.materials_check)
+
         self.center_check = QtWidgets.QCheckBox("Center on X and Z")
         self.center_check.setChecked(settings.get("publish_center"))
         self.center_check.setToolTip("Move the bounding box center to the origin on X and Z.")
@@ -650,6 +659,7 @@ class PublishDialog(QtWidgets.QDialog):
             "center": self.center_check.isChecked(),
             "ground": self.ground_check.isChecked(),
             "unpack": self.unpack_check.isChecked(),
+            "materials": self.materials_check.isChecked(),
             "thumbnail": thumb,
             "image": self.image_edit.text() if thumb == "image" else "",
         }

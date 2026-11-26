@@ -143,6 +143,7 @@ class AssetLibraryPanel(QtWidgets.QWidget):
     @records.setter
     def records(self, records):
         self._records = records
+        library.apply_meta(records, _prefs.asset_meta(self.settings))
         # What the sidebar and grid list: vendor materials of a 3D asset or plant are left out.
         self.shown_records = library.browsable(records)
 
@@ -208,6 +209,18 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             "'broken' finds assets with errors or missing files.")
         self.search.textChanged.connect(lambda _t: self._filter_timer.start())
         bar.addWidget(self.search, 1)
+
+        self.btn_save_search = QtWidgets.QToolButton()
+        self.btn_save_search.setText("Save search")
+        self.btn_save_search.setIcon(icon("BUTTONS_save"))
+        self.btn_save_search.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_save_search.setToolTip("Save this search in the sidebar.")
+        self.btn_save_search.setEnabled(False)
+        self.btn_save_search.clicked.connect(self._save_smart_search)
+        self.search.textChanged.connect(
+            lambda text: self.btn_save_search.setEnabled(bool(text.strip())))
+        bar.addWidget(self.btn_save_search)
 
         self.type_buttons = {}
         for t in schema.ASSET_TYPES:
@@ -407,12 +420,13 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         self._partial_shown = True
 
     def _guess_vendor(self, root):
-        """"megascans" or "gsg" when a library root looks like that vendor's folder."""
+        """"megascans", "gsg" or "folder" when a library root looks like one."""
         cache = self.__dict__.setdefault("_vendor_guess", {})
         if root not in cache:
-            from .. import gsg, megascans
+            from .. import folders, gsg, megascans
             cache[root] = ("megascans" if megascans.looks_like_download(root)
-                           else "gsg" if gsg.looks_like_library(root) else None)
+                           else "gsg" if gsg.looks_like_library(root)
+                           else "folder" if folders.looks_like_library(root) else None)
         return cache[root]
 
     def rescan(self, use_cache=True):
@@ -487,6 +501,15 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         add(None, "In this scene (%d)" % n_scene, ("scene",),
             "Assets with nodes in the open scene. Orange dot: a node uses an older version.")
         labels = _prefs.color_labels(self.settings)
+        searches = _prefs.smart_searches(self.settings)
+        if searches:
+            group = add(None, "Smart searches", ("smart", None),
+                        "Saved searches. Right-click one to edit, rename or delete it.")
+            for entry in searches:
+                query = library.Query(entry["query"], favs, labels)
+                count = sum(1 for r in self.shown_records if query.matches(r))
+                add(group, "%s (%d)" % (entry["name"], count), ("smart", entry["name"]),
+                    entry["query"])
         label_counts = {}
         for rec in self.shown_records:
             key = labels.get(rec.id or "")
@@ -519,10 +542,12 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 guess = self._guess_vendor(root) if n_root == 0 else None
                 if guess:
                     vendor = schema.ROOT_KIND_LABELS[guess]
-                    label += "  (%s folder? set its type in Settings)" % vendor
-                    tip += ("\nThis folder looks like a %s library. Library roots hold "
-                            "asset.json files; open Settings and set Type to %s to browse "
-                            "it in place." % (vendor, vendor))
+                    what = "a watch folder" if guess == "folder" else "a %s library" % vendor
+                    label += "  (%s? Set its type in Settings)" % (
+                        "watch folder" if guess == "folder" else vendor)
+                    tip += ("\nThis folder looks like %s. Library roots hold asset.json "
+                            "files; open Settings and set Type to %s to browse it in "
+                            "place." % (what, vendor))
             ri = add(None, "%s (%d)" % (label, n_root), ("scope", root, None, ""), tip)
             if r["kind"] == "megascans":
                 # Bridge's layout: sections (3D Assets, Surfaces, ...) and their categories,
@@ -577,10 +602,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         item = self.tree.itemAt(pos)
         scope = item.data(0, ScopeRole) if item is not None else None
         del item
-        if not scope or scope[0] != "scope":
+        if not scope or scope[0] not in ("scope", "smart"):
             return
-        _kind, root, asset_type, category = scope
-        root_cfg = self.settings.root_for(root)
         menu = QtWidgets.QMenu(self)
         actions = {}
 
@@ -589,27 +612,91 @@ class AssetLibraryPanel(QtWidgets.QWidget):
             act.setEnabled(enabled)
             actions[act] = fn
 
-        if asset_type is None and not category:
-            add("Show in file browser", lambda: self._reveal(root))
-            add("Rescan", self.rescan)
-            menu.addSeparator()
-            add("Remove from library list", lambda: self._remove_root(root))
-            add("Settings...", self._open_settings)
-        elif not category:
-            add("Show in file browser", lambda: self._reveal(manage.type_dir(root, asset_type)))
+        if scope[0] == "smart":
+            name = scope[1]
+            if not name:
+                menu.deleteLater()
+                return
+            add("Edit query...", lambda: self._edit_smart_search(name))
+            add("Rename...", lambda: self._rename_smart_search(name))
+            add("Delete", lambda: self._delete_smart_search(name))
         else:
-            if not (root_cfg and root_cfg["kind"] in schema.VENDOR_KINDS):
-                folder = os.path.join(manage.type_dir(root, asset_type), *category.split("/"))
-                add("Show in file browser", lambda: self._reveal(folder))
-        if not actions:             # vendor categories have no menu
-            menu.deleteLater()
-            return
+            _kind, root, asset_type, category = scope
+            root_cfg = self.settings.root_for(root)
+            if asset_type is None and not category:
+                add("Show in file browser", lambda: self._reveal(root))
+                add("Rescan", self.rescan)
+                menu.addSeparator()
+                add("Remove from library list", lambda: self._remove_root(root))
+                add("Settings...", self._open_settings)
+            elif not category:
+                add("Show in file browser",
+                    lambda: self._reveal(manage.type_dir(root, asset_type)))
+            else:
+                if not (root_cfg and root_cfg["kind"] in schema.VENDOR_KINDS):
+                    folder = os.path.join(manage.type_dir(root, asset_type),
+                                          *category.split("/"))
+                    add("Show in file browser", lambda: self._reveal(folder))
+            if not actions:         # vendor categories have no menu
+                menu.deleteLater()
+                return
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
         menu.deleteLater()
         fn = actions.get(chosen) if chosen is not None else None
         if fn is not None:
             # Run once the context-menu event is over, not inside the menu's mouse release.
             QtCore.QTimer.singleShot(0, fn)
+
+    def _ask_text(self, title, prompt, initial=""):
+        """One-line text from hou.ui.readInput, or None when cancelled."""
+        try:
+            choice, text = hou.ui.readInput(
+                prompt, buttons=("OK", "Cancel"), default_choice=0, close_choice=1,
+                title=title, initial_contents=initial)
+        except hou.Error:
+            return None
+        return text if choice == 0 else None
+
+    def _save_smart_search(self):
+        text = self.search.text().strip()
+        if not text:
+            return
+        name = self._ask_text("AX Asset Library", "Name for this saved search:", text)
+        if name is None or not name.strip():
+            return
+        _prefs.save_smart_search(self.settings, name.strip(), text)
+        self._rebuild_tree()
+        self._apply_filter()
+
+    def _edit_smart_search(self, name):
+        entry = next((s for s in _prefs.smart_searches(self.settings)
+                      if s["name"] == name), None)
+        if entry is None:
+            return
+        query = self._ask_text("AX Asset Library", "Search query:", entry["query"])
+        if query is None or not query.strip():
+            return
+        _prefs.save_smart_search(self.settings, entry["name"], query.strip())
+        self._rebuild_tree()
+        self._apply_filter()
+
+    def _rename_smart_search(self, name):
+        entry = next((s for s in _prefs.smart_searches(self.settings)
+                      if s["name"] == name), None)
+        if entry is None:
+            return
+        new_name = self._ask_text("AX Asset Library", "New name:", name)
+        if new_name is None or not new_name.strip() or new_name.strip() == name:
+            return
+        _prefs.remove_smart_search(self.settings, name)
+        _prefs.save_smart_search(self.settings, new_name.strip(), entry["query"])
+        self._rebuild_tree()
+        self._apply_filter()
+
+    def _delete_smart_search(self, name):
+        _prefs.remove_smart_search(self.settings, name)
+        self._rebuild_tree()
+        self._apply_filter()
 
     def _reveal(self, path):
         try:
@@ -666,6 +753,11 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         recent = _prefs.recent(self.settings)
         labels = _prefs.color_labels(self.settings)
         query = library.Query(self.search.text(), favs, labels)
+        smart = None
+        if scope[0] == "smart":
+            entry = next((s for s in _prefs.smart_searches(self.settings)
+                          if s["name"] == scope[1]), None)
+            smart = library.Query(entry["query"] if entry else "", favs, labels)
         out = []
         for r in self.shown_records:
             if scope[0] == "broken" and not (r.broken or r.missing):
@@ -686,6 +778,8 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 elif label != scope[1]:
                     continue
             if scope[0] == "scope" and not library.in_scope(r, scope[1], scope[2], scope[3]):
+                continue
+            if smart is not None and not smart.matches(r):
                 continue
             if types and r.type not in types:
                 continue
@@ -758,8 +852,11 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         recs = self.view.selected_records()
         rendering = len(recs) == 1 and thumbnails.karma_queue().is_pending(recs[0].key)
         use = self._usage.get(recs[0].key) if len(recs) == 1 else None
-        editable = len(recs) == 1 and not self._read_only(recs[0]) and not recs[0].broken
-        self.details.set_records(recs, rendering, use, editable)
+        vendor = len(recs) == 1 and self._vendor_root(recs[0])
+        # Vendor assets keep their tags in the user's prefs, so they are editable too.
+        editable = len(recs) == 1 and not recs[0].broken and (
+            not self._read_only(recs[0]) or (vendor and library.browsed_in_place(recs[0])))
+        self.details.set_records(recs, rendering, use, editable, vendor=vendor)
 
     def _picked_version(self, recs):
         """Version chosen in the details pane, when it shows exactly these records."""
@@ -947,6 +1044,10 @@ class AssetLibraryPanel(QtWidgets.QWidget):
                 menu.addAction("Import as material only",
                                lambda: self._import_records(recs, as_geometry=False))
             menu.addAction("Copy path", self._copy_paths)
+            vendor_recs = [r for r in recs if library.browsed_in_place(r)]
+            if vendor_recs:
+                menu.addAction("Add to library...", lambda rs=vendor_recs: self._ingest(
+                    [], plan=publish.plan_from_records(rs, self.records)))
             if len(recs) == 1:
                 menu.addAction("Show in folder", self._reveal_selected)
                 menu.addAction("Thumbnail from image...", self._set_thumbnail)
@@ -1094,15 +1195,28 @@ class AssetLibraryPanel(QtWidgets.QWidget):
 
     def _save_meta(self, tags, description):
         recs = self.view.selected_records()
-        if len(recs) != 1 or self._read_only(recs[0]):
+        if len(recs) != 1:
+            return
+        rec = recs[0]
+        if self._vendor_root(rec) and library.browsed_in_place(rec):
+            info = rec.info or {}
+            _prefs.set_asset_meta(self.settings, rec.id, tags, description,
+                                  base_tags=info.get("base_tags", []),
+                                  base_description=info.get("base_description", ""))
+            self.records = self.records        # apply_meta() picks the new values up
+            self._rebuild_tree()
+            self._apply_filter()
+            self._message("%s: tags saved (stored in your preferences)." % rec.name)
+            return
+        if self._read_only(rec):
             return
         try:
-            manage.set_meta(recs[0].asset_dir, tags, description)
+            manage.set_meta(rec.asset_dir, tags, description)
         except manage.ManageError as e:
             self._error(e)
             return
-        self._message("%s: tags saved." % recs[0].name)
-        self._select_after_scan = {recs[0].key}
+        self._message("%s: tags saved." % rec.name)
+        self._select_after_scan = {rec.key}
         self.rescan()
 
     def _relink(self, old_rec, new_dir):
@@ -1230,6 +1344,10 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         root = self.settings.root_for(rec.root)
         return bool(root and root["read_only"])
 
+    def _vendor_root(self, rec):
+        root = self.settings.root_for(rec.root)
+        return bool(root and root["kind"] in schema.VENDOR_KINDS)
+
     def _error(self, e):
         msg = e.instanceMessage() if isinstance(e, hou.Error) else str(e)
         hou.ui.displayMessage(msg, severity=hou.severityType.Warning, title="AX Asset Library")
@@ -1301,13 +1419,15 @@ class AssetLibraryPanel(QtWidgets.QWidget):
         s.set("publish_center", v["center"], save=False)
         s.set("publish_ground", v["ground"], save=False)
         s.set("publish_unpack", v["unpack"], save=False)
+        s.set("publish_materials", v["materials"], save=False)
         s.set("publish_thumbnail", v["thumbnail"])
         try:
             result = publish.publish_node(
                 node, v["root"], v["name"], v["category"], v["tags"], v["description"],
                 v["note"], v["formats"], v["center"], v["ground"], v["unpack"],
                 thumbnail_image=v["image"] or None,
-                asset_dir=existing.asset_dir if existing is not None else None)
+                asset_dir=existing.asset_dir if existing is not None else None,
+                materials=v["materials"])
         except (hou.Error, schema.SidecarError, OSError) as e:
             self._error(e)
             return

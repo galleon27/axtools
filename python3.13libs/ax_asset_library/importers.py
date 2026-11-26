@@ -8,6 +8,7 @@ import os
 
 import hou
 
+from . import material_bundle
 from . import materials
 from . import prefs as _prefs
 from . import schema
@@ -338,6 +339,16 @@ def _material_sop(parent, mat, name):
     return node
 
 
+def _bundle_material_sop(parent, nodes, name):
+    """Material SOP that assigns each saved material to the prims carrying its saved name."""
+    node = parent.createNode("material", unique_name(parent, name))
+    node.parm("num_materials").set(len(nodes))
+    for i, (saved, mat) in enumerate(nodes.items(), start=1):
+        node.parm("group%d" % i).set('@shop_materialpath="%s"' % saved)
+        node.parm("shop_materialpath%d" % i).set(node.relativePathTo(mat))
+    return node
+
+
 def _sop_loader(parent, rec, path, parm_value):
     node_type, parm = SOP_LOADERS.get(schema.file_ext(path), DEFAULT_SOP_LOADER)
     node = parent.createNode(node_type, unique_name(parent, rec.name))
@@ -375,6 +386,22 @@ def _sop_scale(parent, loader, rec):
     return xf
 
 
+def _import_bundle(bundle, container, parent, rec, settings, version):
+    """Load a version's saved materials and add the Material SOP that assigns them.
+
+    Bundled materials import into SOP and OBJ networks; LOPs keep their own USD materials."""
+    version_dir = os.path.dirname(bundle.get("file") or "")
+    if not version_dir:
+        return None
+    _subnet, loaded = material_bundle.load(
+        bundle, to_parm(rec, settings, version_dir), container, rec.name)
+    if not loaded:
+        return None
+    mnode = _bundle_material_sop(parent, loaded, rec.name + "_material")
+    _tag_node(mnode, rec, settings, version)
+    return mnode
+
+
 def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     if ctx not in ALLOWED_CONTEXTS["geometry"]:
         raise AssetImportError("geometry imports into %s." % TYPE_WHERE["geometry"])
@@ -383,6 +410,8 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
     mrec = None
     if opts.get("renderer") and opts.get("records_all"):
         mrec = variants.linked_material(rec, opts["records_all"])
+    picked = rec.version(version if version is not None else rec.current) or {}
+    bundle = picked.get("materials") if mrec is None else None
 
     if ctx == "sop":
         node = _sop_loader(network, rec, path, value)
@@ -399,6 +428,12 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
             mnode.setInput(0, last)
             _tag_node(mnode, rec, settings, version)
             return mnode
+        if bundle:
+            mnode = _import_bundle(bundle, network, network, rec, settings, version)
+            if mnode is not None:
+                mnode.setPosition(last.position() + hou.Vector2(0, -1))
+                mnode.setInput(0, last)
+                return mnode
         return last
 
     if ctx == "obj":
@@ -417,6 +452,13 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
             mnode.setDisplayFlag(True)
             mnode.setRenderFlag(True)
             _tag_node(mnode, rec, settings, version)
+        elif bundle:
+            mnode = _import_bundle(bundle, geo, geo, rec, settings, version)
+            if mnode is not None:
+                mnode.setPosition(last.position() + hou.Vector2(0, -1))
+                mnode.setInput(0, last)
+                mnode.setDisplayFlag(True)
+                mnode.setRenderFlag(True)
         geo.layoutChildren()
         geo.setPosition(pos)
         _tag_node(geo, rec, settings, version)
@@ -424,6 +466,7 @@ def _import_geometry(rec, network, ctx, pos, anchor, settings, version, opts):
         return geo
 
     # LOP: Reference LOP; Houdini's USD plugins read bgeo and abc files as layers too.
+    # Bundled materials are left unused here: they import into SOP and OBJ networks.
     ref = network.createNode(_lop_type(LOP_REFERENCE_TYPES), unique_name(network, rec.name))
     if _set_first(ref, ("filepath1", "filepath"), value) is None:
         raise AssetImportError("%s has no file path parameter." % ref.type().name())
